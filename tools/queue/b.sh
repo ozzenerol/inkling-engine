@@ -20,3 +20,7 @@ echo "== B bandwidth of the big readers (model-free except bench_moe's two layer
 $(bin bench_matvec) 1 | grep GB/s
 $(bin bench_q8) 1; $(bin bench_q8) 4
 for r in 4 2 1; do echo -n "[moe gate/up rows per simdgroup $r] "; INK_MOE_RPS=$r $(bin bench_moe) 1 | tr '\n' ' '; echo; done
+echo "== B NVFP4 vectorized decode (INK_FP4_VEC=1, bit-identical): us per call and identity"
+$(bin bench_moe) 1 | grep nvfp4; INK_FP4_VEC=1 $(bin bench_moe) 1 | grep nvfp4
+for v in "X=1" "INK_FP4_VEC=1"; do env $v $(bin spec_check) plain ref_data/p2.ids 100 4 $BS/vec_$v.i32 2>&1 | grep -oE "decode [0-9.]+ s -> [0-9.]+ tok/s"; done
+cmp "$BS/vec_X=1.i32" "$BS/vec_INK_FP4_VEC=1.i32" && echo "fp4 vec tokens IDENTICAL"

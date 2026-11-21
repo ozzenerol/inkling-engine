@@ -1184,6 +1184,7 @@ class MetalBackend final : public Backend {
       uint32_t rps = getenv("INK_MOE_RPS") ? uint32_t(atoi(getenv("INK_MOE_RPS"))) : 4;
       if (rps != 1 && rps != 2) rps = 4;
       std::string gun = std::string(nv ? "moe_gateup_nvfp4" : "moe_gateup_mxfp8") + (rps == 4 ? "" : rps == 2 ? "_r2" : "_r1");
+      if (nv && rps == 4 && getenv("INK_FP4_VEC")) gun = "moe_gateup_nvfp4_vec";  // bit-identical decode variant
       pipe(gun);
       bind(0, m.gate.weight);
       bind(1, m.gate.scales);
