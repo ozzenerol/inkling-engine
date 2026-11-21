@@ -475,3 +475,20 @@ head 0.93 -> 0.48). Check script: tests/ref/check_8bit_layout.py (tensor-by-tens
   102 s (MLX 241.5 s); qh end-to-end PASS in 38 s.
   Attention sparsity (INK_AG_STATS, p17, global layers): (row, 64-key tile) pairs below 1e-6 of the row's top
   weight: 0-2.5%; 64x64 tiles where every row is below 1e-6: 0.0%. Skipping far keys is not an option.
+- **Batch 3** (main fd7f72b, 19:57-20:11; b/work, c/work, d/work, a/work merged): all gates pass (op_diff ALL OK
+  with and without q8; acc unchanged; spec identity; rollback). With D's multi-row kernels (one-pass matvec and
+  split attention for 3..16 rows) a verify of 8 rows costs ~73 ms at 2.3k context (T=5 was 122-126 ms), T=3/4 =
+  38.8 / 45.4 ms. Greedy, 600 tokens, token-identical to plain, one run each (tok/s):
+
+  | | plain | drafter block 4 | drafter block 8 | lookup <= 3 | lookup <= 7 | lookup <= 15 | block 8 + lookup 15, temp 0.7 |
+  |---|---|---|---|---|---|---|---|
+  | copy | 33.4 | 65.9 | 85.8 | 71.2 | 88.7 | **100.6** | 97.1 |
+  | edit | 33.3 | 59.3 | 73.7 | 67.3 | 81.2 | **96.2** | 93.2 |
+
+  Lookup v2 (best of 4 trigram positions by backward match, >= 6 tokens): 526 of 600 drafts accepted on copy
+  (v1: 391 of 625). p2 (free text, 99 tokens): block 4 41.5, block 8 with the 8-arm bandit 34.0 (too much
+  exploration) -> policy replaced: k follows acceptance (2k+1 / accepted+1), plain fallback by measured rate.
+  B: MoE LUT no gain (134.6 vs 137.2 us), CTRL_GEMM -6% on p3 prefill (3.72 vs 3.96 s), MOE_GEMM2 slower.
+  C (server, short set): ctxbench temp 0.7 gen 36.8 / 33.3 tok/s lossless, 38.1 / 38.1 8-bit at 1.2k / 9.5k (MLX
+  23.1 / 24.2); prefill 698 / 750 (MLX 565 / 602); agent bench 10 turns: median gen 63.4 lossless, 66.5 8-bit
+  (76 on turns 6-10), MLX 44.1; totals 97.3 / 88.9 s, MLX 241.5 s; qh end-to-end PASS in 18 s.
