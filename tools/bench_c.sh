@@ -8,7 +8,7 @@
 # (qh-like session, 10 turns, with base context 0 and 30000: per-turn TTFT and total wall time).
 # GPU: these load the model, so they run only inside the batch (tools/WORKFLOW.md, tools/queue/c.sh).
 # Env: SIZES (ctxbench, default 1000,8000,16000,32000,64000,104000), CONTEXTS (bench.py, default 40,1k,4k,16k,32k),
-#      TURNS (10), AGENT_BASES ("0 30000"), OUT (bench/), SERVER_ARGS (extra inkling-server flags),
+#      TURNS (10), AGENT_BASES ("0 30000"; "none" = copy scenario only), OUT (bench/), SERVER_ARGS (extra inkling-server flags),
 #      BIN (server binary), SKIP_CTX=1, SKIP_AGENT=1, SKIP_COPY=1. SERVER_ARGS="--model DIR" for the 8-bit build.
 set -u
 here=$(cd "$(dirname "$0")/.." && pwd)
@@ -38,7 +38,9 @@ measure() {
 		"$py" -u "$HOME/llm/ctxbench.py" "$url/v1" "$model" "$sizes" | tee "$out/ctx-$label.jsonl"
 	fi
 	if [ -z "${SKIP_AGENT:-}" ]; then
-		for base in ${AGENT_BASES:-0 30000}; do
+		bases=${AGENT_BASES:-0 30000}
+		[ "$bases" = none ] && bases=
+		for base in $bases; do
 			echo "== agent_bench $label (base $base, $turns turns)"
 			"$py" -u "$here/tools/agent_bench.py" --url "$url" --label "$label" --turns "$turns" \
 				--base-tokens "$base" --out "$out/agent-$label-$base.json"
