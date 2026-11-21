@@ -398,3 +398,29 @@ router weight and controller forget/gain are f32. No mtp.safetensors (use the 4-
 Stage 1 (A, in Model::load): converted at load to the 4-8bit in-memory form, so all kernels run unchanged.
 Stage 2 (B): q8 kernels reading the codes in place; that is the speed gain (dense bytes per token 2.79 -> ~1.5 GB,
 head 0.93 -> 0.48). Check script: tests/ref/check_8bit_layout.py (tensor-by-tensor against the 4-8bit build).
+
+## A: evening work (2026-11-21, code written while C benchmarked; GPU checks queued in tools/a_gpu_queue.sh)
+
+- **Speculative sampling** (src/engine/sampling.{h,cpp}): `target_probs` (full-vocab softmax with min_p / top_k /
+  top_p, 0.3 ms), `spec_accept` (accept draft x ~ q with min(1, p/q), residual resample on rejection; exact).
+  Test (build/sample_test): emitted distribution = target within 2 sigma, acceptance 0.6406 vs 1 - TV 0.6404;
+  greedy-compare (what MLX does) would accept 0.10 on the same pair. speculative.cpp uses it for temperature > 0
+  with B's `draft_sample` / `q_row` (INK_SPEC_COMPARE=1 = old sample-and-compare).
+- **Adaptive draft count**: each round picks k in 0..block-1 (0 = plain step) by expected tokens/ms from EMAs of
+  per-position acceptance and measured plain / draft / verify(T) times. Reason: C's ctxbench at temp 0.7 gave gen
+  30.3 tok/s at 1.2k while plain decode is ~36.7: fixed block 4 with compare-acceptance was slower than no drafts.
+  INK_SPEC_FIXED=1 restores the fixed block.
+- **Chain kernels** (src/gpu/kernels/chain.metal, backend.h ChainFrontArgs / ChainMidArgs): for T <= 8,
+  `chain_front` = [previous visit's x = res + conv(moe)] + mix + (loop passes: 3 controllers) + norm(s);
+  `chain_mid` = conv(+x) + block copy + mix + (mlp controller) + post norm + router top-8, each ONE 1024-thread
+  dispatch. Loop messages are not materialized on chained visits (m = c0 bank0 + c1 bank1 on the fly). Expected:
+  local visit 14 -> 9 dispatches, looped local visit ~25 -> ~10, at B's ~7.5 us per dependent dispatch.
+  Model: run_visit takes ChainMsg*; on_visit fires inside run_visit after the front; CPU path byte-identical (cmp).
+  INK_NO_CHAIN=1 disables.
+- **Rollback test**: `inktest --rollback-test` (4 rows with history, keep 2, continue) is bit-identical to the
+  straight run on the CPU backend with INK_CPU_ROWEXACT=1 (plain CPU differs: BLAS vs loops by batch size).
+- **kernel_check**: `build/kernel_check [names]` compiles the Metal library and builds pipelines with no model and
+  no GPU work. Run it before committing .metal changes (HEAD was uncompilable for ~20 min tonight).
+- **8-bit build**: loader + check script done (see "A: 8-bit build"); CPU p0 greedy 16/16 vs the lossless
+  reference. B wired q8 kernels behind INK_Q8_KERNELS=1 (MLX qmv semantics s*sum(x q) + b*sum(x), not
+  bf16-rounded weights), to be validated.
