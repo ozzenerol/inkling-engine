@@ -297,10 +297,11 @@ class CpuBackend final : public Backend {
     });
   }
 
-  void short_conv(const Tensor& x, const Tensor& w, Tensor& state, Tensor& out) override {
+  void short_conv(const Tensor& x, const Tensor& w, Tensor& state, Tensor& out, Tensor* hist) override {
     const int64_t C = x.dim(-1), T = x.numel() / C;
     const float div = std::sqrt(5.0f);
     float* sp = state.data<float>();
+    float* hp = hist && hist->valid() ? hist->data<float>() : nullptr;
     parallel_for(C, [&](int64_t b, int64_t e) {
       for (int64_t c = b; c < e; ++c) {
         float w4[4];
@@ -317,16 +318,19 @@ class CpuBackend final : public Backend {
           hist[0] = hist[1];
           hist[1] = hist[2];
           hist[2] = xt;
+          if (hp)
+            for (int j = 0; j < 3; ++j) hp[(t * 3 + j) * C + c] = hist[j];
         }
         for (int j = 0; j < 3; ++j) sp[j * C + c] = hist[j];
       }
     }, 64);
   }
 
-  void dyn_conv(const Tensor& x, const Tensor& dyn, const Tensor& sw, Tensor& state, Tensor& out) override {
+  void dyn_conv(const Tensor& x, const Tensor& dyn, const Tensor& sw, Tensor& state, Tensor& out, Tensor* hist) override {
     const int64_t C = x.dim(-1), T = x.numel() / C, HD = 128, K = 4;
     const float div = std::sqrt(9.0f);
     float* sp = state.data<float>();
+    float* hp = hist && hist->valid() ? hist->data<float>() : nullptr;
     parallel_for(C, [&](int64_t b, int64_t e) {
       for (int64_t c = b; c < e; ++c) {
         const int64_t h = c / HD;
@@ -343,6 +347,8 @@ class CpuBackend final : public Backend {
           hist[0] = hist[1];
           hist[1] = hist[2];
           hist[2] = xt;
+          if (hp)
+            for (int j = 0; j < 3; ++j) hp[(t * 3 + j) * C + c] = hist[j];
         }
         for (int j = 0; j < 3; ++j) sp[j * C + c] = hist[j];
       }

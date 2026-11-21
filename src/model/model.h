@@ -32,6 +32,7 @@ struct LayerWeights {
 struct VisitState {
   KvView kv;
   std::array<Tensor, 4> conv;  // f32 [3,C]: k(1024), v(1024), attn(D), mlp(D)
+  std::array<Tensor, 4> hist;  // f32 [16,3,C] conv state after each row of the last keep_hist forward
 };
 
 class Model {
@@ -43,7 +44,14 @@ class Model {
 
   // Run T (<= max_chunk) tokens at positions len()..len()+T-1 and append them to the cache.
   // Logits of the last row (or of all rows if all_logits) are available via logits() after the call.
-  void forward(const int32_t* ids, int64_t T, bool all_logits = false);
+  // keep_hist (T <= 16): record conv states after every row so rollback() can keep a prefix (spec verify).
+  void forward(const int32_t* ids, int64_t T, bool all_logits = false, bool keep_hist = false);
+  // After a keep_hist forward of T rows: keep only the first n_keep rows (conv states + KV lengths).
+  void rollback(int64_t n_keep);
+  static constexpr int64_t kMaxHist = 16;
+  // Test hook: run one visit on an empty cache with given inputs (x, blocks, loop bank), x_out = output.
+  void debug_visit(int v, const Tensor& x_in, const std::vector<const Tensor*>& blocks_in,
+                   const std::vector<const Tensor*>& bank_in, Tensor& x_out, int64_t T);
   const std::vector<float>& logits() const { return logits_; }  // [rows, vocab_unpadded]
   int64_t logit_rows() const { return logit_rows_; }
   int64_t len() const { return len_; }
@@ -58,7 +66,12 @@ class Model {
 
  private:
   void load(const std::string& dir);
-  void layer(int visit, int L, const Tensor& x, Tensor& out, int64_t T, const Tensor* msg);
+  void run_visit(int v, Tensor& x, std::vector<Tensor>& blocks, const Tensor& msg, int64_t T);
+  void write_tau(int64_t T);
+  void ensure_hist();
+  bool keep_hist_ = false;
+  int64_t hist_rows_ = 0;
+  Tensor hist_views_[4];
   Tensor view(const Tensor& t, std::initializer_list<int64_t> shape) const;  // contiguous prefix view
   Tensor row_view(const Tensor& t, int64_t first, std::initializer_list<int64_t> shape) const;
 

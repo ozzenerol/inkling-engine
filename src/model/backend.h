@@ -99,11 +99,13 @@ class Backend {
                           const Tensor& forget, const Tensor& gain, Tensor& out) = 0;
   // Causal depthwise conv K=4 over [state(3 rows, f32); x] + residual: out[t,c] = bf16((sum_j xin[t-3+j,c] *
   // w[c,j] + x[t,c]) / sqrt(5)); then state = last 3 inputs (f32). w bf16 [C,4]. x, out bf16 [T,C].
-  virtual void short_conv(const Tensor& x, const Tensor& w, Tensor& state, Tensor& out) = 0;
+  // hist (optional, f32 [T,3,C]): hist[t] = the state after row t (for speculative rollback).
+  virtual void short_conv(const Tensor& x, const Tensor& w, Tensor& state, Tensor& out, Tensor* hist = nullptr) = 0;
   // Dynamic conv (global layers' k/v): wts[t,h,c,lag] = static[lag, h*128+c] + dyn[t, h*4+lag] (fp32);
   // out = bf16((sum_lag xin[t-lag] * wts[..lag] + x[t]) / sqrt(9)), accumulated lag 0..3 in order; state as above.
   // x bf16 [T,1024]; dyn bf16 [T,32]; static bf16 [4,1024].
-  virtual void dyn_conv(const Tensor& x, const Tensor& dyn, const Tensor& static_w, Tensor& state, Tensor& out) = 0;
+  virtual void dyn_conv(const Tensor& x, const Tensor& dyn, const Tensor& static_w, Tensor& state, Tensor& out,
+                        Tensor* hist = nullptr) = 0;
   // y = x * scale (fp32, scale bf16 [H,d] or none), y *= min(thr / (|y| + 1e-6), 1) over last dim d -> bf16.
   // If tau (f32 [T]) is valid: out = bf16(float(that bf16) * tau[t]). x [T,H,d] bf16, out bf16.
   virtual void l2_clip(const Tensor& x, const Tensor* scale, float thr, const Tensor* tau, Tensor& out) = 0;

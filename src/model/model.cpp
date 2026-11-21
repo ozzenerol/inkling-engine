@@ -23,6 +23,7 @@ Model::~Model() {
     fr(v.kv.k);
     fr(v.kv.v);
     for (auto& c : v.conv) fr(c);
+    for (auto& c : v.hist) fr(c);
   }
   for (Tensor* t : {&ids_, &x_, &x2_, &prelude_, &blk_[0], &blk_[1], &blk_[2], &blk_[3], &bank_[0], &bank_[1], &msg_,
                     &mixed_, &parts_[0], &parts_[1], &parts_[2], &partsb_[0], &partsb_[1], &partsb_[2], &kraw_,
@@ -196,23 +197,171 @@ void Model::set_len(int64_t n) {
   for (auto& s : vs_) s.kv.len = n;
 }
 
-void Model::forward(const int32_t* ids, int64_t T, bool all_logits) {
+void Model::write_tau(int64_t T) {
+  // Global-layer tau (log scaling) for positions len+1 .. len+T.
+  std::vector<float> tau(static_cast<size_t>(T));
+  for (int64_t i = 0; i < T; ++i) {
+    float pos = float(len_ + i + 1);
+    tau[i] = 1.0f + cfg_.log_alpha * std::log(std::max(pos / float(cfg_.log_n_floor), 1.0f));
+  }
+  Tensor tt = view(tau_, {T});
+  be_.write(tt, tau.data(), size_t(T) * 4);
+}
+
+// One layer visit: x (bf16 [T,D]) is updated in place. blocks = current attention-residual blocks (appended to at
+// block boundaries, storage blk_[blocks.size()]). msg = loop messages f32 [4,T,D] or invalid.
+void Model::run_visit(int v, Tensor& x, std::vector<Tensor>& blocks, const Tensor& msg, int64_t T) {
+  const int L = cfg_.visits[v];
+  const int64_t D = cfg_.hidden;
+  const auto& w = lw_[L];
+  const bool boundary = L % cfg_.block == 0;
+  const int nq = w.local ? 1 : 3;
+  if (L > 0) {
+    Tensor mixed = view(mixed_, {nq, T, D});
+    std::vector<const Tensor*> states;
+    for (auto& b : blocks) states.push_back(&b);
+    states.push_back(&x);
+    be_.attn_residual(states, w.attn_query, mixed);
+  }
+  auto part = [&](int i) -> Tensor {
+    if (L == 0) return x;
+    return row_view(mixed_, std::min(i, nq - 1), {T, D});
+  };
+  Tensor xq, xk, xv;
+  if (w.local && !msg.valid()) {
+    xq = view(partsb_[0], {T, D});
+    Tensor p0 = part(0);
+    be_.rms_norm(p0, &w.in_norm, cfg_.rms_eps, D, xq);
+    xk = xv = xq;
+  } else {
+    Tensor ins[3];
+    for (int i = 0; i < 3; ++i) {
+      ins[i] = part(i);
+      if (msg.valid()) {
+        Tensor out = view(parts_[i], {T, D});
+        Tensor mi = row_view(msg, i, {T, D});
+        be_.controller(ins[i], mi, w.ctrl_down[i], w.ctrl_forget[i], w.ctrl_gain[i], out);
+        ins[i] = out;
+      }
+    }
+    const Tensor* norms[3] = {w.local ? &w.in_norm : &w.q_norm, w.local ? &w.in_norm : &w.k_norm,
+                              w.local ? &w.in_norm : &w.v_norm};
+    Tensor outs[3];
+    for (int i = 0; i < 3; ++i) {
+      outs[i] = view(partsb_[i], {T, D});
+      be_.rms_norm(ins[i], norms[i], cfg_.rms_eps, D, outs[i]);
+    }
+    xq = outs[0];
+    xk = outs[1];
+    xv = outs[2];
+  }
+
+  // ---- attention ----
+  auto& s = vs_[v];
+  const int64_t H = cfg_.heads, HD = cfg_.head_dim, KVH = cfg_.kv_heads, KVC = KVH * HD;
+  Tensor kraw = view(kraw_, {T, KVC}), vraw = view(vraw_, {T, KVC});
+  Tensor q = view(q_, {T, H * HD}), r = view(r_, {T, H * cfg_.d_rel}), sink = view(sink_, {T, H});
+  Tensor g = view(gate_, {T, H * HD});
+  Tensor dk = view(dk_, {T, KVH * 4}), dv = view(dv_, {T, KVH * 4});
+  if (w.local && !msg.valid()) {
+    // One shared input: q, k, v, r, sink, gate in one multi-linear.
+    be_.linear_multi(xq, {&w.q_proj, &w.k_proj, &w.v_proj, &w.r_proj, &w.sink_proj, &w.gate_proj},
+                     {&q, &kraw, &vraw, &r, &sink, &g});
+  } else {
+    be_.linear_multi(xq, {&w.q_proj, &w.r_proj, &w.sink_proj, &w.gate_proj}, {&q, &r, &sink, &g});
+    if (w.local) {
+      be_.linear(xk, w.k_proj, kraw);
+      be_.linear(xv, w.v_proj, vraw);
+    } else {
+      be_.linear_multi(xk, {&w.k_proj, &w.k_wproj}, {&kraw, &dk});
+      be_.linear_multi(xv, {&w.v_proj, &w.v_wproj}, {&vraw, &dv});
+    }
+  }
+  Tensor kc = view(kc_, {T, KVC}), vc = view(vc_, {T, KVC});
+  Tensor* hist[4] = {nullptr, nullptr, nullptr, nullptr};
+  if (keep_hist_)
+    for (int i = 0; i < 4; ++i) {
+      int64_t C = s.conv[i].dim(1);
+      hist_views_[i] = row_view(s.hist[i], 0, {T, 3, C});
+      hist[i] = &hist_views_[i];
+    }
+  if (w.local) {
+    be_.short_conv(kraw, w.k_conv, s.conv[0], kc, hist[0]);
+    be_.short_conv(vraw, w.v_conv, s.conv[1], vc, hist[1]);
+  } else {
+    be_.dyn_conv(kraw, dk, w.k_static, s.conv[0], kc, hist[0]);
+    be_.dyn_conv(vraw, dv, w.v_static, s.conv[1], vc, hist[1]);
+  }
+  Tensor tau = view(tau_, {T});
+  Tensor q3 = view(q_, {T, H, HD});
+  be_.l2_clip(q3, &w.q_scale, cfg_.qk_clip, w.local ? nullptr : &tau, q3);
+  Tensor k3 = view(k_, {T, KVH, HD}), kc3 = view(kc_, {T, KVH, HD});
+  be_.l2_clip(kc3, nullptr, cfg_.qk_clip, nullptr, k3);
+  Tensor v3 = view(v_, {T, KVH, HD});
+  be_.rms_norm(vc, nullptr, cfg_.rms_eps, HD, v3);
+  Tensor r3 = view(r_, {T, H, cfg_.d_rel});
+  be_.l2_clip(r3, &w.rel_scale, cfg_.rel_clip, w.local ? nullptr : &tau, r3);
+  AttnArgs aa;
+  aa.q = q3;
+  aa.k_new = k3;
+  aa.v_new = v3;
+  aa.r = r3;
+  aa.rel_proj = w.rel_proj;
+  aa.sink = sink;
+  aa.kv = s.kv;
+  aa.window = w.local ? cfg_.window : 0;
+  Tensor at = view(attn_, {T, H * HD});
+  be_.attention(aa, at);
+  be_.kv_append(k3, v3, s.kv);
+  be_.sigmoid_gate(at, g, at);
+  Tensor ao = view(ao_, {T, D});
+  be_.linear(at, w.o_proj, ao);
+
+  // ---- residual + MoE ----
+  Tensor resb = view(resb_, {T, D}), res = view(res_, {T, D});
+  be_.short_conv(ao, w.attn_sconv, s.conv[2], resb, hist[2]);
+  if (boundary) {
+    Tensor blk = view(blk_[blocks.size()], {T, D});
+    be_.copy(x, blk);
+    blocks.push_back(blk);
+    be_.cast(resb, res);
+  } else {
+    be_.add(resb, x, res);
+  }
+  Tensor hid = view(hid_, {1, T, D});
+  {
+    std::vector<const Tensor*> states;
+    for (auto& b : blocks) states.push_back(&b);
+    states.push_back(&res);
+    be_.attn_residual(states, w.mlp_query, hid);
+  }
+  Tensor hid2 = view(hid_, {T, D});
+  if (msg.valid()) {
+    Tensor m3 = row_view(msg, 3, {T, D});
+    be_.controller(hid2, m3, w.ctrl_down[3], w.ctrl_forget[3], w.ctrl_gain[3], hid2);
+  }
+  Tensor hn = view(hn_, {T, D});
+  be_.rms_norm(hid2, &w.post_norm, cfg_.rms_eps, D, hn);
+  Tensor ridx = view(ridx_, {T, cfg_.topk}), rw = view(rw_, {T, cfg_.topk});
+  be_.router(hn, w.moe, cfg_.topk, cfg_.route_scale, ridx, rw);
+  Tensor mo = view(moe_, {T, D});
+  be_.moe(hn, ridx, rw, w.moe, mo);
+  Tensor mc = view(mo_, {T, D});
+  be_.short_conv(mo, w.mlp_sconv, s.conv[3], mc, hist[3]);
+  be_.add(res, mc, x);  // new x (bf16)
+}
+
+void Model::forward(const int32_t* ids, int64_t T, bool all_logits, bool keep_hist) {
   if (T <= 0 || T > max_chunk_) throw std::runtime_error("forward: bad T");
   if (len_ + T > max_ctx_) throw std::runtime_error("forward: context full");
+  if (keep_hist && T > kMaxHist) throw std::runtime_error("forward: keep_hist needs T <= 16");
+  if (keep_hist) ensure_hist();
+  keep_hist_ = keep_hist;
+  hist_rows_ = keep_hist ? T : 0;
   const int64_t D = cfg_.hidden;
   Tensor idt = view(ids_, {T});
   be_.write(idt, ids, size_t(T) * 4);
-
-  // Global-layer tau (log scaling) for positions len+1 .. len+T.
-  {
-    std::vector<float> tau(static_cast<size_t>(T));
-    for (int64_t i = 0; i < T; ++i) {
-      float pos = float(len_ + i + 1);
-      tau[i] = 1.0f + cfg_.log_alpha * std::log(std::max(pos / float(cfg_.log_n_floor), 1.0f));
-    }
-    Tensor tt = view(tau_, {T});
-    be_.write(tt, tau.data(), size_t(T) * 4);
-  }
+  write_tau(T);
 
   Tensor x = view(x_, {T, D}), xn = view(x2_, {T, D});
   be_.embed(idt, embed_, xn);
@@ -251,138 +400,7 @@ void Model::forward(const int32_t* ids, int64_t T, bool all_logits) {
       be_.loop_messages({&b0, &b1}, q, msg);
     }
     if (on_visit) on_visit(v, x);
-
-    // Block bookkeeping happens inside layer() (blocks.append(x) at boundaries); do it here for clarity.
-    // layer() needs the current blocks list.
-    {
-      // Attention-residual mixing input states: blocks + [x]
-      const auto& w = lw_[L];
-      const bool boundary = L % cfg_.block == 0;
-      const int nq = w.local ? 1 : 3;
-      Tensor mixed;  // f32 [nq,T,D] (or x itself for layer 0)
-      if (L > 0) {
-        mixed = view(mixed_, {nq, T, D});
-        std::vector<const Tensor*> states;
-        for (auto& b : blocks) states.push_back(&b);
-        states.push_back(&x);
-        be_.attn_residual(states, w.attn_query, mixed);
-      }
-      auto part = [&](int i) -> Tensor {
-        if (L == 0) return x;
-        return row_view(mixed_, std::min(i, nq - 1), {T, D});
-      };
-      Tensor xq, xk, xv;
-      if (w.local && !msg.valid()) {
-        xq = view(partsb_[0], {T, D});
-        Tensor p0 = part(0);
-        be_.rms_norm(p0, &w.in_norm, cfg_.rms_eps, D, xq);
-        xk = xv = xq;
-      } else {
-        Tensor ins[3];
-        for (int i = 0; i < 3; ++i) {
-          ins[i] = part(i);
-          if (msg.valid()) {
-            Tensor out = view(parts_[i], {T, D});
-            Tensor mi = row_view(msg_, i, {T, D});
-            be_.controller(ins[i], mi, w.ctrl_down[i], w.ctrl_forget[i], w.ctrl_gain[i], out);
-            ins[i] = out;
-          }
-        }
-        const Tensor* norms[3] = {w.local ? &w.in_norm : &w.q_norm, w.local ? &w.in_norm : &w.k_norm,
-                                  w.local ? &w.in_norm : &w.v_norm};
-        Tensor outs[3];
-        for (int i = 0; i < 3; ++i) {
-          outs[i] = view(partsb_[i], {T, D});
-          be_.rms_norm(ins[i], norms[i], cfg_.rms_eps, D, outs[i]);
-        }
-        xq = outs[0];
-        xk = outs[1];
-        xv = outs[2];
-      }
-
-      // ---- attention ----
-      auto& s = vs_[v];
-      const int64_t H = cfg_.heads, HD = cfg_.head_dim, KVH = cfg_.kv_heads, KVC = KVH * HD;
-      Tensor kraw = view(kraw_, {T, KVC}), vraw = view(vraw_, {T, KVC});
-      be_.linear(xk, w.k_proj, kraw);
-      be_.linear(xv, w.v_proj, vraw);
-      Tensor kc = view(kc_, {T, KVC}), vc = view(vc_, {T, KVC});
-      if (w.local) {
-        be_.short_conv(kraw, w.k_conv, s.conv[0], kc);
-        be_.short_conv(vraw, w.v_conv, s.conv[1], vc);
-      } else {
-        Tensor dk = view(dk_, {T, KVH * 4}), dv = view(dv_, {T, KVH * 4});
-        be_.linear(xk, w.k_wproj, dk);
-        be_.linear(xv, w.v_wproj, dv);
-        be_.dyn_conv(kraw, dk, w.k_static, s.conv[0], kc);
-        be_.dyn_conv(vraw, dv, w.v_static, s.conv[1], vc);
-      }
-      Tensor q = view(q_, {T, H * HD});
-      be_.linear(xq, w.q_proj, q);
-      Tensor tau = view(tau_, {T});
-      Tensor q3 = view(q_, {T, H, HD});
-      be_.l2_clip(q3, &w.q_scale, cfg_.qk_clip, w.local ? nullptr : &tau, q3);
-      Tensor k3 = view(k_, {T, KVH, HD}), kc3 = view(kc_, {T, KVH, HD});
-      be_.l2_clip(kc3, nullptr, cfg_.qk_clip, nullptr, k3);
-      Tensor v3 = view(v_, {T, KVH, HD});
-      be_.rms_norm(vc, nullptr, cfg_.rms_eps, HD, v3);
-      Tensor r = view(r_, {T, H * cfg_.d_rel});
-      be_.linear(xq, w.r_proj, r);
-      Tensor r3 = view(r_, {T, H, cfg_.d_rel});
-      be_.l2_clip(r3, &w.rel_scale, cfg_.rel_clip, w.local ? nullptr : &tau, r3);
-      Tensor sink = view(sink_, {T, H});
-      be_.linear(xq, w.sink_proj, sink);
-      AttnArgs aa;
-      aa.q = q3;
-      aa.k_new = k3;
-      aa.v_new = v3;
-      aa.r = r3;
-      aa.rel_proj = w.rel_proj;
-      aa.sink = sink;
-      aa.kv = s.kv;
-      aa.window = w.local ? cfg_.window : 0;
-      Tensor at = view(attn_, {T, H * HD});
-      be_.attention(aa, at);
-      be_.kv_append(k3, v3, s.kv);
-      Tensor g = view(gate_, {T, H * HD});
-      be_.linear(xq, w.gate_proj, g);
-      be_.sigmoid_gate(at, g, at);
-      Tensor ao = view(ao_, {T, D});
-      be_.linear(at, w.o_proj, ao);
-
-      // ---- residual + MoE ----
-      Tensor resb = view(resb_, {T, D}), res = view(res_, {T, D});
-      be_.short_conv(ao, w.attn_sconv, s.conv[2], resb);
-      if (boundary) {
-        Tensor blk = view(blk_[blocks.size()], {T, D});
-        be_.copy(x, blk);
-        blocks.push_back(blk);
-        be_.cast(resb, res);
-      } else {
-        be_.add(resb, x, res);
-      }
-      Tensor hid = view(hid_, {1, T, D});
-      {
-        std::vector<const Tensor*> states;
-        for (auto& b : blocks) states.push_back(&b);
-        states.push_back(&res);
-        be_.attn_residual(states, w.mlp_query, hid);
-      }
-      Tensor hid2 = view(hid_, {T, D});
-      if (msg.valid()) {
-        Tensor m3 = row_view(msg_, 3, {T, D});
-        be_.controller(hid2, m3, w.ctrl_down[3], w.ctrl_forget[3], w.ctrl_gain[3], hid2);
-      }
-      Tensor hn = view(hn_, {T, D});
-      be_.rms_norm(hid2, &w.post_norm, cfg_.rms_eps, D, hn);
-      Tensor ridx = view(ridx_, {T, cfg_.topk}), rw = view(rw_, {T, cfg_.topk});
-      be_.router(hn, w.moe, cfg_.topk, cfg_.route_scale, ridx, rw);
-      Tensor mo = view(moe_, {T, D});
-      be_.moe(hn, ridx, rw, w.moe, mo);
-      Tensor mc = view(mo_, {T, D});
-      be_.short_conv(mo, w.mlp_sconv, s.conv[3], mc);
-      be_.add(res, mc, x);  // new x (bf16)
-    }
+    run_visit(v, x, blocks, msg, T);
   }
 
   // Final: attention-residual readout, norm, logits.
@@ -402,10 +420,60 @@ void Model::forward(const int32_t* ids, int64_t T, bool all_logits) {
   Tensor lg = view(logits_dev_, {rows, V});
   be_.logits(hrow, head_, V, cfg_.logit_cap, lg);
   be_.sync();
-  logits_.resize(size_t(rows * V));
+  logits_.resize(static_cast<size_t>(rows * V));
   be_.read(lg, logits_.data(), logits_.size() * 4);
   logit_rows_ = rows;
   len_ += T;
+  keep_hist_ = false;
+}
+
+void Model::ensure_hist() {
+  if (vs_.empty() || vs_[0].hist[0].valid()) return;
+  for (auto& s : vs_)
+    for (int i = 0; i < 4; ++i) s.hist[i] = be_.alloc(DType::F32, {kMaxHist, 3, s.conv[i].dim(1)}, "conv.hist");
+}
+
+void Model::rollback(int64_t n_keep) {
+  if (hist_rows_ == 0 || n_keep < 1 || n_keep > hist_rows_) throw std::runtime_error("rollback: no history");
+  const int64_t base = len_ - hist_rows_;
+  if (n_keep < hist_rows_) {
+    for (auto& s : vs_)
+      for (int i = 0; i < 4; ++i) {
+        size_t row = s.conv[i].nbytes();
+        be_.copy(s.hist[i], s.conv[i], size_t(n_keep - 1) * row, 0, row);
+      }
+    set_len(base + n_keep);
+  }
+  hist_rows_ = 0;
+}
+
+void Model::debug_visit(int v, const Tensor& x_in, const std::vector<const Tensor*>& blocks_in,
+                        const std::vector<const Tensor*>& bank_in, Tensor& x_out, int64_t T) {
+  const int64_t D = cfg_.hidden;
+  const int L = cfg_.visits[v];
+  write_tau(T);
+  Tensor x = view(x_, {T, D});
+  be_.copy(x_in, x);
+  std::vector<Tensor> blocks;
+  for (size_t i = 0; i < blocks_in.size(); ++i) {
+    Tensor b = view(blk_[i], {T, D});
+    be_.copy(*blocks_in[i], b);
+    blocks.push_back(b);
+  }
+  Tensor msg;
+  if (!bank_in.empty()) {
+    for (size_t i = 0; i < bank_in.size(); ++i) {
+      Tensor b = view(bank_[i], {T, D});
+      be_.copy(*bank_in[i], b);
+    }
+    msg = view(msg_, {4, T, D});
+    Tensor q = row_view(msg_queries_, L - cfg_.core_start, {4, D});
+    Tensor b0 = view(bank_[0], {T, D}), b1 = view(bank_[1], {T, D});
+    be_.loop_messages({&b0, &b1}, q, msg);
+  }
+  run_visit(v, x, blocks, msg, T);
+  be_.copy(x, x_out);
+  be_.sync();
 }
 
 }  // namespace ink
