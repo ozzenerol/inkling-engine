@@ -20,3 +20,13 @@ for M8 in $HOME/llm/mlx-models/Inkling-2-Mini-MLX-8bit $HOME/llm/mlx-models/Inkl
   done; ls $BS/m64 | head -3 | tr '\n' ' '; cmp $BS/m64/logits.f32 $BS/m32/logits.f32 && cmp $BS/m64/logits.f32 $BS/m0/logits.f32 && echo "moe tile logits IDENTICAL"; done
 done
 INK_MOE_M=32 build/gpu/op_diff 2>&1 | grep -E "moe .*T=300|ALL|FAILED"
+echo "== B NULL chain: 8-bit plain decode with every dispatch replaced by a one-thread kernel (same barriers / commits)"
+bin() { for d in build/gpu build/src/gpu build; do [ -x $d/$1 ] && { echo $d/$1; return; }; done; echo "missing:$1"; }
+M8=$HOME/llm/mlx-models/Inkling-2-Mini-MLX-8bit
+for v in "X=1" "INK_NULL=1" "INK_NULL=1 INK_NO_FUSE2=1" "INK_NULL=1 INK_SERIAL=1" "INK_NULL=1 INK_COMMIT_EVERY=0" "INK_SERIAL=1"; do
+  echo -n "[$v] "; env $v INK_GPU_TIME=1 INK_MODEL=$M8 $(bin spec_check) plain ref_data/p2.ids 100 4 /dev/null 2>&1 | grep -E "hazard|tok/s" | tr '\n' ' '; echo
+done
+echo "== B INTERLEAVE bench: dependent vs independent tiny dispatches between the q8 matvecs"
+for n in 0 2 6; do INTERLEAVE=$n $(bin bench_q8) 1; done
+for n in 2 6; do INTERLEAVE_INDEP=1 INTERLEAVE=$n $(bin bench_q8) 1; done
+INK_SERIAL=1 INTERLEAVE=2 $(bin bench_q8) 1; INK_NULL=1 INTERLEAVE=2 $(bin bench_q8) 1
