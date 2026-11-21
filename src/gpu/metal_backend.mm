@@ -90,6 +90,7 @@ struct ResParams {
   uint32_t T, D, nb, nq;
   uint32_t dt[8];
   float eps;
+  uint32_t conv_hist, conv_dt_other;
 };
 struct CtrlParams {
   uint32_t T, D, R, m_stride;
@@ -163,6 +164,11 @@ class MetalBackend final : public Backend {
   ~MetalBackend() override {
     sync();
     prof_report();
+    for (uint32_t t = 2; t <= 16; t++)
+      if (moe_calls_[t])
+        fprintf(stderr, "moe stats T=%-2u: %ld calls, routes %ld, distinct experts %ld (%.1f%% of the routes; %.2f per call "
+                        "of %u)\n", t, moe_calls_[t], moe_routes_[t], moe_uniq_[t], 100.0 * moe_uniq_[t] / moe_routes_[t],
+                double(moe_uniq_[t]) / moe_calls_[t], t * 8);
     if (gpu_time_ && acc_n_)
       fprintf(stderr, "gpu time: %ld syncs, per sync: wall %.2f ms (since previous sync), GPU span %.2f ms, CPU wait %.2f ms\n",
               acc_n_, acc_wall_ / acc_n_, acc_gpu_ / acc_n_, acc_wait_ / acc_n_);
@@ -535,7 +541,47 @@ class MetalBackend final : public Backend {
     g_.set_value(10, p);
     bind(11, gamma ? *gamma : query);
     bind(12, normed ? *normed : out);
+    for (uint32_t i = 13; i <= 18; i++) bind(i, out);  // CONV-only arguments (unused here)
     g_.dispatch({p.T, 1, 1}, {wide ? 1024u : 256u, 1, 1});
+  }
+  // conv_add (attn_sconv + residual) and the following mix + post norm in one threadgroup (T == 1 only; the
+  // arithmetic is that of conv_add4 and attn_residual_mix_norm_1024, so it is bit-identical to the two ops).
+  void conv_add_mix_norm(const Tensor& x, const Tensor& w, Tensor& state, Tensor* hist, const Tensor& other,
+                         Tensor& tmp, Tensor& res, const std::vector<const Tensor*>& states, const Tensor& query,
+                         Tensor& mixed, const Tensor& gamma, float eps, Tensor& normed) override {
+    uint32_t D = uint32_t(x.dim(-1)), T = uint32_t(x.numel() / D);
+    bool nq1 = query.ndim == 1 || query.dim(0) == 1;
+    if (T != 1 || !nq1 || D > 2304 || res.dtype != DType::F32 || normed.dtype != DType::BF16 || states.size() > 8 ||
+        states.back()->buf != res.buf || !getenv("INK_CONV_MIX"))  // opt-in until GPU-tested
+      return Backend::conv_add_mix_norm(x, w, state, hist, other, tmp, res, states, query, mixed, gamma, eps, normed);
+    if (skip("mix")) return;
+    bool hh = hist && hist->valid();
+    ResParams p{};
+    p.T = 1;
+    p.D = D;
+    p.nb = uint32_t(states.size());
+    p.nq = 1;
+    p.eps = eps;
+    p.conv_hist = hh;
+    p.conv_dt_other = dtc(other.dtype);
+    pipe("conv_mix_norm_1024");
+    for (uint32_t i = 0; i < 8; i++) {
+      const Tensor& s = *states[std::min<size_t>(i, states.size() - 1)];
+      bind(i, s);
+      p.dt[i] = dtc(s.dtype);
+    }
+    bind(8, query);
+    bind(9, mixed);
+    g_.set_value(10, p);
+    bind(11, gamma);
+    bind(12, normed);
+    bind(13, x);
+    bind(14, w);
+    bind(15, state);
+    bind(16, hh ? *hist : state);
+    bind(17, other);
+    bind(18, res);
+    g_.dispatch({1, 1, 1}, {1024, 1, 1});
   }
   void attn_residual(const std::vector<const Tensor*>& states, const Tensor& query, Tensor& out) override {
     uint32_t nq = query.ndim == 1 ? 1 : uint32_t(query.dim(0));
@@ -632,7 +678,7 @@ class MetalBackend final : public Backend {
     g_.set_value(3, p);
     g_.dispatch({T, 1, 1}, {256, 1, 1});
     linear(pair, down, h);
-    if (T > 16 && getenv("INK_CTRL_GEMM")) {  // opt-in until measured
+    if (T > 16 && !getenv("INK_CTRL_SCALAR")) {  // batch 3: p3 prefill 3.96 -> 3.72 s (one run)
       // prefill: forget/gain projections as GEMMs (K = 64), then an elementwise combine
       Tensor F = scratch("ctrl-F", DType::F32, {T, D}), G = scratch("ctrl-G", DType::F32, {T, D});
       linear(h, forget, F);
@@ -1086,11 +1132,24 @@ class MetalBackend final : public Backend {
     if (x.dtype != DType::BF16) fail("moe: x must be bf16");
     uint32_t D = uint32_t(x.dim(-1)), T = uint32_t(x.numel() / D), topk = uint32_t(idx.dim(-1));
     uint32_t routes = T * topk, I = uint32_t(m.gate.n);
+    if (moe_stats_ && T > 1 && T <= 16) {
+      // D, diagnostics (INK_MOE_STATS=1, a sync per MoE call): how many of the T*topk routes of a verify hit an
+      // expert already used by an earlier row of the same forward. That share is what an expert-union kernel saves.
+      sync();
+      const int32_t* ip = idx.data<int32_t>();
+      bool seen[256] = {};
+      uint32_t uniq = 0;
+      for (uint32_t i = 0; i < routes; i++)
+        if (uint32_t(ip[i]) < 256 && !seen[ip[i]]) seen[ip[i]] = true, uniq++;
+      moe_calls_[T]++;
+      moe_routes_[T] += routes;
+      moe_uniq_[T] += uniq;
+    }
     if (topk == 8 && T <= 16 && !getenv("INK_MOE_SLOW")) {
       bool nv = m.gate.mode == QuantMode::NVFP4;
       Tensor at = scratch("moe-a", DType::BF16, {routes, I});
       MoeFastParams gp{I, D, topk};
-      pipe(nv ? (getenv("INK_FP4_LUT") ? "moe_gateup_nvfp4_lut" : "moe_gateup_nvfp4") : "moe_gateup_mxfp8");
+      pipe(nv ? "moe_gateup_nvfp4" : "moe_gateup_mxfp8");
       bind(0, m.gate.weight);
       bind(1, m.gate.scales);
       bind(2, m.gate.global.valid() ? m.gate.global : m.gate.scales);
@@ -1145,9 +1204,7 @@ class MetalBackend final : public Backend {
   void moe_gemm(const QuantProj& q, const Tensor& a, const Tensor& perm, const Tensor& offs, const Tensor& tiles,
                 const Tensor& tiles_n, uint32_t max_tiles, uint32_t topk, bool gather, bool scatter, Tensor& out) {
     MoeGemmParams p{uint32_t(q.n), uint32_t(q.k), topk, gather ? 1u : 0u, scatter ? 1u : 0u};
-    bool v2 = getenv("INK_MOE_GEMM2") != nullptr;  // candidate, off until measured
-    pipe(q.mode == QuantMode::NVFP4 ? (v2 ? "moe_gemm2_nvfp4" : "moe_gemm_nvfp4")
-                                    : (v2 ? "moe_gemm2_mxfp8" : "moe_gemm_mxfp8"));
+    pipe(q.mode == QuantMode::NVFP4 ? "moe_gemm_nvfp4" : "moe_gemm_mxfp8");
     bind(0, q.weight);
     bind(1, q.scales);
     bind(2, q.global.valid() ? q.global : q.scales);
@@ -1239,6 +1296,8 @@ class MetalBackend final : public Backend {
   // rows from which the multi-row attention kernel is used. 3: it is bit-identical to attn_decode_split and at
   // T = 3, 4 faster (32k global: 1.11 ms vs 1.94; 128k: 3.8 vs 6.8), at T <= 2 equal.
   uint32_t mr_attn_min_ = getenv("INK_MR_ATTN_MIN") ? uint32_t(atoi(getenv("INK_MR_ATTN_MIN"))) : 3;
+  bool moe_stats_ = getenv("INK_MOE_STATS") != nullptr;
+  long moe_calls_[17] = {}, moe_routes_[17] = {}, moe_uniq_[17] = {};
   bool mr_attn_ = !(getenv("INK_MR_ATTN") && getenv("INK_MR_ATTN")[0] == '0');  // D: 5..16-row attention
   bool ag_stats_ = getenv("INK_AG_STATS") != nullptr;
   // Chain kernels (A), opt-in with INK_CHAIN=1: measured SLOWER than the separate ops (decode 28.6 vs 36.9 tok/s;

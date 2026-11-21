@@ -210,6 +210,14 @@ class Backend {
                               Tensor* outs) {
     for (int i = 0; i < n; ++i) rms_norm(xs[i], gammas[i], eps, dim, outs[i]);
   }
+  // conv_add(x, w, state, hist, other, tmp, res) then attn_residual_norm(states (last = res), query, mixed, gamma,
+  // eps, normed).
+  virtual void conv_add_mix_norm(const Tensor& x, const Tensor& w, Tensor& state, Tensor* hist, const Tensor& other,
+                                 Tensor& tmp, Tensor& res, const std::vector<const Tensor*>& states,
+                                 const Tensor& query, Tensor& mixed, const Tensor& gamma, float eps, Tensor& normed) {
+    conv_add(x, w, state, hist, other, tmp, res);
+    attn_residual_norm(states, query, mixed, gamma, eps, normed);
+  }
   // attention() then sigmoid_gate(out, gate, out).
   virtual void attention_gated(const AttnArgs& a, const Tensor& gate, Tensor& out) {
     attention(a, out);

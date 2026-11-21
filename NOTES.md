@@ -475,3 +475,45 @@ head 0.93 -> 0.48). Check script: tests/ref/check_8bit_layout.py (tensor-by-tens
   102 s (MLX 241.5 s); qh end-to-end PASS in 38 s.
   Attention sparsity (INK_AG_STATS, p17, global layers): (row, 64-key tile) pairs below 1e-6 of the row's top
   weight: 0-2.5%; 64x64 tiles where every row is below 1e-6: 0.0%. Skipping far keys is not an option.
+- **Batch 3** (main fd7f72b, 19:57-20:11; b/work, c/work, d/work, a/work merged): all gates pass (op_diff ALL OK
+  with and without q8; acc unchanged; spec identity; rollback). With D's multi-row kernels (one-pass matvec and
+  split attention for 3..16 rows) a verify of 8 rows costs ~73 ms at 2.3k context (T=5 was 122-126 ms), T=3/4 =
+  38.8 / 45.4 ms. Greedy, 600 tokens, token-identical to plain, one run each (tok/s):
+
+  | | plain | drafter block 4 | drafter block 8 | lookup <= 3 | lookup <= 7 | lookup <= 15 | block 8 + lookup 15, temp 0.7 |
+  |---|---|---|---|---|---|---|---|
+  | copy | 33.4 | 65.9 | 85.8 | 71.2 | 88.7 | **100.6** | 97.1 |
+  | edit | 33.3 | 59.3 | 73.7 | 67.3 | 81.2 | **96.2** | 93.2 |
+
+  Lookup v2 (best of 4 trigram positions by backward match, >= 6 tokens): 526 of 600 drafts accepted on copy
+  (v1: 391 of 625). p2 (free text, 99 tokens): block 4 41.5, block 8 with the 8-arm bandit 34.0 (too much
+  exploration) -> policy replaced: k follows acceptance (2k+1 / accepted+1), plain fallback by measured rate.
+  B: MoE LUT no gain (134.6 vs 137.2 us), CTRL_GEMM -6% on p3 prefill (3.72 vs 3.96 s), MOE_GEMM2 slower.
+  C (server, short set): ctxbench temp 0.7 gen 36.8 / 33.3 tok/s lossless, 38.1 / 38.1 8-bit at 1.2k / 9.5k (MLX
+  23.1 / 24.2); prefill 698 / 750 (MLX 565 / 602); agent bench 10 turns: median gen 63.4 lossless, 66.5 8-bit
+  (76 on turns 6-10), MLX 44.1; totals 97.3 / 88.9 s, MLX 241.5 s; qh end-to-end PASS in 18 s.
+
+
+## D: multi-row forwards, T = 5..16 (2026-11-21 night, model-free benches, one run each)
+
+- **Where the T >= 5 cliff was**: above 4 rows attention went to `attn_prefill`, 8 threadgroups for the whole
+  context: 2.16 ms per call at 2k global (T = 8 or 16), 32 ms at 32k. Dense: passes of 4 rows, W reread per pass.
+- **Attention** (`mr_attn_split` / `mr_attn_combine`, kernels/multirow.metal): B's splits, block walk and per-row
+  arithmetic; one simdgroup per (8-row group, block parity), K/V tile staged once per parity for all rows.
+  Per call, new vs old: 2k global T=8 0.226 ms vs 2.164, T=16 0.248 vs 2.166; 32k global T=5 1.12, T=8 1.43 vs 32.2,
+  T=16 3.07 vs 32.4; 128k global T=8 5.2, T=16 11.8; local T=16 0.229. Also faster than `attn_decode_split` at 3-4
+  rows (32k: 1.11 vs 1.94 ms; 128k: 3.81 vs 6.8) and equal at 1-2, so it is the default from 3 rows
+  (INK_MR_ATTN_MIN, INK_MR_ATTN=0 = off).
+- **Dense** (`mr_matvec`, one pass over W, x rows walked one at a time with the weight chunks held): 2.58 GB of
+  attention projections: T=5 9.7 ms, T=8 10.1, T=16 18.1 (passes of 4: 12.6 / 12.9 / 20.8; 1 row 7.8). Output head
+  0.92 GB: T=5 2.37 ms, T=8 2.65, T=16 4.24 (passes of 4: 4.70 / 4.73 / 9.54). Best layout: 2 output rows per
+  simdgroup up to 8 rows, 4 above. A loop over only the rows present (no unrolling) is slower (22-32 ms at 16).
+  Above 8 rows it is compute bound. Not better: skinny2 21.2 ms at 8 rows, 28.0 at 16; t8tg 81 ms at 8 rows.
+  `mr_matvec_multi` (linear_multi, controller_multi) uses 4 rows per simdgroup for both sizes; unmeasured.
+- **Bit identity** (op_diff): "linear rows==T1" (linear, linear_multi, bf16/f32 in and out) and "verify==decode"
+  (global, local ring) at T = 4, 5, 8, 11, 16: all rows equal. Fused mix+norm, wide mix and controller_multi now run
+  up to 16 rows (the 256-thread mix reduces in another order than the 1024-thread one used for decode).
+- **MoE**: not touched. Cost is per route (T=4 449 us per call vs 136 at T=1, B), so a T-row verify costs at least
+  plain + (T-1) x ~6.8 ms unless rows share experts.
+- Switches: INK_MR=0 (dense passes of 4), INK_MR_ATTN=0, INK_MR_ATTN_MIN=n.
+- Open: forward times per T with the model (queue d), drafter 8 ms -> 3 ms, a 12-row dense variant, q8 multi-row.

@@ -562,7 +562,7 @@ void Model::run_visit(int v, Tensor& x, std::vector<Tensor>& blocks, const Chain
       be_.copy(x, blk);
       blocks.push_back(blk);
       be_.cast(resb, res);
-    } else {
+    } else if (has_msg) {
       be_.conv_add(ao, w.attn_sconv, s.conv[2], hist[2], x, resb, res);  // conv + residual add (fused on Metal)
     }
     Tensor hid = view(hid_, {1, T, D});
@@ -570,7 +570,12 @@ void Model::run_visit(int v, Tensor& x, std::vector<Tensor>& blocks, const Chain
       std::vector<const Tensor*> states;
       for (auto& b : blocks) states.push_back(&b);
       states.push_back(&res);
-      if (!has_msg) {
+      if (!has_msg && !boundary) {
+        // conv + residual add + mix + post norm: one op (B); default = conv_add then attn_residual_norm
+        Tensor hn0 = view(hn_, {T, D});
+        be_.conv_add_mix_norm(ao, w.attn_sconv, s.conv[2], hist[2], x, resb, res, states, w.mlp_query, hid,
+                              w.post_norm, cfg_.rms_eps, hn0);
+      } else if (!has_msg) {
         Tensor hn0 = view(hn_, {T, D});
         be_.attn_residual_norm(states, w.mlp_query, hid, w.post_norm, cfg_.rms_eps, hn0);  // mix + post norm (B)
       } else {

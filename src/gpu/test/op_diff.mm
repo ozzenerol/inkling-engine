@@ -198,6 +198,33 @@ int main(int argc, char** argv) {
                 memcmp(mx1.data<float>(), mx2.data<float>(), size_t(T * D * 4)) == 0;
     printf("%-28s %s\n", "mix+norm fused == separate", same ? "ok" : "FAIL");
     if (!same) fails++;
+    if (getenv("INK_CONV_MIX")) {  // conv_add + mix + norm in one kernel == the two ops (Metal vs Metal, T = 1)
+      Tensor cx = MTL->alloc(DType::BF16, {1, D}, "cx"), oth = MTL->alloc(DType::BF16, {1, D}, "oth");
+      Tensor r1 = MTL->alloc(DType::F32, {1, D}, "r1"), r2 = MTL->alloc(DType::F32, {1, D}, "r2");
+      Tensor st1 = MTL->alloc(DType::F32, {3, D}, "st1"), st2 = MTL->alloc(DType::F32, {3, D}, "st2");
+      Tensor tmp = MTL->alloc(DType::BF16, {1, D}, "tmp"), cwt = MTL->alloc(DType::BF16, {D, 4}, "cw");
+      Tensor ma = MTL->alloc(DType::F32, {1, 1, D}, "ma"), mb = MTL->alloc(DType::F32, {1, 1, D}, "mb");
+      Tensor na = MTL->alloc(DType::BF16, {1, D}, "na"), nb = MTL->alloc(DType::BF16, {1, D}, "nb");
+      MTL->sync();
+      std::normal_distribution<float> nd(0, 1);
+      for (int64_t k = 0; k < D; k++) {
+        cx.data<uint16_t>()[k] = f32_to_bf16(nd(rng));
+        oth.data<uint16_t>()[k] = f32_to_bf16(nd(rng));
+        for (int j = 0; j < 4; j++) cwt.data<uint16_t>()[k * 4 + j] = f32_to_bf16(nd(rng) * 0.3f);
+        for (int j = 0; j < 3; j++) st1.data<float>()[j * D + k] = st2.data<float>()[j * D + k] = nd(rng);
+      }
+      Tensor b0 = s0.m, b1 = s1.m;  // first rows as block states
+      b0.set_shape({1, D});
+      b1.set_shape({1, D});
+      MTL->conv_add_mix_norm(cx, cwt, st1, nullptr, oth, tmp, r1, {&b0, &b1, &r1}, q1.m, ma, gam.m, 1e-6f, na);
+      MTL->conv_add(cx, cwt, st2, nullptr, oth, tmp, r2);
+      MTL->attn_residual_norm({&b0, &b1, &r2}, q1.m, mb, gam.m, 1e-6f, nb);
+      MTL->sync();
+      bool eq = !memcmp(na.data<uint16_t>(), nb.data<uint16_t>(), D * 2) && !memcmp(r1.data<float>(), r2.data<float>(), D * 4) &&
+                !memcmp(st1.data<float>(), st2.data<float>(), 3 * D * 4) && !memcmp(ma.data<float>(), mb.data<float>(), D * 4);
+      printf("%-28s %s\n", "conv+mix+norm == separate", eq ? "ok" : "FAIL");
+      if (!eq) fails++;
+    }
   }
   for (int64_t T : {2, 40}) {  // controller (T = 40: prefill GEMM path)
     auto x = make(DType::F32, {T, D}), m = make(DType::F32, {4, T, D});

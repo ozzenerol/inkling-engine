@@ -13,7 +13,7 @@ struct EngineOptions {
   std::string model_dir;
   int64_t max_context = 131072;
   bool use_mtp = true;     // DSpark drafting
-  int draft_block = 4;
+  int draft_block = 8;  // 1 + up to 7 drafter tokens per verify (the drafter's own block size)
   int prefill_chunk = 2048;
 };
 
