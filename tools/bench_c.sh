@@ -1,14 +1,14 @@
 #!/bin/bash
 # Owner: C. Server benchmarks for inkling-server vs MLX-VLM, one server at a time on port 8091.
-#   tools/bench_c.sh inkling   start build-c/src/server/inkling-server, measure it, stop it
+#   tools/bench_c.sh inkling   start build/src/server/inkling-server (or BIN), measure it, stop it
 #   tools/bench_c.sh mlx       start ~/llm/serve_inkling.sh (MLX-VLM + DSpark), measure it, stop it
 #   tools/bench_c.sh report    print markdown tables from the JSON files
 # Measures: ~/llm/ctxbench.py (BRIEF baseline: temp 0.7, effort none, 400 tokens) and tools/agent_bench.py
 # (qh-like session, 10 turns, with base context 0 and 30000: per-turn TTFT and total wall time).
-# Announce the GPU lock in NOTES.md and to the other agents before running inkling or mlx.
+# GPU: these load the model, so they run only inside the batch (tools/WORKFLOW.md, tools/queue/c.sh).
 # Env: SIZES (ctxbench, default 1000,8000,16000,32000,64000,104000), CONTEXTS (bench.py, default 40,1k,4k,16k,32k),
 #      TURNS (10), AGENT_BASES ("0 30000"), OUT (bench/), SERVER_ARGS (extra inkling-server flags),
-#      BIN (server binary, default build-c/src/server/inkling-server), SKIP_CTX=1, SKIP_AGENT=1.
+#      BIN (server binary), SKIP_CTX=1, SKIP_AGENT=1. SERVER_ARGS="--model DIR" for the 8-bit build.
 set -u
 here=$(cd "$(dirname "$0")/.." && pwd)
 py=$HOME/llm/inkling-venv/bin/python
@@ -19,6 +19,10 @@ turns=${TURNS:-10}
 out=${OUT:-$here/bench}
 url=http://127.0.0.1:8091
 mkdir -p "$out"
+
+# Server binary: BIN, else this tree's build/ (what the batch builds), else build-c/.
+bin=${BIN:-$here/build/src/server/inkling-server}
+[ -x "$bin" ] || bin=$here/build-c/src/server/inkling-server
 
 up() { curl -s -m 2 "$url/v1/models" >/dev/null; }
 
@@ -58,7 +62,7 @@ case "${1:-}" in
 inkling)
 	up && { echo "something already serves $url; stop it first"; exit 1; }
 	# shellcheck disable=SC2086
-	start_and_wait "$out/inkling-serve.log" "${BIN:-$here/build-c/src/server/inkling-server}" --port 8091 ${SERVER_ARGS:-}
+	start_and_wait "$out/inkling-serve.log" "$bin" --port 8091 ${SERVER_ARGS:-}
 	measure inkling
 	;;
 mlx)

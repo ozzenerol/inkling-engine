@@ -1,0 +1,6 @@
+{"size": 1000, "prompt_tokens": 1221, "completion_tokens": 400, "prefill_s": 2.16, "prefill_tps": 564.8, "gen_tps": 23.1}
+{"size": 8000, "prompt_tokens": 9461, "completion_tokens": 400, "prefill_s": 15.7, "prefill_tps": 602.5, "gen_tps": 24.2}
+{"size": 16000, "prompt_tokens": 18881, "prefill_tps": 571, "gen_tps": 23.3, "source": "BRIEF"}
+{"size": 32000, "prompt_tokens": 38584, "completion_tokens": 400, "prefill_s": 77.89, "prefill_tps": 495.4, "gen_tps": 22.0}
+{"size": 64000, "prompt_tokens": 78106, "prefill_tps": 385, "gen_tps": 16.5, "source": "BRIEF"}
+{"size": 104000, "prompt_tokens": 127519, "prefill_tps": 324, "gen_tps": 13.8, "source": "BRIEF"}
