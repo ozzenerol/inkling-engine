@@ -164,6 +164,11 @@ class MetalBackend final : public Backend {
   ~MetalBackend() override {
     sync();
     prof_report();
+    for (uint32_t t = 2; t <= 16; t++)
+      if (moe_calls_[t])
+        fprintf(stderr, "moe stats T=%-2u: %ld calls, routes %ld, distinct experts %ld (%.1f%% of the routes; %.2f per call "
+                        "of %u)\n", t, moe_calls_[t], moe_routes_[t], moe_uniq_[t], 100.0 * moe_uniq_[t] / moe_routes_[t],
+                double(moe_uniq_[t]) / moe_calls_[t], t * 8);
     if (gpu_time_ && acc_n_)
       fprintf(stderr, "gpu time: %ld syncs, per sync: wall %.2f ms (since previous sync), GPU span %.2f ms, CPU wait %.2f ms\n",
               acc_n_, acc_wall_ / acc_n_, acc_gpu_ / acc_n_, acc_wait_ / acc_n_);
@@ -1127,6 +1132,19 @@ class MetalBackend final : public Backend {
     if (x.dtype != DType::BF16) fail("moe: x must be bf16");
     uint32_t D = uint32_t(x.dim(-1)), T = uint32_t(x.numel() / D), topk = uint32_t(idx.dim(-1));
     uint32_t routes = T * topk, I = uint32_t(m.gate.n);
+    if (moe_stats_ && T > 1 && T <= 16) {
+      // D, diagnostics (INK_MOE_STATS=1, a sync per MoE call): how many of the T*topk routes of a verify hit an
+      // expert already used by an earlier row of the same forward. That share is what an expert-union kernel saves.
+      sync();
+      const int32_t* ip = idx.data<int32_t>();
+      bool seen[256] = {};
+      uint32_t uniq = 0;
+      for (uint32_t i = 0; i < routes; i++)
+        if (uint32_t(ip[i]) < 256 && !seen[ip[i]]) seen[ip[i]] = true, uniq++;
+      moe_calls_[T]++;
+      moe_routes_[T] += routes;
+      moe_uniq_[T] += uniq;
+    }
     if (topk == 8 && T <= 16 && !getenv("INK_MOE_SLOW")) {
       bool nv = m.gate.mode == QuantMode::NVFP4;
       Tensor at = scratch("moe-a", DType::BF16, {routes, I});
@@ -1280,6 +1298,8 @@ class MetalBackend final : public Backend {
   // rows from which the multi-row attention kernel is used. 3: it is bit-identical to attn_decode_split and at
   // T = 3, 4 faster (32k global: 1.11 ms vs 1.94; 128k: 3.8 vs 6.8), at T <= 2 equal.
   uint32_t mr_attn_min_ = getenv("INK_MR_ATTN_MIN") ? uint32_t(atoi(getenv("INK_MR_ATTN_MIN"))) : 3;
+  bool moe_stats_ = getenv("INK_MOE_STATS") != nullptr;
+  long moe_calls_[17] = {}, moe_routes_[17] = {}, moe_uniq_[17] = {};
   bool mr_attn_ = !(getenv("INK_MR_ATTN") && getenv("INK_MR_ATTN")[0] == '0');  // D: 5..16-row attention
   bool ag_stats_ = getenv("INK_AG_STATS") != nullptr;
   // Chain kernels (A), opt-in with INK_CHAIN=1: measured SLOWER than the separate ops (decode 28.6 vs 36.9 tok/s;
