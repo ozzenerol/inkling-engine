@@ -560,3 +560,80 @@ kernel void round_bf_f32(device const float* a [[buffer(0)]], device float* out 
   if (i >= n) return;
   out[i] = round_bf(a[i]);
 }
+
+// ---------------------------------------------------------------- parallel router: scores via matvec (f32 out),
+// then one threadgroup of E threads per token: sigmoid, rank-based top-k (descending s+bias, ties -> lower index).
+kernel void router_select(device const float* logit [[buffer(0)]], device const float* bias [[buffer(1)]],
+                          device int* idx [[buffer(2)]], device float* wout [[buffer(3)]],
+                          constant RouterParams& p [[buffer(4)]], uint t [[threadgroup_position_in_grid]],
+                          uint e [[thread_index_in_threadgroup]]) {
+  threadgroup float sc[128], key[128];
+  threadgroup int sel[16];
+  if (e < p.E) {
+    float s = 1.0f / (1.0f + exp(-logit[t * p.E + e]));
+    sc[e] = s;
+    key[e] = s + bias[e];
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (e < p.E) {
+    float v = key[e];
+    uint rank = 0;
+    for (uint j = 0; j < p.E; j++) {
+      float u = key[j];
+      rank += (u > v || (u == v && j < e)) ? 1u : 0u;
+    }
+    if (rank < p.topk) sel[rank] = int(e);
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (e == 0) {
+    float sum = 0;
+    for (uint k = 0; k < p.topk; k++) sum += sc[sel[k]];
+    for (uint k = 0; k < p.topk; k++) {
+      idx[t * p.topk + k] = sel[k];
+      wout[t * p.topk + k] = sc[sel[k]] / (sum + 1e-20f) * p.scale;
+    }
+  }
+}
+
+// ---------------------------------------------------------------- controller in three parallel steps
+// 1) pair = bf16([rms(x), rms(m)]) per token (one threadgroup of 256 per token)
+kernel void ctrl_pair(device const float* x [[buffer(0)]], device const float* m [[buffer(1)]],
+                      device ushort* pair [[buffer(2)]], constant CtrlParams& p [[buffer(3)]],
+                      uint t [[threadgroup_position_in_grid]], uint tid [[thread_position_in_threadgroup]],
+                      uint lane [[thread_index_in_simdgroup]], uint sg [[simdgroup_index_in_threadgroup]]) {
+  threadgroup float scratch[RT / 32];
+  device const float* xr = x + t * p.D;
+  device const float* mr = m + t * p.m_stride;
+  float sx = 0, sm = 0;
+  for (uint i = tid; i < p.D; i += RT) {
+    sx += xr[i] * xr[i];
+    sm += mr[i] * mr[i];
+  }
+  sx = tg_sum(sx, scratch, tid, lane, sg);
+  sm = tg_sum(sm, scratch, tid, lane, sg);
+  float ix = metal::precise::rsqrt(sx / float(p.D) + 1e-6f), im = metal::precise::rsqrt(sm / float(p.D) + 1e-6f);
+  for (uint i = tid; i < p.D; i += RT) {
+    pair[t * 2 * p.D + i] = f2bf(xr[i] * ix);
+    pair[t * 2 * p.D + p.D + i] = f2bf(mr[i] * im);
+  }
+}
+// 2) h = bf16(pair @ down^T): matvec / gemm in the backend
+// 3) out = (1 - tanh(h @ forget^T)) * x + tanh(h @ gain^T) * m, one thread per (t, i)
+kernel void ctrl_out(device const float* x [[buffer(0)]], device const float* m [[buffer(1)]],
+                     device const ushort* h [[buffer(2)]], device const ushort* forget [[buffer(3)]],
+                     device const ushort* gain [[buffer(4)]], device float* out [[buffer(5)]],
+                     constant CtrlParams& p [[buffer(6)]], uint2 gid [[thread_position_in_grid]]) {
+  uint i = gid.x, t = gid.y;
+  if (i >= p.D || t >= p.T) return;
+  device const ushort* hr = h + t * p.R;
+  float f = 0, g = 0;
+  for (uint r = 0; r < p.R; r++) {
+    float hv = bf2f(hr[r]);
+    f = fma(hv, bf2f(forget[i * p.R + r]), f);
+    g = fma(hv, bf2f(gain[i * p.R + r]), g);
+  }
+  f = precise::tanh(f);
+  g = precise::tanh(g);
+  float xv = x[t * p.D + i];
+  out[t * p.D + i] = (1 - f) * xv + g * m[t * p.m_stride + i];
+}

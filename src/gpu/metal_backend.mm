@@ -7,6 +7,9 @@
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
+#include <map>
+#include <algorithm>
+#include <vector>
 
 #include "gpu/context.h"
 #include "model/backend.h"
@@ -114,9 +117,10 @@ uint32_t cdiv(uint64_t a, uint64_t b) { return uint32_t((a + b - 1) / b); }
 
 class MetalBackend final : public Backend {
  public:
-  MetalBackend() : g_(Context::get()) {}
+  MetalBackend() : g_(Context::get()) { profile_ = getenv("INK_PROFILE") != nullptr; }
   ~MetalBackend() override {
     sync();
+    prof_report();
     for (auto& [k, b] : scratch_) g_.release(b);
   }
   const char* name() const override { return "metal"; }
@@ -154,6 +158,7 @@ class MetalBackend final : public Backend {
     return t;
   }
   void sync() override {
+    if (profile_) prof_flush();
     g_.commit_and_wait();
     pending_ = false;
   }
@@ -183,8 +188,30 @@ class MetalBackend final : public Backend {
   // ---------------------------------------------------------------- helpers
   void bind(uint32_t i, const Tensor& t) { g_.set_buffer(i, bufof(t), t.offset); }
   void pipe(const std::string& name) {
+    if (profile_) prof_flush();
     g_.set_pipeline(g_.pipeline(name));
     pending_ = true;
+    cur_ = name;
+  }
+  // INK_PROFILE=1: every kernel runs in its own command buffer; GPU time accumulated per kernel name.
+  void prof_flush() {
+    if (cur_.empty()) return;
+    g_.commit_and_wait();
+    auto& e = prof_[cur_];
+    e.first += g_.last_gpu_ms();
+    e.second++;
+    cur_.clear();
+  }
+  void prof_report() {
+    if (prof_.empty()) return;
+    std::vector<std::pair<std::string, std::pair<double, long>>> v(prof_.begin(), prof_.end());
+    std::sort(v.begin(), v.end(), [](auto& a, auto& b) { return a.second.first > b.second.first; });
+    double tot = 0;
+    for (auto& e : v) tot += e.second.first;
+    fprintf(stderr, "kernel profile (GPU ms, each dispatch waited separately): total %.1f ms\n", tot);
+    for (auto& e : v)
+      fprintf(stderr, "  %-28s %9.2f ms %7ld calls %8.1f us/call %5.1f%%\n", e.first.c_str(), e.second.first,
+              e.second.second, 1e3 * e.second.first / e.second.second, 100 * e.second.first / tot);
   }
   // Scratch buffers reused across ops (serial encoder orders the uses). Grown buffers are retired at sync.
   Tensor scratch(const char* key, DType dt, std::initializer_list<int64_t> shape) {
@@ -336,18 +363,26 @@ class MetalBackend final : public Backend {
 
   void controller(const Tensor& x, const Tensor& m, const Tensor& down, const Tensor& forget, const Tensor& gain,
                   Tensor& out) override {
-    uint32_t D = uint32_t(x.dim(-1));
-    if (D > 2304 || down.dim(0) > 64) fail("controller: shape");
-    CtrlParams p{uint32_t(x.numel() / D), D, uint32_t(down.dim(0)), D};
-    pipe("controller_mix");
+    uint32_t D = uint32_t(x.dim(-1)), T = uint32_t(x.numel() / D), R = uint32_t(down.dim(0));
+    CtrlParams p{T, D, R, D};
+    Tensor pair = scratch("ctrl-pair", DType::BF16, {T, 2 * D});
+    Tensor h = scratch("ctrl-h", DType::BF16, {T, R});
+    pipe("ctrl_pair");
     bind(0, x);
     bind(1, m);
-    bind(2, down);
+    bind(2, pair);
+    g_.set_value(3, p);
+    g_.dispatch({T, 1, 1}, {256, 1, 1});
+    linear(pair, down, h);
+    pipe("ctrl_out");
+    bind(0, x);
+    bind(1, m);
+    bind(2, h);
     bind(3, forget);
     bind(4, gain);
     bind(5, out);
     g_.set_value(6, p);
-    g_.dispatch({p.T, 1, 1}, {256, 1, 1});
+    g_.dispatch({cdiv(D, 256), T, 1}, {256, 1, 1});
   }
 
   void short_conv(const Tensor& x, const Tensor& w, Tensor& state, Tensor& out, Tensor* hist) override {
@@ -483,17 +518,18 @@ class MetalBackend final : public Backend {
   }
 
   void router(const Tensor& x, const MoeWeights& m, int topk, float scale, Tensor& idx, Tensor& w) override {
-    uint32_t D = uint32_t(x.dim(-1));
-    RouterParams p{uint32_t(x.numel() / D), D, uint32_t(m.gate_w.dim(0)), uint32_t(topk), dtc(x.dtype), scale};
-    if (p.E > 128 || topk > 16) fail("router: shape");
-    pipe("router_topk");
-    bind(0, x);
-    bind(1, m.gate_w);
-    bind(2, m.bias);
-    bind(3, idx);
-    bind(4, w);
-    g_.set_value(5, p);
-    g_.dispatch({p.T, 1, 1}, {256, 1, 1});
+    uint32_t D = uint32_t(x.dim(-1)), T = uint32_t(x.numel() / D), E = uint32_t(m.gate_w.dim(0));
+    RouterParams p{T, D, E, uint32_t(topk), dtc(x.dtype), scale};
+    if (E > 128 || topk > 16) fail("router: shape");
+    Tensor lg = scratch("router-logit", DType::F32, {T, E});
+    linear(x, m.gate_w, lg);  // f32(x) @ f32(gate_w)^T, fp32 out
+    pipe("router_select");
+    bind(0, lg);
+    bind(1, m.bias);
+    bind(2, idx);
+    bind(3, w);
+    g_.set_value(4, p);
+    g_.dispatch({T, 1, 1}, {E, 1, 1});
   }
 
   void qmv(const QuantProj& q, const Tensor& x, const Tensor& idx, uint32_t routes, uint32_t x_div, Tensor& out) {
@@ -648,6 +684,9 @@ class MetalBackend final : public Backend {
  private:
   Context& g_;
   bool pending_ = false;
+  bool profile_ = false;
+  std::string cur_;
+  std::map<std::string, std::pair<double, long>> prof_;
   std::unordered_map<void*, size_t> sizes_;
   std::unordered_map<std::string, Buf> scratch_;
 };

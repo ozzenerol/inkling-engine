@@ -16,7 +16,7 @@ One model on the GPU at a time. Before loading weights: add a line here AND mess
 Format: `LOCK <agent> <what> <start time>` / `UNLOCK <agent> <time>`.
 
 (none held)
-LOCK B inktest --backend metal (full model, ~20 GB) 2026-11-21  [A ran the MLX reference dump 17:22, done]
+UNLOCK B 2026-11-21 (C next: server run)  [A ran the MLX reference dump 17:22, done]
 LOCK C MLX-VLM baseline (serve_inkling.sh :8091, qh e2e + ctxbench) 17:43 / UNLOCK C 17:50
 
 
@@ -246,3 +246,18 @@ src/engine/engine.cpp exists; `-DINK_SERVER_ENGINE=OFF` forces stub-only).
     5.4k/8.3k/11.2k/14.1k prompt; turn 5 spent all 128 tokens thinking (effort none still thinks), so no content.
   - bench.py's context sweep fails on Inkling: its 2-token calibration run gets no content (the first two tokens are
     <|message_model|><|content_text|>). Use ctxbench for the sweep and bench.py --contexts "" for multi-turn.
+
+## B: first end-to-end Metal results (2026-11-21, inktest, one run each)
+
+| prompt | greedy vs MLX | KL mean / max | decode tok/s (63 steps, ctx < 3k) |
+|---|---|---|---|
+| p0 (8 steps) | 8/8 | 5.5e-5 / 3.6e-4 | 34.9 |
+| p1 | 62/64 (first 38) | 1.6e-2 / 0.69 | 32.0 |
+| p2 | 62/64 (first 6) | 7.7e-4 / 9.8e-3 | 31.8 |
+| p3 (2886-token prompt) | 61/64 (first 12) | 1.2e-2 / 0.16 | 27.8 |
+
+CPU reference on p0: 8/8, KL mean 1.0e-3. The p1-p3 mismatches match A's known loop-pass gap (A is on it).
+Decode went 11 -> 33 tok/s after making router and controller parallel (they were one threadgroup per token).
+Profile tool: `INK_PROFILE=1` on any binary using MetalBackend prints GPU ms per kernel (each dispatch waited
+separately, so totals are inflated; use for ranking). Known slow spots, next: attention prefill (0.9-1.8 TFLOPS),
+skinny GEMM T=5..16 (110 GB/s), dispatch count (~1500/token), decode attention at long context (180 GB/s).
