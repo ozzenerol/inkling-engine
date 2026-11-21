@@ -924,6 +924,33 @@ class MetalBackend final : public Backend {
         bind(9, flip ? l1 : l2);
         g_.dispatch({2, row_tiles, KVH}, {128, 1, 1});
         flip = !flip;
+        // INK_AG_STATS=1 (A, diagnostics): how much of the block carries weight. For every (row, 64-key tile):
+        // d = tile max - running row max; exp(d) bounds the tile's softmax weight relative to the row's top key.
+        if (ag_stats_ && (j0 == first || j0 + KEYS >= end) && end - first > 4 * KEYS) {
+          sync();
+          const float* tm = tmax.data<float>();
+          const float* mm = (flip ? m2 : m1).data<float>();
+          long n = 0, c9 = 0, c14 = 0, c21 = 0, rows_all21 = 0;
+          const uint32_t tiles = cdiv(p.n, 64);
+          for (uint32_t g = 0; g < KVH; g++)
+            for (uint32_t r0 = 0; r0 < rows; r0 += 64)
+              for (uint32_t tl = 0; tl < tiles; tl++) {
+                bool all21 = true;
+                for (uint32_t r = r0; r < std::min(rows, r0 + 64); r++) {
+                  float d = tm[(size_t(g) * rows_pad + r) * (KEYS / 64) + tl] - mm[size_t(g) * rows_pad + r];
+                  n++;
+                  c9 += d < -9.2f;
+                  c14 += d < -13.8f;
+                  c21 += d < -20.7f;
+                  all21 &= d < -13.8f;
+                }
+                rows_all21 += all21;
+              }
+          fprintf(stderr, "ag stats len %u window %u block at %u: (row, tile) below 1e-4 %.1f%%, 1e-6 %.1f%%, 1e-9 %.1f%%; "
+                          "64x64 tiles with every row below 1e-6: %.1f%%\n",
+                  len, window, j0, 100.0 * c9 / n, 100.0 * c14 / n, 100.0 * c21 / n,
+                  100.0 * rows_all21 / (double(KVH) * cdiv(rows, 64) * tiles));
+        }
       }
       pipe("ag_final");
       bind(0, o);
@@ -1154,6 +1181,7 @@ class MetalBackend final : public Backend {
   bool skinny_ = false;
   uint32_t split_keys_ = 512;
   uint32_t split_local_ = 64;
+  bool ag_stats_ = getenv("INK_AG_STATS") != nullptr;
   bool chain_ = !getenv("INK_NO_CHAIN");  // chain kernels for T <= 8 (A)
   uint32_t ag_min_t_ = getenv("INK_AG_MIN_T") ? uint32_t(atoi(getenv("INK_AG_MIN_T"))) : 64;  // GEMM attention from this T
   std::string cur_;
