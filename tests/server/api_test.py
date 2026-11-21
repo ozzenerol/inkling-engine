@@ -163,6 +163,15 @@ try:
           u["prompt_tokens"] - u["prompt_tokens_details"]["cached_tokens"] < 30,
           f"new session restores the shared system-prompt prefix ({r['timings']['cache']}, {u})")
 
+    # the system prompt + tools prefix is pinned during the FIRST session's prefill: session 2 already restores it
+    sys2 = {"role": "system", "content": "You are another agent. " + "Rule: stay calm. " * 120}
+    post("/v1/chat/completions", {"messages": [sys2, {"role": "user", "content": "session one"}], "tools": TOOLS})
+    st, r = post("/v1/chat/completions", {"messages": [sys2, {"role": "user", "content": "session two"}],
+                                          "tools": TOOLS})
+    u = r["usage"]
+    check(r["timings"]["cache"] in ("ckpt", "rewind") and u["prompt_tokens"] - u["prompt_tokens_details"]["cached_tokens"] < 30,
+          f"second session restores the prefix pinned by the first ({r['timings']['cache']}, {u})")
+
     # effort handling
     st, t1 = post("/tokenize", {"messages": [{"role": "user", "content": "x"}], "reasoning_effort": "none"})
     st, t2 = post("/tokenize", {"messages": [{"role": "user", "content": "x"}]})

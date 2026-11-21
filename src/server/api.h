@@ -38,6 +38,8 @@ class Api {
   void handle(const http::Request& req, http::Response& res);
 
   // Prompt token ids for a (canonicalized) request; public for tests.
+  int64_t stable_prefix(const pyjson::Value& messages, const pyjson::Value& tools, const pyjson::Value& effort,
+                        const std::vector<int32_t>& prompt);
   std::vector<int32_t> prompt_ids(const pyjson::Value& messages, const pyjson::Value& tools, const pyjson::Value& effort,
                                   int64_t* spliced_tokens = nullptr);
 
