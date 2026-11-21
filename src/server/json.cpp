@@ -5,6 +5,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
+#include <unordered_map>
 
 namespace ink::json {
 
@@ -198,6 +199,7 @@ struct Parser {
       Value v = Value::object();
       ws();
       if (i < t.size() && t[i] == '}') { i++; depth--; return v; }
+      std::unordered_map<std::string, size_t> index;  // built once the object gets large
       for (;;) {
         ws();
         if (i >= t.size() || t[i] != '"') fail("expected key");
@@ -206,7 +208,15 @@ struct Parser {
         if (i >= t.size() || t[i] != ':') fail("expected ':'");
         i++;
         Value x = value();
-        v.set(k, std::move(x));
+        if (v.obj.size() < 32) {
+          v.set(k, std::move(x));
+        } else {
+          if (index.empty())
+            for (size_t n = 0; n < v.obj.size(); n++) index.emplace(v.obj[n].first, n);
+          auto [it, fresh] = index.emplace(k, v.obj.size());
+          if (fresh) v.obj.emplace_back(std::move(k), std::move(x));
+          else v.obj[it->second].second = std::move(x);
+        }
         ws();
         if (i < t.size() && t[i] == ',') { i++; continue; }
         if (i < t.size() && t[i] == '}') { i++; break; }
