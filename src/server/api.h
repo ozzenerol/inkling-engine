@@ -27,6 +27,7 @@ struct ApiOptions {
   bool splice = true;                // reuse generated token ids for assistant turns sent back
   bool keepalive_comments = true;    // SSE ": prefill" comments during long prefills
   bool log = true;
+  std::string dump_dir;              // if set, every chat request body is written there (debugging)
 };
 
 class Api {

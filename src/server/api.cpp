@@ -1,5 +1,6 @@
 #include "api.h"
 
+#include <atomic>
 #include <chrono>
 #include <cstdio>
 #include <ctime>
@@ -190,6 +191,11 @@ void Api::handle(const http::Request& req, http::Response& res) {
 
 void Api::chat(const http::Request& req, http::Response& res) {
   const double t_req = now_s();
+  if (!o_.dump_dir.empty()) {
+    static std::atomic<int> k{0};
+    std::string f = o_.dump_dir + "/req-" + std::to_string(k++) + ".json";
+    if (FILE* fp = std::fopen(f.c_str(), "wb")) { std::fwrite(req.body.data(), 1, req.body.size(), fp); std::fclose(fp); }
+  }
   Value body;
   try {
     body = pyjson::parse(req.body);
@@ -286,6 +292,7 @@ void Api::chat(const http::Request& req, http::Response& res) {
   double t_gen0 = 0, t_first = 0, t_end = 0;
   size_t n_calls_sent = 0;
   bool client_gone = false;
+  double cb_s = 0;  // server-side time per token, inside on_token
   try {
     double last_ka = now_s();
     std::vector<int32_t> before;
@@ -310,6 +317,11 @@ void Api::chat(const http::Request& req, http::Response& res) {
     }
     t_gen0 = now_s();
     eng_.generate(sp, (int)max_tokens, stops_, [&](int32_t tok) {
+      const auto cb0 = std::chrono::steady_clock::now();
+      struct Acc {  // time spent in this callback: parse + detokenize + JSON + socket write
+        std::chrono::steady_clock::time_point t0; double& sum;
+        ~Acc() { sum += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(); }
+      } acc{cb0, cb_s};
       if (emitted.empty()) t_first = now_s();
       emitted.push_back(tok);
       Delta d = parser.push(tok);
@@ -389,15 +401,16 @@ void Api::chat(const http::Request& req, http::Response& res) {
   timings.set("predicted_ms", gen_s * 1000);
   timings.set("predicted_per_second", gen_s > 0 && n_gen > 1 ? (n_gen - 1) / gen_s : 0.0);
   timings.set("cache", prep.how);
+  timings.set("server_us_per_token", n_gen ? cb_s * 1e6 / n_gen : 0.0);
 
   if (o_.log)
     std::fprintf(stderr,
                  "[req] prompt %lld (reused %lld via %s, spliced %lld) prefill %lld in %.3fs (%.0f tok/s) | gen %lld "
-                 "in %.3fs (%.1f tok/s) | ttft %.3fs | %s%s\n",
+                 "in %.3fs (%.1f tok/s) | ttft %.3fs | server %.1f us/tok | %s%s\n",
                  (long long)n_prompt, (long long)prep.reused, prep.how.c_str(), (long long)spliced,
                  (long long)prep.prefilled, prep.prefill_s, prep.prefill_s > 0 ? prep.prefilled / prep.prefill_s : 0.0,
                  (long long)n_gen, gen_s, gen_s > 0 && n_gen > 1 ? (n_gen - 1) / gen_s : 0.0,
-                 (t_first > 0 ? t_first : t_end) - t_req, finish.c_str(), client_gone ? " (client gone)" : "");
+                 (t_first > 0 ? t_first : t_end) - t_req, n_gen ? cb_s * 1e6 / n_gen : 0.0, finish.c_str(), client_gone ? " (client gone)" : "");
 
   if (client_gone) return;
   if (stream) {

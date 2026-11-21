@@ -66,7 +66,8 @@ class StubEngine : public EngineIface {
     int emitted = 0;
     for (int32_t id : out) {
       if (emitted >= max_tokens) break;
-      std::this_thread::sleep_for(std::chrono::microseconds((int64_t)(o_.decode_ms_per_token * 1000)));
+      if (o_.decode_ms_per_token > 0)
+        std::this_thread::sleep_for(std::chrono::microseconds((int64_t)(o_.decode_ms_per_token * 1000)));
       emitted++;
       bool more = on_token(id);
       bool stop = std::find(stops.begin(), stops.end(), id) != stops.end();
@@ -101,6 +102,19 @@ class StubEngine : public EngineIface {
       if (a != std::string::npos) tool_name = text.substr(a + 8, text.find('"', a + 8) - a - 8);
     }
     n_++;
+    if (o_.reply_tokens > 0) {
+      static const char* para =
+          "The cache keeps every visit's keys and values, so a growing prompt only pays for its new tail. "
+          "Ünïcödé, 日本語, emoji 🎉 and code `for (int i = 0; i < n; i++) sum += a[i];` stream through. ";
+      std::vector<int32_t> body = tok_.encode(para);
+      std::vector<int32_t> out = tok_.encode("<|message_model|><|content_thinking|>");
+      int half = o_.reply_tokens / 2;
+      for (int k = 0; k < half; k++) out.push_back(body[k % body.size()]);
+      for (int32_t id : tok_.encode("<|end_message|><|message_model|><|content_text|>")) out.push_back(id);
+      for (int k = 0; k < o_.reply_tokens - half; k++) out.push_back(body[k % body.size()]);
+      for (int32_t id : tok_.encode("<|end_message|><|content_model_end_sampling|>")) out.push_back(id);
+      return out;
+    }
     std::string s;
     bool after_tool = text.size() >= 16 && text.rfind("<|message_tool|>") != std::string::npos &&
                       text.rfind("<|message_tool|>") > (u == std::string::npos ? 0 : u);

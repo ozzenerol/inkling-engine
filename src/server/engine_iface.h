@@ -34,6 +34,7 @@ struct StubOptions {
   double decode_ms_per_token = 5;
   int64_t slack = 512;
   int max_ckpts = 8;
+  int reply_tokens = 0;  // >0: long reply (half thinking, half text) of about this many tokens
 };
 std::unique_ptr<EngineIface> make_stub_engine(const Tokenizer& tok, const StubOptions& o);
 

@@ -32,6 +32,7 @@ int main(int argc, char** argv) {
     else if (a == "--port") port = std::stoi(next());
     else if (a == "--stub") stub = true;
     else if (a == "--stub-decode-ms") so.decode_ms_per_token = std::stod(next());
+    else if (a == "--stub-reply-tokens") so.reply_tokens = std::stoi(next());
     else if (a == "--ctx") ao.max_context = eo.max_context = std::stoll(next());
     else if (a == "--max-tokens") ao.default_max_tokens = std::stoi(next());
     else if (a == "--temp") ao.default_temperature = std::stof(next());
@@ -46,6 +47,7 @@ int main(int argc, char** argv) {
     else if (a == "--prefill-chunk") eo.prefill_chunk = std::stoi(next());
     else if (a == "--no-splice") ao.splice = false;
     else if (a == "--quiet") ao.log = false;
+    else if (a == "--dump-requests") ao.dump_dir = next();
     else { std::fprintf(stderr, "unknown option %s\n", a.c_str()); return 2; }
   }
   eo.model_dir = model;
