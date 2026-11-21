@@ -90,6 +90,25 @@ Context::Context() : impl_(new Impl) {
     g_barrier_report.d = &impl_->dispatches;
     impl_->untracked = getenv("INK_UNTRACKED") != nullptr;
     if (!all.empty()) compile("ink", all);
+    // Build every pipeline now, in parallel: lazy creation cost ~2.5 s inside the first request (TTFT).
+    if (!getenv("INK_LAZY_PIPELINES") && !impl_->libs.empty()) {
+      NSArray<NSString*>* names = [impl_->libs.back() functionNames];
+      std::vector<std::string> fn;
+      for (NSString* n in names) fn.push_back([n UTF8String]);
+      std::vector<id<MTLComputePipelineState>> ps(fn.size());
+      id<MTLLibrary> lib = impl_->libs.back();
+      id<MTLDevice> dev = impl_->device;
+      __strong id<MTLComputePipelineState>* out = ps.data();
+      const std::string* names_p = fn.data();
+      dispatch_apply(fn.size(), dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^(size_t i) {
+        @autoreleasepool {
+          id<MTLFunction> f = [lib newFunctionWithName:[NSString stringWithUTF8String:names_p[i].c_str()]];
+          if (f) out[i] = [dev newComputePipelineStateWithFunction:f error:nil];
+        }
+      });
+      for (size_t i = 0; i < fn.size(); i++)
+        if (ps[i]) impl_->pipelines[fn[i]] = ps[i];
+    }
   }
 }
 
