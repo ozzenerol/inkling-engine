@@ -803,3 +803,27 @@ Branch c/work = main c618174 plus this section and docs/RESULTS.md (batch 9 is t
      and check `cache: ckpt` on the second.
   3. With A/B: the per-chunk cost on short reads (775 tokens at 600 tok/s against 800 steady) and the 40 tok/s
      line at the start; server side, send the first SSE byte before the marker tokens are generated.
+
+## Batch 10 (main 2b72df9, 23:17-23:56, one session working alone; one run each)
+
+Defaults flipped: INK_GA (direct global attention, drafter too), INK_RW (read/write hazard sets), INK_MOE_M=0
+(32-row MoE prefill tiles below 1280 rows). All gates pass (op_diff ALL OK with and without q8, acc both builds as
+before: only the known near-ties, spec identity, rollback identical).
+
+C's depth bench, 8-bit server, temp 0.7 (batch 9 in brackets): **target met at every depth**
+
+| context | 1.2k | 9.6k | 39k | 79k | 127k |
+|---|---|---|---|---|---|
+| gen tok/s | 41.9 (39.9) | 44.8 (38.1) | 37.3 (30.3) | 33.1 (27.2) | 28.6 (22.0) |
+| read tok/s | 808 (729) | 800 (794) | 668 (658) | 506 (503) | 382 (381) |
+
+Agent bench 8-bit: read 10 turns 47.2 s (88.1), median TTFT 1.20 s, median gen 66.5; copy 6 turns 46.5 s, TTFT
+0.93 s, gen 91.9; MLX 241.5 s. qh e2e PASS 17 s.
+D (spec_check, 8-bit, temp 0.7): 126k GA 27.5 vs 21.6 tok/s off (plain 35.1 vs 45.9 ms, draft 11.7 vs 16.5 ms);
+INK_GA_DRAFT=0 27.6, INK_DSPARK_ROWS=1 27.7 (noise: no change); 32k 37.1 vs 32.6 off, ROWS=1 37.2.
+B: rw 45.7 vs 43.9 tok/s on 8-bit (barriers 146k vs 176k of 210k), lossless 37.5 vs 37.3, tokens identical;
+MoE tiles 800 tokens 1.15 vs 1.24 s (8-bit), 2048 / 2886 unchanged, logits identical.
+Decode floor (A, from the safetensors): a token reads 1.96 GB of experts (5.1 MB each, 8 x 48 visits) + 1.83 GB
+dense (38 MB per visit) + 0.49 GB head = 4.3 GB: 10.7 ms at 400 GB/s vs the 23 ms plain step (~185 GB/s).
+bench_q8's 756 GB/s (batch 9) is above the M3 Max's 400 GB/s: its matvecs are independent (all read x, write own
+y) and the GPU timestamps may miss work; b/work adds a wall clock to settle it before using it as the in-model gap.
