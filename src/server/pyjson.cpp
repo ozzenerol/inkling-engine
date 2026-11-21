@@ -1,4 +1,4 @@
-#include "json.h"
+#include "pyjson.h"
 
 #include <algorithm>
 #include <charconv>
@@ -7,7 +7,7 @@
 #include <cstring>
 #include <unordered_map>
 
-namespace ink::json {
+namespace ink::pyjson {
 
 static const Value kNull;
 
@@ -394,4 +394,4 @@ std::string py_str(const Value& v) {
   }
 }
 
-}  // namespace ink::json
+}  // namespace ink::pyjson

@@ -10,7 +10,7 @@
 #include <stdexcept>
 #include <unordered_map>
 
-#include "../server/json.h"
+#include "../server/pyjson.h"
 
 namespace ink {
 
@@ -202,13 +202,13 @@ std::unique_ptr<Tokenizer> Tokenizer::load(const std::string& dir) {
   if (!f) throw std::runtime_error("cannot open " + dir + "/tokenizer.json");
   std::stringstream ss;
   ss << f.rdbuf();
-  json::Value tj = json::parse(ss.str());
+  pyjson::Value tj = pyjson::parse(ss.str());
 
   std::unique_ptr<Tokenizer> t(new Tokenizer());
   Impl& p = *t->p_;
   static const ByteMap bm;
 
-  const json::Value& model = tj["model"];
+  const pyjson::Value& model = tj["model"];
   if (model.str_or("type") != "BPE") throw std::runtime_error("tokenizer: model is not BPE");
   if (!model["ignore_merges"].truthy()) throw std::runtime_error("tokenizer: expected ignore_merges=true");
   int32_t max_id = -1;
@@ -254,7 +254,7 @@ std::unique_ptr<Tokenizer> Tokenizer::load(const std::string& dir) {
   for (auto& [s, id] : p.specials) p.special[id] = 1;
 
   // pre-tokenizer regex
-  const json::Value& pre = tj["pre_tokenizer"];
+  const pyjson::Value& pre = tj["pre_tokenizer"];
   std::string pattern;
   for (auto& pt : pre["pretokenizers"].arr)
     if (pt.str_or("type") == "Split") pattern = pt["pattern"].str_or("Regex");

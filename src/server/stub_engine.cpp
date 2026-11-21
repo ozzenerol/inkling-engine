@@ -9,7 +9,7 @@
 #include <thread>
 
 #include "engine_iface.h"
-#include "json.h"
+#include "pyjson.h"
 #include "tokenizer/tokenizer.h"
 
 namespace ink {

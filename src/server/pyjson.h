@@ -9,7 +9,7 @@
 #include <utility>
 #include <vector>
 
-namespace ink::json {
+namespace ink::pyjson {
 
 enum class Kind : uint8_t { Null, Bool, Int, Float, String, Array, Object };
 
@@ -90,4 +90,4 @@ std::string py_str(const Value& v);
 // JSON string literal with Python's escaping.
 void quote_to(std::string& out, std::string_view s, bool ensure_ascii = false);
 
-}  // namespace ink::json
+}  // namespace ink::pyjson

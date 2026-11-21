@@ -6,7 +6,7 @@
 #include <string>
 #include <vector>
 
-#include "json.h"
+#include "pyjson.h"
 
 namespace ink {
 
@@ -27,11 +27,11 @@ struct RenderedPrompt {
 // messages: array of OpenAI-style messages. tool_calls[].function.arguments must already be objects
 // (see canonicalize_messages). tools: array or null. reasoning_effort: null (template default 0.9),
 // a string from the effort map, or a number in [0, 0.99].
-RenderedPrompt render_chat(const json::Value& messages, const json::Value& tools,
-                           const json::Value& reasoning_effort);
+RenderedPrompt render_chat(const pyjson::Value& messages, const pyjson::Value& tools,
+                           const pyjson::Value& reasoning_effort);
 
 // OpenAI clients send tool_calls[].function.arguments as a JSON string; the template wants an object.
 // Parses those strings in place (order preserved); invalid JSON becomes {} as in mlx_vlm.
-void canonicalize_messages(json::Value& messages);
+void canonicalize_messages(pyjson::Value& messages);
 
 }  // namespace ink

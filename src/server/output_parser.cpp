@@ -13,21 +13,21 @@ static std::string new_call_id() {
 }
 
 bool parse_inkling_tool_call(const std::string& body, std::string& name, std::string& arguments) {
-  json::Value call;
+  pyjson::Value call;
   try {
-    call = json::parse(body);  // json.loads(text.strip()); our parser skips surrounding whitespace
-  } catch (const json::ParseError&) {
+    call = pyjson::parse(body);  // json.loads(text.strip()); our parser skips surrounding whitespace
+  } catch (const pyjson::ParseError&) {
     return false;
   }
-  const json::Value* n = call.find("name");
+  const pyjson::Value* n = call.find("name");
   if (!call.is_object() || !n || !n->is_string()) return false;
-  const json::Value* args = call.find("args");
+  const pyjson::Value* args = call.find("args");
   if (!args) args = call.find("arguments");
-  json::Value empty = json::Value::object();
+  pyjson::Value empty = pyjson::Value::object();
   if (!args) args = &empty;
   if (!args->is_object()) return false;
   name = n->s;
-  arguments = json::compact(*args);
+  arguments = pyjson::compact(*args);
   return true;
 }
 
@@ -74,11 +74,11 @@ void OutputParser::close_message(Delta& d) {
       n_calls_++;
     } else if (mode_ == Mode::ToolText && !header_.empty()) {
       // <|content_invoke_tool_text|>: body is not JSON; pass it as {"input": body} to the named tool.
-      json::Value a = json::Value::object();
+      pyjson::Value a = pyjson::Value::object();
       a.set("input", tool_buf_);
       c.id = new_call_id();
       c.name = header_;
-      c.arguments = json::compact(a);
+      c.arguments = pyjson::compact(a);
       d.tool_calls.push_back(c);
       calls_.push_back(c);
       n_calls_++;

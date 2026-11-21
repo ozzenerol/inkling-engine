@@ -56,14 +56,24 @@ PromptCache::Prep PromptCache::prepare(const std::vector<int32_t>& prompt,
       cur = target;
       r.how = "rewind";
     } else {
-      const Entry* best = nullptr;
-      for (auto& x : ck_)
-        if (x.c.len <= target && (!best || x.c.len > best->c.len)) best = &x;
-      if (best && e_.restore(best->c)) {
-        cur = best->c.len;
-        const_cast<Entry*>(best)->used = ++clock_;
-        r.how = "ckpt";
-      } else {
+      // Try checkpoints <= target from the longest down; the engine may have invalidated or evicted some.
+      bool restored = false;
+      for (;;) {
+        auto best = ck_.end();
+        for (auto it = ck_.begin(); it != ck_.end(); ++it)
+          if (it->c.len <= target && (best == ck_.end() || it->c.len > best->c.len)) best = it;
+        if (best == ck_.end()) break;
+        if (e_.restore(best->c)) {
+          cur = best->c.len;
+          best->used = ++clock_;
+          r.how = "ckpt";
+          restored = true;
+          break;
+        }
+        e_.drop(best->c);
+        ck_.erase(best);
+      }
+      if (!restored) {
         for (auto& x : ck_) e_.drop(x.c);
         ck_.clear();
         e_.reset();

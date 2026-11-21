@@ -11,7 +11,7 @@
 #include <string>
 #include <vector>
 
-#include "json.h"
+#include "pyjson.h"
 #include "tokenizer/tokenizer.h"
 
 namespace ink {

@@ -6,12 +6,12 @@
 using namespace ink;
 int main() {
   std::string in((std::istreambuf_iterator<char>(std::cin)), {});
-  json::Value cases = json::parse(in);
-  json::Value outs = json::Value::array();
+  pyjson::Value cases = pyjson::parse(in);
+  pyjson::Value outs = pyjson::Value::array();
   for (auto& c : cases.arr) {
-    json::Value r = json::Value::object();
+    pyjson::Value r = pyjson::Value::object();
     try {
-      json::Value msgs = c["messages"];
+      pyjson::Value msgs = c["messages"];
       canonicalize_messages(msgs);
       r.set("ok", render_chat(msgs, c["tools"], c["reasoning_effort"]).text);
     } catch (const std::exception& e) {
@@ -19,5 +19,5 @@ int main() {
     }
     outs.arr.push_back(std::move(r));
   }
-  std::cout << json::compact(outs);
+  std::cout << pyjson::compact(outs);
 }

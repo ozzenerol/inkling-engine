@@ -10,7 +10,7 @@
 
 #include "engine_iface.h"
 #include "http.h"
-#include "json.h"
+#include "pyjson.h"
 #include "prompt_cache.h"
 #include "tokenizer/tokenizer.h"
 
@@ -23,7 +23,7 @@ struct ApiOptions {
   float default_temperature = 1.0f;  // generation_config.json
   float default_top_p = 1.0f;
   int default_top_k = 0;
-  json::Value default_effort;        // null = template default (0.9)
+  pyjson::Value default_effort;        // null = template default (0.9)
   bool splice = true;                // reuse generated token ids for assistant turns sent back
   bool keepalive_comments = true;    // SSE ": prefill" comments during long prefills
   bool log = true;
@@ -35,15 +35,15 @@ class Api {
   void handle(const http::Request& req, http::Response& res);
 
   // Prompt token ids for a (canonicalized) request; public for tests.
-  std::vector<int32_t> prompt_ids(const json::Value& messages, const json::Value& tools, const json::Value& effort,
+  std::vector<int32_t> prompt_ids(const pyjson::Value& messages, const pyjson::Value& tools, const pyjson::Value& effort,
                                   int64_t* spliced_tokens = nullptr);
 
  private:
   void chat(const http::Request& req, http::Response& res);
   void remember_turn(const std::string& key, std::vector<int32_t> ids);
   static std::string turn_key(const std::string& reasoning, const std::string& content,
-                              const std::vector<std::pair<std::string, json::Value>>& calls);
-  static bool message_key(const json::Value& msg, std::string& key);
+                              const std::vector<std::pair<std::string, pyjson::Value>>& calls);
+  static bool message_key(const pyjson::Value& msg, std::string& key);
 
   const Tokenizer& tok_;
   EngineIface& eng_;

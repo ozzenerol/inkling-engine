@@ -14,7 +14,7 @@ from transformers import AutoTokenizer
 
 MODEL = "/Users/ozzenerol/llm/mlx-models/Inkling-2-Mini-MLX-4-8bit"
 N = int(sys.argv[1]) if len(sys.argv) > 1 else 400
-BIN = sys.argv[2] if len(sys.argv) > 2 else "build/render_main"
+BIN = sys.argv[2] if len(sys.argv) > 2 else "build-c/src/server/render_main"
 rng = random.Random(1234)
 
 WORDS = ["hello", "world", "naïve", "日本語", "emoji 🎉", "tab\there", "line\nbreak", "quote \"x\"", "back\\slash",

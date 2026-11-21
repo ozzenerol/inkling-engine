@@ -39,7 +39,7 @@ int main(int argc, char** argv) {
       std::string e = next();
       char* end;
       double d = std::strtod(e.c_str(), &end);
-      ao.default_effort = *end == 0 && !e.empty() ? json::Value(d) : json::Value(e);
+      ao.default_effort = *end == 0 && !e.empty() ? pyjson::Value(d) : pyjson::Value(e);
     }
     else if (a == "--no-mtp") eo.use_mtp = false;
     else if (a == "--draft-block") eo.draft_block = std::stoi(next());

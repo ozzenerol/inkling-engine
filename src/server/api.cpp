@@ -9,7 +9,7 @@
 #include "output_parser.h"
 
 namespace ink {
-using json::Value;
+using pyjson::Value;
 
 namespace {
 
@@ -27,7 +27,7 @@ std::string error_json(const std::string& msg, const std::string& type = "invali
   in.set("message", msg);
   in.set("type", type);
   e.set("error", std::move(in));
-  return json::compact(e);
+  return pyjson::compact(e);
 }
 
 std::string new_id() {
@@ -43,7 +43,7 @@ double now_s() {
   return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
 }
 
-const json::DumpOptions kSorted{",", ":", true, false};
+const pyjson::DumpOptions kSorted{",", ":", true, false};
 
 }  // namespace
 
@@ -59,7 +59,7 @@ std::string Api::turn_key(const std::string& reasoning, const std::string& conte
     k += '\x1e';
     k += name;
     k += '\x1d';
-    k += json::dump(args, kSorted);
+    k += pyjson::dump(args, kSorted);
   }
   return k;
 }
@@ -69,7 +69,7 @@ bool Api::message_key(const Value& m, std::string& key) {
   std::string content;
   if (c.is_string()) content = c.s;
   else if (!c.is_null()) return false;
-  std::string reasoning = m["reasoning_content"].truthy() ? json::py_str(m["reasoning_content"]) : "";
+  std::string reasoning = m["reasoning_content"].truthy() ? pyjson::py_str(m["reasoning_content"]) : "";
   std::vector<std::pair<std::string, Value>> calls;
   const Value& tcs = m["tool_calls"];
   if (tcs.is_array()) {
@@ -141,7 +141,7 @@ void Api::handle(const http::Request& req, http::Response& res) {
     Value l = Value::object();
     l.set("object", "list");
     l.set("data", Value::array({m}));
-    res.send(200, "application/json", json::compact(l));
+    res.send(200, "application/json", pyjson::compact(l));
     return;
   }
   if (req.path == "/v1/chat/completions" || req.path == "/chat/completions") {
@@ -151,7 +151,7 @@ void Api::handle(const http::Request& req, http::Response& res) {
   }
   if (req.path == "/tokenize" && req.method == "POST") {
     Value b;
-    try { b = json::parse(req.body); } catch (const std::exception& e) {
+    try { b = pyjson::parse(req.body); } catch (const std::exception& e) {
       res.send(400, "application/json", error_json(e.what())); return;
     }
     std::vector<int32_t> ids;
@@ -170,7 +170,7 @@ void Api::handle(const http::Request& req, http::Response& res) {
     for (int32_t id : ids) a.arr.emplace_back((int64_t)id);
     Value o = Value::object();
     o.set("tokens", std::move(a));
-    res.send(200, "application/json", json::compact(o));
+    res.send(200, "application/json", pyjson::compact(o));
     return;
   }
   if (req.path == "/v1/cache") {
@@ -182,7 +182,7 @@ void Api::handle(const http::Request& req, http::Response& res) {
     o.set("prompt_tokens_total", total_prompt_);
     o.set("reused_tokens_total", total_reused_);
     o.set("spliced_tokens_total", total_spliced_);
-    res.send(200, "application/json", json::compact(o));
+    res.send(200, "application/json", pyjson::compact(o));
     return;
   }
   res.send(404, "application/json", error_json("no route " + req.path));
@@ -192,7 +192,7 @@ void Api::chat(const http::Request& req, http::Response& res) {
   const double t_req = now_s();
   Value body;
   try {
-    body = json::parse(req.body);
+    body = pyjson::parse(req.body);
   } catch (const std::exception& e) {
     res.send(400, "application/json", error_json(std::string("bad JSON: ") + e.what()));
     return;
@@ -250,7 +250,7 @@ void Api::chat(const http::Request& req, http::Response& res) {
     c.set("created", created);
     c.set("model", model);
     c.set("choices", Value::array({ch}));
-    return "data: " + json::compact(c) + "\n\n";
+    return "data: " + pyjson::compact(c) + "\n\n";
   };
   auto tool_calls_json = [](const std::vector<ToolCallOut>& calls, size_t base, bool with_index) {
     Value a = Value::array();
@@ -336,7 +336,7 @@ void Api::chat(const http::Request& req, http::Response& res) {
       std::vector<std::pair<std::string, Value>> calls;
       for (auto& c : parser.tool_calls()) {
         Value a;
-        try { a = json::parse(c.arguments); } catch (...) { a = Value::object(); }
+        try { a = pyjson::parse(c.arguments); } catch (...) { a = Value::object(); }
         calls.emplace_back(c.name, std::move(a));
       }
       remember_turn(turn_key(parser.reasoning(), parser.content(), calls), emitted);
@@ -397,7 +397,7 @@ void Api::chat(const http::Request& req, http::Response& res) {
       c.set("choices", Value::array());
       c.set("usage", usage);
       c.set("timings", timings);
-      res.write("data: " + json::compact(c) + "\n\n");
+      res.write("data: " + pyjson::compact(c) + "\n\n");
     }
     res.write("data: [DONE]\n\n");
     return;
@@ -419,7 +419,7 @@ void Api::chat(const http::Request& req, http::Response& res) {
   out.set("choices", Value::array({ch}));
   out.set("usage", usage);
   out.set("timings", timings);
-  res.send(200, "application/json", json::compact(out));
+  res.send(200, "application/json", pyjson::compact(out));
 }
 
 }  // namespace ink

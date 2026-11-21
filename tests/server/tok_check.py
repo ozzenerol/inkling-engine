@@ -31,7 +31,7 @@ try:
 except Exception as e:
     print("no ref meta:", e)
 want = [tk.encode(t, add_special_tokens=False).ids for t in texts]
-r = subprocess.run(["build/tok_main"], input=json.dumps(texts), capture_output=True, text=True)
+r = subprocess.run([sys.argv[1] if len(sys.argv) > 1 else "build-c/src/server/tok_main"], input=json.dumps(texts), capture_output=True, text=True)
 print(r.stderr.strip())
 got = json.loads(r.stdout)
 bad = [i for i in range(len(texts)) if want[i] != got[i]]

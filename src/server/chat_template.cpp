@@ -4,13 +4,13 @@
 #include <cctype>
 
 namespace ink {
-using json::Kind;
-using json::Value;
+using pyjson::Kind;
+using pyjson::Value;
 
 namespace {
 
-const json::DumpOptions kSortedCompact{",", ":", true, false};
-const json::DumpOptions kCompact{",", ":", false, false};
+const pyjson::DumpOptions kSortedCompact{",", ":", true, false};
+const pyjson::DumpOptions kCompact{",", ":", false, false};
 
 // Jinja `x is defined` on a dict attribute: present (even if null).
 const Value* attr(const Value& v, std::string_view key) { return v.find(key); }
@@ -45,7 +45,7 @@ std::string effort_text(const Value& eff_in) {
   }
   if (num < 0.0 || num > 0.99) throw TemplateError("reasoning_effort must be in [0.0, 0.99]");
   std::string out = "<|message_system|><|content_text|>Thinking effort level: ";
-  out += num == 0.0 ? std::string("0") : json::py_float(num);
+  out += num == 0.0 ? std::string("0") : pyjson::py_float(num);
   out += "<|end_message|>";
   return out;
 }
@@ -73,8 +73,8 @@ void canonicalize_messages(Value& messages) {
       if (args->s.empty()) { *args = Value::object(); continue; }
       // Same as mlx_vlm request_normalization: invalid JSON becomes {}.
       try {
-        *args = json::parse(args->s);
-      } catch (const json::ParseError&) {
+        *args = pyjson::parse(args->s);
+      } catch (const pyjson::ParseError&) {
         *args = Value::object();
       }
     }
@@ -104,7 +104,7 @@ RenderedPrompt render_chat(const Value& messages, const Value& tools, const Valu
       specs.arr.push_back(std::move(spec));
     }
     out += "<|message_system|>tool_declare<|content_xml|>";
-    json::dump_to(out, specs, kSortedCompact);
+    pyjson::dump_to(out, specs, kSortedCompact);
     out += "<|end_message|>";
   }
 
@@ -114,7 +114,7 @@ RenderedPrompt render_chat(const Value& messages, const Value& tools, const Valu
     const Value* rolep = attr(message, "role");
     std::string role = rolep && rolep->is_string() ? rolep->s : "";
     const char* rt = role_token(role);
-    if (!rt) throw TemplateError("Unknown message role: " + (rolep ? json::py_str(*rolep) : std::string("")));
+    if (!rt) throw TemplateError("Unknown message role: " + (rolep ? pyjson::py_str(*rolep) : std::string("")));
     if (!effort_emitted && role != "system") {
       out += effort_text(reasoning_effort);
       effort_emitted = true;
@@ -124,7 +124,7 @@ RenderedPrompt render_chat(const Value& messages, const Value& tools, const Valu
     std::string header = rt;
     if (role == "tool") {
       if (defined_truthy(message, "name")) {
-        header += json::py_str(message["name"]);
+        header += pyjson::py_str(message["name"]);
       } else if (defined_truthy(message, "tool_call_id")) {
         const Value& want = message["tool_call_id"];
         for (const Value& prev : messages.arr) {
@@ -136,12 +136,12 @@ RenderedPrompt render_chat(const Value& messages, const Value& tools, const Valu
             const Value* fn = attr(tc, "function");
             const Value* nm = fn ? attr(*fn, "name") : nullptr;
             // == between JSON values; ids are strings in practice
-            if (id && nm && json::compact(*id) == json::compact(want)) header += json::py_str(*nm);
+            if (id && nm && pyjson::compact(*id) == pyjson::compact(want)) header += pyjson::py_str(*nm);
           }
         }
       }
     } else if (is_asst && defined_truthy(message, "name")) {
-      header += json::py_str(message["name"]);
+      header += pyjson::py_str(message["name"]);
     }
 
     size_t span_begin = out.size();
@@ -152,7 +152,7 @@ RenderedPrompt render_chat(const Value& messages, const Value& tools, const Valu
     if (is_asst && has_rc) {
       out += header;
       out += "<|content_thinking|>";
-      out += json::py_str(message["reasoning_content"]);
+      out += pyjson::py_str(message["reasoning_content"]);
       out += "<|end_message|>";
     }
 
@@ -182,7 +182,7 @@ RenderedPrompt render_chat(const Value& messages, const Value& tools, const Valu
         } else if (ty == "audio" || ty == "input_audio" || ty == "audio_url") {
           throw TemplateError("Inkling 2 does not accept audio input");
         } else {
-          throw TemplateError("Unsupported content part type: " + (type ? json::py_str(*type) : std::string()));
+          throw TemplateError("Unsupported content part type: " + (type ? pyjson::py_str(*type) : std::string()));
         }
       }
     }
@@ -194,8 +194,8 @@ RenderedPrompt render_chat(const Value& messages, const Value& tools, const Valu
         const Value* fnp = attr(tc, "function");
         const Value* nm = fnp ? attr(*fnp, "name") : nullptr;
         if (!nm || !nm->is_string()) throw TemplateError("tool call function name must be a string");
-        if (defined_truthy(message, "name") && json::py_str(message["name"]) != nm->s)
-          throw TemplateError("assistant name " + json::py_str(message["name"]) + " does not match its tool call " +
+        if (defined_truthy(message, "name") && pyjson::py_str(message["name"]) != nm->s)
+          throw TemplateError("assistant name " + pyjson::py_str(message["name"]) + " does not match its tool call " +
                               nm->s);
         const Value* ap = attr(*fnp, "arguments");
         Value empty = Value::object();
@@ -207,16 +207,16 @@ RenderedPrompt render_chat(const Value& messages, const Value& tools, const Valu
         out += nm->s;
         out += "<|content_invoke_tool_json|>";
         out += "{\"name\":";
-        json::quote_to(out, nm->s);
+        pyjson::quote_to(out, nm->s);
         out += ",\"args\":{";
-        std::vector<const json::Member*> ms;
+        std::vector<const pyjson::Member*> ms;
         for (auto& m : args.obj) ms.push_back(&m);
         std::stable_sort(ms.begin(), ms.end(),
-                         [](const json::Member* a, const json::Member* b) { return a->first < b->first; });
+                         [](const pyjson::Member* a, const pyjson::Member* b) { return a->first < b->first; });
         for (size_t k = 0; k < ms.size(); k++) {
-          json::quote_to(out, ms[k]->first);
+          pyjson::quote_to(out, ms[k]->first);
           out += ':';
-          json::dump_to(out, ms[k]->second, kCompact);
+          pyjson::dump_to(out, ms[k]->second, kCompact);
           if (k + 1 < ms.size()) out += ',';
         }
         out += "}}<|end_message|>";
