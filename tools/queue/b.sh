@@ -12,3 +12,7 @@ for v in "X=1" "INK_MOE_GEMM2=1" "INK_CTRL_GEMM=1" "INK_MOE_GEMM2=1 INK_CTRL_GEM
 done
 echo "== B keep-warm: first decode after 8 s idle, off vs on (INK_WARM_SECS)"
 echo "(needs a tool with an idle gap; skipped until B adds one)"
+echo "== B conv+mix+norm merge (INK_CONV_MIX=1): identity test, then plain decode off vs on"
+INK_CONV_MIX=1 $(bin op_diff) 2>&1 | grep -E "conv\+mix|ALL|FAILED"
+for v in "X=1" "INK_CONV_MIX=1"; do echo -n "[$v] "; env $v $(bin spec_check) plain ref_data/p2.ids 200 4 $BS/cm_$v.i32 2>&1 | grep -oE "decode [0-9.]+ s -> [0-9.]+ tok/s"; done
+cmp "$BS/cm_X=1.i32" "$BS/cm_INK_CONV_MIX=1.i32" && echo "conv_mix tokens IDENTICAL"

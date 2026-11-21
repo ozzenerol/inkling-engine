@@ -94,17 +94,46 @@ struct ResParams {
   uint T, D, nb, nq;
   uint dt[8];
   float eps;  // fused norm (attn_residual_norm)
+  uint conv_hist, conv_dt_other;  // CONV variant
 };
-template <uint NT, bool NORM>
+template <uint NT, bool NORM, bool CONV = false>
 kernel void attn_residual_mix_t(device const void* s0 [[buffer(0)]], device const void* s1 [[buffer(1)]],
                               device const void* s2 [[buffer(2)]], device const void* s3 [[buffer(3)]],
                               device const void* s4 [[buffer(4)]], device const void* s5 [[buffer(5)]],
                               device const void* s6 [[buffer(6)]], device const void* s7 [[buffer(7)]],
                               device const float* query [[buffer(8)]], device float* out [[buffer(9)]],
                               constant ResParams& p [[buffer(10)]], device const ushort* gamma [[buffer(11)]],
-                              device ushort* normed [[buffer(12)]], uint t [[threadgroup_position_in_grid]],
+                              device ushort* normed [[buffer(12)]], device const ushort* cx [[buffer(13)]],
+                              device const ushort* cw [[buffer(14)]], device float* cstate [[buffer(15)]],
+                              device float* chist [[buffer(16)]], device const void* cother [[buffer(17)]],
+                              device float* cres [[buffer(18)]], uint t [[threadgroup_position_in_grid]],
                               uint tid [[thread_position_in_threadgroup]], uint lane [[thread_index_in_simdgroup]],
                               uint sg [[simdgroup_index_in_threadgroup]]) {
+  if (CONV) {
+    // conv_add4 for the single row (T == 1), same arithmetic; res (f32) is the last mix state, read back below.
+    const float div = 2.2360679774997896f;
+    for (uint c = tid; c < p.D; c += NT) {
+      float s0 = cstate[0 * p.D + c], s1 = cstate[1 * p.D + c], s2 = cstate[2 * p.D + c];
+      float w0 = bf2f(cw[c * 4 + 0]), w1 = bf2f(cw[c * 4 + 1]), w2 = bf2f(cw[c * 4 + 2]), w3 = bf2f(cw[c * 4 + 3]);
+      float xv = bf2f(cx[c]);
+      float v = 0;
+      v = v + s0 * w0;
+      v = v + s1 * w1;
+      v = v + s2 * w2;
+      v = v + xv * w3;
+      float tmp = round_bf((v + xv) / div);
+      cres[c] = tmp + ldv(cother, p.conv_dt_other, c);
+      cstate[0 * p.D + c] = s1;
+      cstate[1 * p.D + c] = s2;
+      cstate[2 * p.D + c] = xv;
+      if (p.conv_hist) {
+        chist[0 * p.D + c] = s1;
+        chist[1 * p.D + c] = s2;
+        chist[2 * p.D + c] = xv;
+      }
+    }
+    threadgroup_barrier(mem_flags::mem_device);
+  }
   // Single pass: each thread accumulates sum(x_b^2) and x_b . q for all b, q; one batched reduction.
   threadgroup float red[NT / 32][8 * 5];  // NT threads
   threadgroup float inv[8];
@@ -185,14 +214,16 @@ kernel void attn_residual_mix_t(device const void* s0 [[buffer(0)]], device cons
   }
 }
 
-#define ARM_INST(NAME, NT, NORM)                                                                             \
-  template [[host_name(NAME)]] kernel void attn_residual_mix_t<NT, NORM>(                                    \
+#define ARM_INST(NAME, NT, NORM, CONV)                                                                       \
+  template [[host_name(NAME)]] kernel void attn_residual_mix_t<NT, NORM, CONV>(                              \
       device const void*, device const void*, device const void*, device const void*, device const void*,     \
       device const void*, device const void*, device const void*, device const float*, device float*,         \
-      constant ResParams&, device const ushort*, device ushort*, uint, uint, uint, uint);
-ARM_INST("attn_residual_mix", 256, false)
-ARM_INST("attn_residual_mix_1024", 1024, false)
-ARM_INST("attn_residual_mix_norm_1024", 1024, true)
+      constant ResParams&, device const ushort*, device ushort*, device const ushort*, device const ushort*,  \
+      device float*, device float*, device const void*, device float*, uint, uint, uint, uint);
+ARM_INST("attn_residual_mix", 256, false, false)
+ARM_INST("attn_residual_mix_1024", 1024, false, false)
+ARM_INST("attn_residual_mix_norm_1024", 1024, true, false)
+ARM_INST("conv_mix_norm_1024", 1024, true, true)
 
 // ---------------------------------------------------------------- message controller
 // pair = bf16([rms(x), rms(m)]); h = bf16(pair @ down^T) (rank R); f = tanh(h @ forget^T); g = tanh(h @ gain^T)

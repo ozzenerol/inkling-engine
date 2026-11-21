@@ -90,6 +90,7 @@ struct ResParams {
   uint32_t T, D, nb, nq;
   uint32_t dt[8];
   float eps;
+  uint32_t conv_hist, conv_dt_other;
 };
 struct CtrlParams {
   uint32_t T, D, R, m_stride;
@@ -535,7 +536,47 @@ class MetalBackend final : public Backend {
     g_.set_value(10, p);
     bind(11, gamma ? *gamma : query);
     bind(12, normed ? *normed : out);
+    for (uint32_t i = 13; i <= 18; i++) bind(i, out);  // CONV-only arguments (unused here)
     g_.dispatch({p.T, 1, 1}, {wide ? 1024u : 256u, 1, 1});
+  }
+  // conv_add (attn_sconv + residual) and the following mix + post norm in one threadgroup (T == 1 only; the
+  // arithmetic is that of conv_add4 and attn_residual_mix_norm_1024, so it is bit-identical to the two ops).
+  void conv_add_mix_norm(const Tensor& x, const Tensor& w, Tensor& state, Tensor* hist, const Tensor& other,
+                         Tensor& tmp, Tensor& res, const std::vector<const Tensor*>& states, const Tensor& query,
+                         Tensor& mixed, const Tensor& gamma, float eps, Tensor& normed) override {
+    uint32_t D = uint32_t(x.dim(-1)), T = uint32_t(x.numel() / D);
+    bool nq1 = query.ndim == 1 || query.dim(0) == 1;
+    if (T != 1 || !nq1 || D > 2304 || res.dtype != DType::F32 || normed.dtype != DType::BF16 || states.size() > 8 ||
+        states.back()->buf != res.buf || !getenv("INK_CONV_MIX"))  // opt-in until GPU-tested
+      return Backend::conv_add_mix_norm(x, w, state, hist, other, tmp, res, states, query, mixed, gamma, eps, normed);
+    if (skip("mix")) return;
+    bool hh = hist && hist->valid();
+    ResParams p{};
+    p.T = 1;
+    p.D = D;
+    p.nb = uint32_t(states.size());
+    p.nq = 1;
+    p.eps = eps;
+    p.conv_hist = hh;
+    p.conv_dt_other = dtc(other.dtype);
+    pipe("conv_mix_norm_1024");
+    for (uint32_t i = 0; i < 8; i++) {
+      const Tensor& s = *states[std::min<size_t>(i, states.size() - 1)];
+      bind(i, s);
+      p.dt[i] = dtc(s.dtype);
+    }
+    bind(8, query);
+    bind(9, mixed);
+    g_.set_value(10, p);
+    bind(11, gamma);
+    bind(12, normed);
+    bind(13, x);
+    bind(14, w);
+    bind(15, state);
+    bind(16, hh ? *hist : state);
+    bind(17, other);
+    bind(18, res);
+    g_.dispatch({1, 1, 1}, {1024, 1, 1});
   }
   void attn_residual(const std::vector<const Tensor*>& states, const Tensor& query, Tensor& out) override {
     uint32_t nq = query.ndim == 1 ? 1 : uint32_t(query.dim(0));
