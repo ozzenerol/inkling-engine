@@ -25,6 +25,9 @@ up() { curl -s -m 2 "$url/v1/models" >/dev/null; }
 measure() {
 	label=$1
 	model=$(curl -s "$url/v1/models" | "$py" -c 'import json,sys; print(json.load(sys.stdin)["data"][0]["id"])')
+	echo "== warm-up (kernel compile, first allocations)"
+	curl -s -m 900 "$url/v1/chat/completions" -H 'Content-Type: application/json' \
+		-d '{"messages":[{"role":"user","content":"Say hi."}],"max_tokens":32,"chat_template_kwargs":{"reasoning_effort":"none"}}' >/dev/null
 	if [ -z "${SKIP_CTX:-}" ]; then
 		echo "== ctxbench $label ($sizes)"
 		"$py" -u "$HOME/llm/ctxbench.py" "$url/v1" "$model" "$sizes" | tee "$out/ctx-$label.jsonl"
