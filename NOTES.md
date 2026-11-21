@@ -902,3 +902,19 @@ no cache loss; not yet measured whether the model follows a mid-conversation eff
 on the cached prompt. First real run: tools/nib_e2e.sh task 5/5 tests pass, 5 steps, 15.6 s, wrote 731 tokens at
 66 tok/s, read 2.3k at 563 tok/s. `tools/nib_e2e.sh` runs in C's queue after the qh test.
 Note for installs: copy the binary with rm + cp; cp over the old file gets the new one killed (exit 137) by macOS.
+
+## Batch 15 (main 407c76d, 01:33-01:53, one run): clean repeat of batch 14's server numbers, nib in the queue
+
+Gates pass. mix2 again 45.7 vs 44.9 tok/s (8-bit, tokens identical). Depth bench 8-bit: gen 41.4 / 40.3 / 36.8 /
+31.1 / 27.9 tok/s, read 753 / 762 / 614 / 469 / 349 at 1.2k / 9.6k / 39k / 79k / 127k. Agent read 86.9 s, median
+TTFT 1.23 s; copy 47.1 s, TTFT 1.01 s. qh e2e PASS 37 s (6 steps, 1251 tokens out); **nib e2e PASS 14 s** (5
+steps, 690 tokens out, wrote at 68 tok/s, read at 575 tok/s).
+**Reading is 5-9% slower than in batch 13 and it is not the code**: inktest prefill of 2886 tokens takes
+3.90-4.05 s with INK_MIX2=0 and with the default alike (3.58 s in batches 12-13). A game (Habbo, Adobe AIR,
+started 01:21, 35% CPU, rendering) has been on the GPU since before batch 14. Prefill is compute bound, so it
+pays for a shared GPU first; decode (bandwidth bound) lost 0-4%. Batch 13 stays the reference table. Check
+`ps aux -r` for GPU users before trusting a batch.
+MLX copy baseline: still not measured. This time bench_c.sh's warm-up loop waited on MLX's 422 (its API wants a
+model field in the request) until killed; the loop now waits only on 503 / no answer. Run `MLX=1` on an idle GPU.
+nib on the real model after the prompt change: "hi" is answered in one step without tools (2.9 s); a second
+session reads 80 new tokens (the 1121-token prefix comes from the pinned checkpoint).
