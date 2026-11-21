@@ -10,6 +10,9 @@
 #include <map>
 #include <memory>
 
+#include <random>
+
+#include "engine/sampling.h"
 #include "gpu/dspark.h"
 #include "model/model.h"
 
@@ -25,6 +28,9 @@ struct Spec {
   double acc[8] = {0.7, 0.7, 0.7, 0.7, 0.7, 0.7, 0.7, 0.7};  // P(draft j accepted | drafts before it accepted)
   double t_plain = 0, t_draft = 0, t_verify[9] = {0, 0, 0, 0, 0, 0, 0, 0, 0};  // ms, 0 = not measured yet
   long plain_steps = 0, since_full = 0, since_plain = 0;
+  std::mt19937_64 rng{0x9E3779B97F4A7C15ull};  // speculative sampling uniforms
+  uint64_t seeded = ~0ull;
+  std::vector<float> pt;
 };
 std::map<const Engine*, std::unique_ptr<Spec>>& registry() {
   static std::map<const Engine*, std::unique_ptr<Spec>> r;
@@ -96,6 +102,10 @@ bool speculative_generate(Engine& e, Model& m, const SamplingParams& p, int max_
   }
   if (d.ctx_len() != m.len()) d.truncate(m.len());
   std::vector<int32_t> verify;
+  if (p.temperature > 0.0f && s.seeded != p.seed) {
+    s.rng.seed(p.seed ? p.seed * 0x9E3779B97F4A7C15ull + 1 : std::random_device{}());
+    s.seeded = p.seed;
+  }
   const bool adaptive = !getenv("INK_SPEC_FIXED");
   auto ema = [](double& v, double x, double alpha) { v = v == 0 ? x : v + alpha * (x - v); };
   auto ms_since = [](std::chrono::steady_clock::time_point t) {
@@ -145,7 +155,24 @@ bool speculative_generate(Engine& e, Model& m, const SamplingParams& p, int max_
     s.since_plain++;
     s.since_full = k == std::min(count_max, max_tokens - emitted) ? 0 : s.since_full + 1;
     auto c0 = std::chrono::steady_clock::now();
-    std::vector<int32_t> drafts = d.draft(b, k);
+    // Temperature > 0 with a sampling drafter: real speculative sampling (drafts sampled from the drafter's
+    // q = softmax(z / T), accepted with probability min(1, p / q), residual resample on the first rejection;
+    // exact, and accepts 1 - TV(p, q) instead of p(greedy draft)). Otherwise greedy drafts + sample-and-compare.
+    bool sampled = false;
+    std::vector<float> q_tok;
+#ifdef INK_DSPARK_HAS_SAMPLE
+    sampled = p.temperature > 0.0f && !getenv("INK_SPEC_COMPARE");
+#endif
+    std::vector<int32_t> drafts;
+    if (sampled) {
+#ifdef INK_DSPARK_HAS_SAMPLE
+      float us[8];
+      for (int j = 0; j < k; j++) us[j] = float(std::generate_canonical<double, 53>(s.rng));
+      drafts = d.draft_sample(b, k, p.temperature, us, &q_tok);
+#endif
+    } else {
+      drafts = d.draft(b, k);
+    }
     auto c1 = std::chrono::steady_clock::now();
     verify.assign(1, b);
     verify.insert(verify.end(), drafts.begin(), drafts.end());
@@ -163,7 +190,29 @@ bool speculative_generate(Engine& e, Model& m, const SamplingParams& p, int max_
     // while it equals the sample. Every emitted token is an exact target sample (greedy: the argmax).
     std::vector<int32_t> y(verify.size());
     int a = 0;
-    for (size_t j = 0; j < verify.size(); j++) {
+    for (size_t j = 0; sampled && j < verify.size(); j++) {
+      const float* row = lg.data() + j * V;
+      if (int(j) == k) {  // every draft accepted: the last row gives a free target sample
+        y[j] = e.sample(p, row, V);
+        break;
+      }
+      target_probs(p, row, V, s.pt);
+      SpecStep st = spec_accept(
+          s.pt, drafts[j], q_tok[j],
+          [&](std::vector<float>& q) {
+#ifdef INK_DSPARK_HAS_SAMPLE
+            const float* qr = d.q_row(int(j));
+            q.assign(qr, qr + V);
+#else
+            q.assign(size_t(V), 0.0f);
+#endif
+          },
+          std::generate_canonical<double, 53>(s.rng), std::generate_canonical<double, 53>(s.rng));
+      y[j] = st.token;
+      if (!st.accepted) break;
+      a++;
+    }
+    for (size_t j = 0; !sampled && j < verify.size(); j++) {
       const float* row = lg.data() + j * V;
       y[j] = p.temperature <= 0.0f ? int32_t(std::max_element(row, row + V) - row) : e.sample(p, row, V);
       if (int(j) < k && drafts[j] == y[j]) {
