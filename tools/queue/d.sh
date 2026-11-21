@@ -5,9 +5,9 @@ M8=~/llm/mlx-models/Inkling-2-Mini-MLX-8bit
 echo "-- op_diff with INK_GA=1"; INK_GA=1 $B/op_diff 2>&1 | grep -E "FAIL|ALL"
 for ids in long128k long32k; do
   [ -f ref_data/$ids.ids ] || continue
-  for v in "" "INK_GA=1"; do
+  for v in "" "INK_GA=1" "INK_GA=1 INK_GA_DRAFT=0"; do
     echo "-- 8-bit, $ids, temp 0.7, 300 tokens, dspark block 8, ${v:-split kernels}"
-    env INK_MODEL=$M8 INK_Q8_KERNELS=1 INK_SPEC_STATS=1 $v $SC dspark ref_data/$ids.ids 300 8 $OUT/d-$ids-t07${v:+-ga}.i32 0.7 2>&1 | grep -E "tok/s|dspark:|lookup:|adaptive"
+    env INK_MODEL=$M8 INK_Q8_KERNELS=1 INK_SPEC_STATS=1 $v $SC dspark ref_data/$ids.ids 300 8 $OUT/d-$ids-t07.i32 0.7 2>&1 | grep -E "tok/s|dspark:|lookup:|adaptive"
   done
 done
 # identity: greedy, plain vs dspark, both with INK_GA=1 (lossless build, 32k)
