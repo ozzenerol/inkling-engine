@@ -58,7 +58,7 @@ int main(int argc, char** argv) {
 
   int R = argc > 2 ? atoi(argv[2]) : 4, S = argc > 3 ? atoi(argv[3]) : 2;
   bool skinny = T > 4;
-  std::string name = skinny ? "gemm_skinny_bf16"
+  std::string name = skinny ? (getenv("SK1") ? "gemm_skinny_bf16" : "gemm_skinny2")
                             : "matvec_bf16_bf16_bf16_t" + std::to_string(T == 1 ? 1 : 4) + "_r" + std::to_string(R) +
                                   "_s" + std::to_string(S);
   Pipeline p = g.pipeline(name);
@@ -74,7 +74,8 @@ int main(int argc, char** argv) {
       if (skinny) {
         SkinnyParams s{m.N, m.K, (uint32_t)T, 1};
         g.set_value(3, s);
-        g.dispatch({(m.N + 31) / 32, 1, 1}, {128, 1, 1});
+        if (getenv("SK1")) g.dispatch({(m.N + 31) / 32, 1, 1}, {128, 1, 1});
+        else g.dispatch({(m.N + 15) / 16, 1, 1}, {64, 1, 1});
       } else {
         MatvecShape s{m.N, m.K, (uint32_t)T, 3072, 3072};
         g.set_value(3, s);

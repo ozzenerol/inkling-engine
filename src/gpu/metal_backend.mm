@@ -117,7 +117,10 @@ uint32_t cdiv(uint64_t a, uint64_t b) { return uint32_t((a + b - 1) / b); }
 
 class MetalBackend final : public Backend {
  public:
-  MetalBackend() : g_(Context::get()) { profile_ = getenv("INK_PROFILE") != nullptr; }
+  MetalBackend() : g_(Context::get()) {
+    profile_ = getenv("INK_PROFILE") != nullptr;
+    skinny_ = getenv("INK_SKINNY") != nullptr;  // off until it beats 2-4 passes of the 4-row matvec
+  }
   ~MetalBackend() override {
     sync();
     prof_report();
@@ -263,14 +266,14 @@ class MetalBackend final : public Backend {
   // rows of out computed: [0, N) of w; out row stride = N.
   void linear_rows(const Tensor& x, const Tensor& w, Tensor& out, uint32_t T, uint32_t N, uint32_t K,
                    uint32_t /*unused*/) {
-    if (K % 8 == 0 && T > 4 && T <= 16 && N >= 8 && !getenv("INK_NO_SKINNY")) {
+    if (K % 8 == 0 && T > 4 && T <= 16 && x.dtype == DType::BF16 && skinny_) {
       SkinnyParams sp{N, K, T, dtc(out.dtype)};
-      pipe(x.dtype == DType::BF16 ? "gemm_skinny_bf16" : "gemm_skinny_f32");
+      pipe("gemm_skinny2");
       bind(0, w);
       bind(1, x);
       bind(2, out);
       g_.set_value(3, sp);
-      g_.dispatch({cdiv(N, 32), 1, 1}, {128, 1, 1});
+      g_.dispatch({cdiv(N, 16), 1, 1}, {64, 1, 1});
       return;
     }
     if (K % 8 == 0 && T <= 16) {
@@ -686,6 +689,7 @@ class MetalBackend final : public Backend {
   Context& g_;
   bool pending_ = false;
   bool profile_ = false;
+  bool skinny_ = false;
   std::string cur_;
   std::map<std::string, std::pair<double, long>> prof_;
   std::unordered_map<void*, size_t> sizes_;

@@ -219,3 +219,56 @@ template [[host_name("gemm_skinny_bf16")]] kernel void gemm_skinny<bfloat>(devic
 template [[host_name("gemm_skinny_f32")]] kernel void gemm_skinny<float>(device const bfloat*, device const float*,
                                                                         device void*, constant SkinnyParams&, uint,
                                                                         uint, uint);
+
+// Skinny GEMM v2 (T <= 16 rows of bf16 x): threadgroup = 2 simdgroups x 8 output rows; K in steps of 64 with W
+// [16 x 64] and x [16 x 64] tiles staged by coalesced 16-byte loads; out^T = W x^T via 8x8 bf16 mma, fp32 acc.
+kernel void gemm_skinny2(device const ushort* W [[buffer(0)]], device const ushort* x [[buffer(1)]],
+                         device void* y [[buffer(2)]], constant SkinnyParams& s [[buffer(3)]],
+                         uint tg [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
+                         uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {
+  constexpr uint KS = 64, LD = KS + 8;
+  threadgroup bfloat Ws[16 * LD];
+  threadgroup bfloat Xs[16 * LD];
+  uint n0 = tg * 16;
+  simdgroup_float8x8 acc[2] = {simdgroup_float8x8(0), simdgroup_float8x8(0)};
+  for (uint k0 = 0; k0 < s.K; k0 += KS) {
+    // 16 rows x 64 = 128 uint4 for W and for x; 64 threads -> 2 each
+    for (uint i = tid; i < 128; i += 64) {
+      uint r = i / 8, c8 = (i % 8) * 8;
+      uint n = min(n0 + r, s.N - 1), t = min(r, s.T - 1);
+      uint k = k0 + c8;
+      uint4 wv = uint4(0), xv = uint4(0);
+      if (k < s.K) {
+        wv = *(device const uint4*)(W + size_t(n) * s.K + k);
+        xv = *(device const uint4*)(x + size_t(t) * s.K + k);
+      }
+      *(threadgroup uint4*)(Ws + r * LD + c8) = wv;
+      *(threadgroup uint4*)(Xs + r * LD + c8) = xv;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint kk = 0; kk < KS; kk += 8) {
+      simdgroup_bfloat8x8 wf, x0, x1;
+      simdgroup_load(wf, Ws + (sg * 8) * LD + kk, LD);
+      simdgroup_load(x0, Xs + kk, LD, ulong2(0, 0), true);
+      simdgroup_multiply_accumulate(acc[0], wf, x0, acc[0]);
+      if (s.T > 8) {
+        simdgroup_load(x1, Xs + 8 * LD + kk, LD, ulong2(0, 0), true);
+        simdgroup_multiply_accumulate(acc[1], wf, x1, acc[1]);
+      }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+  }
+  short2 fc = frag_coord(lane);
+  uint fm = uint(fc.y), fn = uint(fc.x);
+  for (uint j = 0; j < 2; j++) {
+    thread auto& e = acc[j].thread_elements();
+    for (uint c = 0; c < 2; c++) {
+      uint n = n0 + sg * 8 + fm, t = j * 8 + fn + c;
+      if (n < s.N && t < s.T) {
+        size_t o = size_t(t) * s.N + n;
+        if (s.dt_out == 0) ((device float*)y)[o] = e[c];
+        else ((device ushort*)y)[o] = f2bf(e[c]);
+      }
+    }
+  }
+}
