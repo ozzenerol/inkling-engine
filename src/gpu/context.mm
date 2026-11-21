@@ -418,7 +418,39 @@ void Context::commit_and_wait() {
   wait();
 }
 
+// Experiment (A's hypothesis: the GPU lowers its performance state on a duty cycle of short dependent dispatches):
+// INK_BUSY=G keeps G threadgroups of 256 threads spinning (INK_BUSY_ITERS iterations, default 20000) on a second
+// queue, resubmitted back to back, for the life of the process. No buffers shared with the model.
+static void start_busy(id<MTLDevice> dev, id<MTLComputePipelineState> pipe) {
+  const char* e = getenv("INK_BUSY");
+  if (!e || atoi(e) <= 0) return;
+  int groups = atoi(e);
+  uint32_t iters = getenv("INK_BUSY_ITERS") ? uint32_t(atoi(getenv("INK_BUSY_ITERS"))) : 20000;
+  id<MTLCommandQueue> q = [dev newCommandQueue];
+  id<MTLBuffer> buf = [dev newBufferWithLength:4096 options:MTLResourceStorageModeShared];
+  std::thread([=] {
+    while (true) {
+      @autoreleasepool {
+        id<MTLCommandBuffer> cb = [q commandBuffer];
+        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+        [enc setComputePipelineState:pipe];
+        [enc setBuffer:buf offset:0 atIndex:0];
+        [enc setBytes:&iters length:4 atIndex:1];
+        [enc dispatchThreadgroups:MTLSizeMake(groups, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        [enc endEncoding];
+        [cb commit];
+        [cb waitUntilCompleted];
+      }
+    }
+  }).detach();
+}
+
 void Context::keep_warm() {
+  static bool busy_started = false;
+  if (!busy_started) {
+    busy_started = true;
+    start_busy(impl_->device, (__bridge id<MTLComputePipelineState>)pipeline("busy_spin"));
+  }
   impl_->last_activity = now_s();
   if (impl_->warm_secs <= 0 || impl_->warm_queue) return;
   impl_->warm_queue = [impl_->device newCommandQueue];

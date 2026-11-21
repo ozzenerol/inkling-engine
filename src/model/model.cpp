@@ -616,7 +616,7 @@ void Model::run_visit(int v, Tensor& x, std::vector<Tensor>& blocks, const Chain
 void Model::forward(const int32_t* ids, int64_t T, bool all_logits, bool keep_hist) {
   if (T <= 0 || T > max_chunk_) throw std::runtime_error("forward: bad T");
   if (len_ + T > max_ctx_) throw std::runtime_error("forward: context full");
-  if (keep_hist && T > kMaxHist) throw std::runtime_error("forward: keep_hist needs T <= 16");
+  if (keep_hist && T > kMaxHist) throw std::runtime_error("forward: keep_hist needs T <= kMaxHist");
   if (keep_hist) ensure_hist();
   keep_hist_ = keep_hist;
   hist_rows_ = keep_hist ? T : 0;

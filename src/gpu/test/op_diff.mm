@@ -413,6 +413,23 @@ int main(int argc, char** argv) {
     MTL->kv_append(kn.m, vn.m, m);
     compare("kv_append ring T>cap", kc, 0, 0);
   }
+  for (int64_t T : {1, 4, 40}) {  // attention_gated == attention + sigmoid_gate (Metal vs Metal, bit-identical)
+    int64_t cap = 4096, len = 1500;
+    auto q = make(DType::BF16, {T, 24, 128}, 0.5f), kn = make(DType::BF16, {T, 8, 128}, 0.5f),
+         vn = make(DType::BF16, {T, 8, 128});
+    auto r = make(DType::BF16, {T, 24, 16}, 1.0f), rp = make(DType::BF16, {16, 1024}, 0.5f),
+         sk = make(DType::BF16, {T, 24}, 1.0f), gt = make(DType::BF16, {T, 24 * 128}, 2.0f);
+    auto kc = make(DType::BF16, {8, cap, 128}, 0.5f), vc = make(DType::BF16, {8, cap, 128});
+    Tensor o1 = MTL->alloc(DType::BF16, {T, 24 * 128}, "o1"), o2 = MTL->alloc(DType::BF16, {T, 24 * 128}, "o2");
+    AttnArgs am{q.m, kn.m, vn.m, r.m, rp.m, sk.m, KvView{kc.m, vc.m, cap, len, false}, 0};
+    MTL->attention_gated(am, gt.m, o1);
+    MTL->attention(am, o2);
+    MTL->sigmoid_gate(o2, gt.m, o2);
+    MTL->sync();
+    bool eq = !memcmp(o1.data<uint16_t>(), o2.data<uint16_t>(), size_t(T) * 3072 * 2);
+    printf("%-28s %s\n", ("attention_gated == sep T=" + std::to_string(T)).c_str(), eq ? "ok" : "FAIL");
+    if (!eq) fails++;
+  }
   // Verify (T=4 at len L) must equal decode (T=1 at len L+t) bit for bit, row by row (speculative identity).
   // T = 5..16 go through the multi-row kernel (D, kernels/multirow.metal).
   for (int TV : {4, 5, 8, 11, 16})

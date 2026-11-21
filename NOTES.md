@@ -568,3 +568,24 @@ head 0.93 -> 0.48). Check script: tests/ref/check_8bit_layout.py (tensor-by-tens
   B: q8 matvec model-free 795 GB/s of codes at T=1 (dense reads of the 8-bit build: 1.7 ms against 8.1 ms bf16),
   so the 8-bit plain step (23.7 ms) is now almost all MoE + head + small-dispatch latency; q8 linear_multi and
   conv_mix: no gain; MoE gate/up with 2 or 1 rows per simdgroup: slower (249 / 237 vs 262 GB/s).
+
+## B: correction (fused decode ops were not wired)
+
+The Metal overrides for `attn_prep_local`, `attention_gated` and `conv_add` were missing from metal_backend.mm from
+5f0fe21 until b/work ab13ba8: the edit that inserted them did not apply, so the Backend defaults (primitive
+sequences) ran. Consequences: the "fused attn_prep_local / attention_gated / conv_add" item in "B: decode speed
+work" contributed nothing to 31.8 -> 36.7 tok/s (that came from the wide mix, router matvec, concurrent encoder and
+mix+norm); the op_diff "prep" / "conv_add" cases compared primitives with primitives; the INK_SKIP numbers were on
+the unfused paths. The overrides now exist behind INK_FUSE2=1 and are unmeasured until a batch runs
+tools/queue/b.sh (exact op_diff cases, attention_gated identity, decode off vs on, DSpark identity).
+Also: batch 5's "q8 matvec 795 GB/s" came from zero-filled weights in bench_q8 and is not a read measurement.
+- **Batch 6** (main 73d0183, 20:45-21:05; stopped by A during C's full sweep): gates pass. D's q8 multi-row: 8-bit
+  copy 119-129 tok/s (118.8 without), token-identical. Parallel target sampling of verify rows in. C's cold sweep,
+  lossless build, temp 0.7 (prefill / gen tok/s): 1.2k 749 / 34.8, 9.5k 815 / 32.9, 18.9k 782 / 31.5, 38.6k
+  710 / 29.2, 78k 593 / 23.8 (MLX: 565 / 23.1, 602 / 24.2, 571 / 23.3, 495 / 22.0, 385 / 16.5).
+  B's 8-bit plain-step ablation (23.6 ms): MoE 7.5, dense 6.2, small ops 4.7, attention 3.0, mix 2.5, controllers
+  2.5, router 2.0, logits 1.5 ms; ~1200 dependent barriers per 1560 dispatches per token. The same q8 dense bytes
+  take 1.8 ms model-free (random codes): in-model they are 3x slower, cause open (dispatch gaps / GPU performance
+  state: B tests INTERLEAVE and INK_BUSY in batch 7). 8-bit verify: T=1 24.3 ms, T=2 33.3 (the 4-row matvec
+  template computed 4 rows at T=2: B adds 2-row kernels), T=3 36.8, T=4 42.4.
+- **Target (user, 21:00): 60 tok/s at the start of the context, 40 tok/s at 128k.** See tools/WORKFLOW.md.

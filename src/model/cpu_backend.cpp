@@ -464,6 +464,27 @@ class CpuBackend final : public Backend {
         std::memcpy(kv.k.data<uint16_t>() + (h * kv.cap + slot) * HD, k_new.data<uint16_t>() + (t * KVH + h) * HD, HD * 2);
         std::memcpy(kv.v.data<uint16_t>() + (h * kv.cap + slot) * HD, v_new.data<uint16_t>() + (t * KVH + h) * HD, HD * 2);
       }
+      // INK_KV_Q8SIM=1 (accuracy experiment, A): store the global-layer K and V as if they went through an 8-bit
+      // affine cache (groups of 64 values, scale = (max - min) / 255, bias = min), i.e. quantize and dequantize.
+      static const bool q8sim = std::getenv("INK_KV_Q8SIM") != nullptr;
+      if (q8sim && !kv.ring)
+        for (int64_t h = 0; h < KVH; ++h)
+          for (Tensor* dst : {&kv.k, &kv.v})
+            for (int64_t g0 = 0; g0 < HD; g0 += 64) {
+              uint16_t* p = dst->data<uint16_t>() + (h * kv.cap + slot) * HD + g0;
+              float lo = INFINITY, hi = -INFINITY;
+              for (int j = 0; j < 64; ++j) {
+                float v = bf16_to_f32(p[j]);
+                lo = std::min(lo, v);
+                hi = std::max(hi, v);
+              }
+              float sc = (hi - lo) / 255.0f;
+              for (int j = 0; j < 64; ++j) {
+                float v = bf16_to_f32(p[j]);
+                float q = sc > 0 ? std::round((v - lo) / sc) : 0.0f;
+                p[j] = f32_to_bf16(q * sc + lo);
+              }
+            }
     }
     kv.len += T;
   }
