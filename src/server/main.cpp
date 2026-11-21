@@ -61,12 +61,10 @@ int main(int argc, char** argv) {
     std::string t((std::istreambuf_iterator<char>(f)), {});
     uint64_t h = 0xcbf29ce484222325ull;
     for (unsigned char c : t) h = (h ^ c) * 0x100000001b3ull;
-    if (t.empty()) std::fprintf(stderr, "warning: %s/chat_template.jinja missing; using the built-in Inkling 2 template
-", model.c_str());
+    if (t.empty()) std::fprintf(stderr, "warning: %s/chat_template.jinja missing; using the built-in Inkling 2 template\n", model.c_str());
     else if (h != 0x73916286448643c8ull)
       std::fprintf(stderr, "WARNING: %s/chat_template.jinja differs from the template this server implements "
-                           "(Inkling-2-Mini-MLX-4-8bit); prompts may not match the model's template
-", model.c_str());
+                           "(Inkling-2-Mini-MLX-4-8bit); prompts may not match the model's template\n", model.c_str());
   }
   std::unique_ptr<Tokenizer> tok;
   try {
