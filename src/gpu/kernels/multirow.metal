@@ -369,11 +369,11 @@ kernel void mr_attn_combine(device const float* part [[buffer(0)]], device const
 // Per (route, output row) the arithmetic is the one of moe_gateup / moe_down (moe_fast.metal, B): same lane ->
 // chunk mapping, same fma order inside a chunk, same lane reduction, same scale / round / activation; so every row
 // equals the T = 1 result bit for bit. Steps:
-//   mr_moe_group   idx [routes] -> ulist: per used expert (in expert order) {expert, count, routes[32]}; uhdr[0] = n
+//   mr_moe_group   idx [routes] -> ulist: per used expert (in expert order) {expert, count, routes[64]}; uhdr[0] = n
 //   mr_moe_gateup  a[route, n]  = bf16(act(bf16(g), bf16(u)))          grid (slot, N / 16)
 //   mr_moe_down    dd[route, n] = bf16(down[e] a[route])               grid (slot, N / 32)
 //   mr_moe_wsum    out[t, n]    = bf16(sum_k dd[t*8+k, n] * w[t, k])   (k in order 0..7)
-constant uint MRL = 32;       // routes per expert in the list (= max rows: an expert is used once per row)
+constant uint MRL = 64;       // routes per expert in the list (= max rows: an expert is used once per row)
 constant uint MRU = 2 + MRL;  // ints per ulist slot
 constant uint MRP = 4;   // rows of one expert handled per pass over its weights
 

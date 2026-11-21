@@ -159,10 +159,10 @@ struct SoftcapParams {
 };
 
 uint32_t cdiv(uint64_t a, uint64_t b) { return uint32_t((a + b - 1) / b); }
-// D: largest T that takes the decode/verify kernels (rows bit-equal to T = 1). Dense ops run passes of 16 rows.
-// The code handles 32 (attention in two row groups, union MoE lists of 32) but that is unmeasured and parked
-// (2026-11-21, priority moved to long context): to go to 32, set this and add 17..32 to the op_diff row lists.
-constexpr uint32_t kMR = 16;
+// D: largest T that takes the decode/verify kernels (rows bit-equal to T = 1); dense ops run passes of 16 rows,
+// attention groups of 16 query rows, the union MoE route lists of up to 64. Verifies use T <= 16 (measured, gated
+// by op_diff). INK_MR_MAX=n (<= 64) sends prefill-only sizes 17..n the same way: unmeasured, bench first.
+const uint32_t kMR = std::min<uint32_t>(64, getenv("INK_MR_MAX") ? uint32_t(atoi(getenv("INK_MR_MAX"))) : 16);
 
 class MetalBackend final : public Backend {
  public:
@@ -868,7 +868,7 @@ class MetalBackend final : public Backend {
       const uint32_t sra = cdiv(sr, 12) * 12, ska = cdiv(nkeys, 16384) * 16384;
       Tensor S = scratch("ga-s", DType::F32, {KVH * sra, ska});
       Tensor bmax = scratch("ga-bmax", DType::F32, {KVH * sra, ska / 64});
-      Tensor M = scratch("ga-m", DType::F32, {KVH * 3 * kMR});
+      Tensor M = scratch("ga-m", DType::F32, {KVH * 3 * 64});
       Tensor part = scratch("ga-part", DType::F32, {KVH * (ska / 512) * sra, 132});
       const std::string rs = "_r" + std::to_string(R);
       const Tensor& kc = a.kv.k.valid() ? a.kv.k : a.k_new;
@@ -951,8 +951,8 @@ class MetalBackend final : public Backend {
       uint32_t split_keys = window ? split_local_ : split_keys_;
       uint32_t nsplit = cdiv(len + T, split_keys) - first / split_keys;
       MrAttnParams p{T, H, KVH, uint32_t(a.kv.cap), len, a.kv.ring ? 1u : 0u, window, uint32_t(a.rel_proj.dim(1)),
-                     split_keys, nsplit, 1u, first, 1u, gate ? 1u : 0u, 3 * kMR, 0u, T};
-      // sized for kMR rows and nsplit rounded up, so the scratch is not regrown (a sync) as T or the context grows
+                     split_keys, nsplit, 1u, first, 1u, gate ? 1u : 0u, cdiv(3 * T, 48) * 48, 0u, T};
+      // sized for 16 rows (or the next multiple) and nsplit rounded up, so the scratch is rarely regrown (a sync)
       Tensor part = scratch("mr-attn-part", DType::F32, {KVH * cdiv(nsplit, 64) * 64 * p.prow, 132});
       for (uint32_t t0 = 0; t0 < T; t0 += 16) {
         p.t0 = t0;
@@ -1281,8 +1281,8 @@ class MetalBackend final : public Backend {
       bool nv = m.gate.mode == QuantMode::NVFP4;
       const uint32_t E = 128, slots = std::min(routes, E);
       Tensor at = scratch("moe-a", DType::BF16, {routes, I});
-      Tensor dd = scratch("mr-moe-d", DType::BF16, {kMR * topk, D});
-      Tensor ul = scratch("mr-moe-ulist", DType::I32, {E, 2 + kMR});
+      Tensor dd = scratch("mr-moe-d", DType::BF16, {std::max<uint32_t>(T, 16) * topk, D});
+      Tensor ul = scratch("mr-moe-ulist", DType::I32, {E, 2 + 64});
       Tensor uh = scratch("mr-moe-uhdr", DType::I32, {4});
       struct { uint32_t routes, E; } gp{routes, E};
       pipe("mr_moe_group");

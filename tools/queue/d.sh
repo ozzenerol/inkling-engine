@@ -17,3 +17,13 @@ if [ -f ref_data/long32k.ids ]; then
   cmp -s $OUT/d-l32-plain.i32 $OUT/d-l32-plain-ga.i32 && echo "long32k: INK_GA=1 same tokens as the split kernels" || echo "long32k: INK_GA=1 tokens differ from the split kernels (other summation order; check it is a near-tie)"
 fi
 echo "-- bench_mrattn, INK_GA=1, groups of 2 tokens (INK_GA_TOK=2)"; INK_GA=1 INK_GA_TOK=2 $B/bench_mrattn 4 8 | grep -v local
+# Prefill-only sizes T = 17..63 (prompt tails, small agent turns): current paths vs the verify kernels in passes
+for v in "" "INK_MR_MAX=64"; do
+  echo "-- T = 20 32 48 63, ${v:-current paths (GEMMs, attn_prefill, moe_prefill)}"
+  env $v $B/bench_dense 16 20 32 48 63
+  env $v $B/bench_mrattn 20 32 48 63 | grep -E "len=(2048|32768) "
+  for T in 20 32 48 63; do env $v $B/bench_moe $T | grep layer; done
+done
+echo "-- T = 20 32 48 63 attention: INK_GA=1 INK_MR_MAX=64, and attn_gemm from 17 rows (INK_AG_MIN_T=17)"
+INK_GA=1 INK_MR_MAX=64 $B/bench_mrattn 20 32 48 63 | grep -E "len=(2048|32768) .*global"
+INK_AG_MIN_T=17 $B/bench_mrattn 20 32 48 63 | grep -E "len=(2048|32768) "
