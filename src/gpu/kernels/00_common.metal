@@ -19,3 +19,19 @@ inline void unpack_bf8(uint4 w, thread float* o) {
   o[4] = as_type<float>(w.z << 16); o[5] = as_type<float>(w.z & 0xffff0000u);
   o[6] = as_type<float>(w.w << 16); o[7] = as_type<float>(w.w & 0xffff0000u);
 }
+
+// FP8 decoders (MLX semantics: e4m3fn, e8m0 with 0 -> 2^-127)
+inline float e4m3_to_f(uint b) {  // fn variant (no inf), same as MLX fp8_e4m3 -> half path
+  uint v = b & 127u;
+  float r;
+  if (v == 127u) r = NAN;
+  else if ((v >> 3) == 0) r = float(v & 7u) * 0.001953125f;  // subnormal: m/8 * 2^-6
+  else r = as_type<float>(((v >> 3) + 120u) << 23 | (v & 7u) << 20);
+  return (b & 128u) ? -r : r;
+}
+inline float e8m0_to_f(uint b) {
+  if (b == 0) return as_type<float>(0x400000u);
+  if (b == 255) return NAN;
+  return as_type<float>(b << 23);
+}
+

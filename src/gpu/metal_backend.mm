@@ -79,6 +79,9 @@ struct RouterParams {
 struct QmvParams {
   uint32_t N, K, routes, x_div, mode;
 };
+struct MoeFastParams {
+  uint32_t N, K, topk;
+};
 struct CombineParams {
   uint32_t T, D, topk;
 };
@@ -386,6 +389,35 @@ class MetalBackend final : public Backend {
     if (x.dtype != DType::BF16) fail("moe: x must be bf16");
     uint32_t D = uint32_t(x.dim(-1)), T = uint32_t(x.numel() / D), topk = uint32_t(idx.dim(-1));
     uint32_t routes = T * topk, I = uint32_t(m.gate.n);
+    if (topk == 8 && T <= 16 && !getenv("INK_MOE_SLOW")) {
+      bool nv = m.gate.mode == QuantMode::NVFP4;
+      Tensor at = scratch("moe-a", DType::BF16, {routes, I});
+      MoeFastParams gp{I, D, topk};
+      pipe(nv ? "moe_gateup_nvfp4" : "moe_gateup_mxfp8");
+      bind(0, m.gate.weight);
+      bind(1, m.gate.scales);
+      bind(2, m.gate.global.valid() ? m.gate.global : m.gate.scales);
+      bind(3, m.up.weight);
+      bind(4, m.up.scales);
+      bind(5, m.up.global.valid() ? m.up.global : m.up.scales);
+      bind(6, x);
+      bind(7, idx);
+      bind(8, at);
+      g_.set_value(9, gp);
+      g_.dispatch({cdiv(I, 16), routes, 1}, {128, 1, 1});
+      MoeFastParams dp{D, I, topk};
+      pipe(nv ? "moe_down_nvfp4" : "moe_down_mxfp8");
+      bind(0, m.down.weight);
+      bind(1, m.down.scales);
+      bind(2, m.down.global.valid() ? m.down.global : m.down.scales);
+      bind(3, at);
+      bind(4, idx);
+      bind(5, w);
+      bind(6, out);
+      g_.set_value(7, dp);
+      g_.dispatch({cdiv(D, 4), T, 1}, {128, 1, 1});
+      return;
+    }
     Tensor gt = scratch("moe-g", DType::BF16, {routes, I});
     Tensor ut = scratch("moe-u", DType::BF16, {routes, I});
     Tensor at = scratch("moe-a", DType::BF16, {routes, I});

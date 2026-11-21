@@ -460,20 +460,6 @@ kernel void router_topk(device const void* x [[buffer(0)]], device const ushort*
 // MXFP8: weight u32 [E,N,K/4] e4m3 bytes, scales u8 e8m0 [E,N,K/32].
 constant float FP4_LUT[16] = {0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f,
                               -0.0f, -0.5f, -1.0f, -1.5f, -2.0f, -3.0f, -4.0f, -6.0f};
-inline float e4m3_to_f(uint b) {  // fn variant (no inf), same as MLX fp8_e4m3 -> half path
-  uint v = b & 127u;
-  float r;
-  if (v == 127u) r = NAN;
-  else if ((v >> 3) == 0) r = float(v & 7u) * 0.001953125f;  // subnormal: m/8 * 2^-6
-  else r = as_type<float>(((v >> 3) + 120u) << 23 | (v & 7u) << 20);
-  return (b & 128u) ? -r : r;
-}
-inline float e8m0_to_f(uint b) {
-  if (b == 0) return as_type<float>(0x400000u);
-  if (b == 255) return NAN;
-  return as_type<float>(b << 23);
-}
-
 // One simdgroup per (route, 4 output rows). Each lane takes one group (16 or 32 values) per step, sums
 // x*q within the group in fp32, multiplies by the group scale, accumulates; global scale at the end.
 // x: bf16 [routes, K] with row = route / x_div (x_div = topk for gate/up from x, 1 for down from a).

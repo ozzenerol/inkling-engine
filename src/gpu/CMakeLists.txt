@@ -39,7 +39,7 @@ file(GLOB INK_GPU_BENCH CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/bench/*.mm
 foreach(src ${INK_GPU_BENCH})
   get_filename_component(name ${src} NAME_WE)
   add_executable(${name} ${src})
-  target_link_libraries(${name} PRIVATE inkgpu)
+  target_link_libraries(${name} PRIVATE "-Wl,-force_load,$<TARGET_FILE:inkgpu>" inkgpu)
   target_compile_options(${name} PRIVATE -fobjc-arc)
   set_target_properties(${name} PROPERTIES OBJCXX_STANDARD 20)
 endforeach()
