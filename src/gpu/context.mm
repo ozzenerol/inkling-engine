@@ -32,6 +32,9 @@ struct Context::Impl {
   id<MTLComputeCommandEncoder> enc = nil;
   id<MTLCommandBuffer> last = nil;
   std::map<std::string, size_t> by_tag;
+  std::vector<id<MTLCommandBuffer>> pending;  // committed early, not yet waited
+  int since_commit = 0;
+  int commit_every = 128;
   std::unordered_map<void*, std::pair<std::string, size_t>> live;  // mtl ptr -> tag, size
   bool residency_dirty = false;
 };
@@ -64,6 +67,7 @@ Context::Context() : impl_(new Impl) {
     // All kernel files form one library, in file-name order (00_common.metal first holds shared helpers).
     std::string all;
     for (auto& [name, src] : embedded_kernels()) all += "// ---- " + name + "\n" + src + "\n";
+    if (const char* ce = getenv("INK_COMMIT_EVERY")) impl_->commit_every = atoi(ce);
     if (!all.empty()) compile("ink", all);
   }
 }
@@ -267,6 +271,15 @@ void Context::set_threadgroup_memory(uint32_t index, size_t bytes) {
 void Context::dispatch(Dim3 g, Dim3 t) {
   ensure_encoder();
   [impl_->enc dispatchThreadgroups:MTLSizeMake(g.x, g.y, g.z) threadsPerThreadgroup:MTLSizeMake(t.x, t.y, t.z)];
+  // Submit in pieces so the GPU starts while the CPU is still encoding the rest of a forward. One serial queue
+  // keeps the order; wait() on the last buffer covers the earlier ones.
+  if (++impl_->since_commit >= impl_->commit_every && impl_->commit_every > 0) {
+    end_encoder();
+    [impl_->cmd commit];
+    impl_->pending.push_back(impl_->cmd);
+    impl_->cmd = nil;
+    impl_->since_commit = 0;
+  }
 }
 
 void Context::barrier() {
@@ -290,6 +303,7 @@ void Context::blit_copy(Buf src, size_t src_off, Buf dst, size_t dst_off, size_t
 
 void Context::commit() {
   end_encoder();
+  impl_->since_commit = 0;
   if (!impl_->cmd) return;
   [impl_->cmd commit];
   impl_->last = impl_->cmd;
@@ -297,11 +311,23 @@ void Context::commit() {
 }
 
 void Context::wait() {
-  if (!impl_->last) return;
+  if (!impl_->last && impl_->pending.empty()) return;
+  if (!impl_->last) {  // nothing new since the early commits
+    impl_->last = impl_->pending.back();
+    impl_->pending.pop_back();
+  }
   [impl_->last waitUntilCompleted];
+  double first = impl_->last.GPUStartTime;
+  for (auto& b : impl_->pending) {
+    [b waitUntilCompleted];
+    if (b.status == MTLCommandBufferStatusError)
+      die(std::string("command buffer failed: ") + [[b.error description] UTF8String]);
+    first = std::min(first, b.GPUStartTime);
+  }
   if (impl_->last.status == MTLCommandBufferStatusError)
     die(std::string("command buffer failed: ") + [[impl_->last.error description] UTF8String]);
-  last_gpu_ms_ = (impl_->last.GPUEndTime - impl_->last.GPUStartTime) * 1e3;
+  last_gpu_ms_ = (impl_->last.GPUEndTime - first) * 1e3;  // wall time on the GPU across the pieces
+  impl_->pending.clear();
   impl_->last = nil;
 }
 
