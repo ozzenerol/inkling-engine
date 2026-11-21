@@ -832,7 +832,7 @@ class MetalBackend final : public Backend {
     if (st.size() > 4 || D > 2304 || E != 128 || a.topk > 8 || a.moe->gate_w.dtype != DType::BF16)
       fail("chain_mid: unsupported shape");
     ChainParams p{T, D, uint32_t(st.size()), 0u, a.boundary ? 1u : 0u, a.conv.hist ? 1u : 0u, a.msg ? 1u : 0u,
-                  uint32_t(a.topk), E, a.msg ? uint32_t(a.ctrl->down.dim(0)) : 64u, a.eps, a.route_scale, 1u};
+                  uint32_t(a.topk), E, a.msg ? uint32_t(a.ctrl->down.dim(0)) : 64u, a.eps, a.route_scale, getenv("INK_CH_STOP") ? uint32_t(atoi(getenv("INK_CH_STOP"))) : 1u};
     pipe("chain_mid");
     const Tensor& dummy = a.x;
     bind(0, a.conv.in);
@@ -1182,7 +1182,11 @@ class MetalBackend final : public Backend {
   uint32_t split_keys_ = 512;
   uint32_t split_local_ = 64;
   bool ag_stats_ = getenv("INK_AG_STATS") != nullptr;
-  bool chain_ = !getenv("INK_NO_CHAIN");  // chain kernels for T <= 8 (A)
+  // Chain kernels (A), opt-in with INK_CHAIN=1: measured SLOWER than the separate ops (decode 28.6 vs 36.9 tok/s;
+  // chain_front 198 us, chain_mid 117 us per call). One threadgroup of 1024 threads has the throughput of one
+  // slice of the GPU, so the router and controller matvecs inside it cost far more than the ~7.5 us per
+  // dependent dispatch they save.
+  bool chain_ = getenv("INK_CHAIN") != nullptr;
   uint32_t ag_min_t_ = getenv("INK_AG_MIN_T") ? uint32_t(atoi(getenv("INK_AG_MIN_T"))) : 64;  // GEMM attention from this T
   std::string cur_;
   std::map<std::string, std::pair<double, long>> prof_;

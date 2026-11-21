@@ -534,11 +534,12 @@ void Model::run_visit(int v, Tensor& x, std::vector<Tensor>& blocks, const Chain
     ma.conv = ChainConv{ao, w.attn_sconv, &s.conv[2], hist[2]};
     ma.x = x;
     ma.boundary = boundary;
-    for (auto& b : blocks) ma.blocks.push_back(&b);
+    const size_t nold = blocks.size();
     if (boundary) {
-      ma.blk = view(blk_[blocks.size()], {T, D});
-      blocks.push_back(ma.blk);
+      ma.blk = view(blk_[nold], {T, D});
+      blocks.push_back(ma.blk);  // may reallocate: take the pointers afterwards
     }
+    for (size_t b = 0; b < nold; ++b) ma.blocks.push_back(&blocks[b]);
     ma.query = w.mlp_query;
     ma.gamma = w.post_norm;
     ma.msg = cm;

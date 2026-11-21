@@ -131,27 +131,34 @@ inline void ch_msg_coef(device const ushort* bank0, device const ushort* bank1, 
 }
 
 // Message controller: dst = (1 - f) x + g m, f = tanh(h . forget), g = tanh(h . gain),
-// h = bf16(bf16([rms(x), rms(m)]) @ down^T) (rank R = 64). xs: threadgroup; m from the bank; dst may be xs.
+// h = bf16(bf16([rms(x), rms(m)]) @ down^T) (rank R = 64). xs: threadgroup; the message is written to vm
+// (threadgroup) first; dst may be xs. Weights are read 8 bf16 at a time: one threadgroup has only 1024
+// threads, and a single-element device load costs about 0.25 us of latency each.
 inline void ch_ctrl(threadgroup float* xs, float ssx, device const ushort* bank0, device const ushort* bank1,
                     float c0, float c1, device const ushort* down, device const ushort* forget,
-                    device const ushort* gain, threadgroup float* dst, threadgroup float* h, uint t, uint D, uint R,
-                    uint tid, uint sg, uint lane, threadgroup float* scratch) {
+                    device const ushort* gain, threadgroup float* vm, threadgroup float* dst, threadgroup float* h,
+                    uint t, uint D, uint R, uint tid, uint sg, uint lane, threadgroup float* scratch) {
   float ssm = 0;
   for (uint i = tid; i < D; i += CH_NT) {
     float mv = c0 * bf2f(bank0[t * D + i]) + c1 * bf2f(bank1[t * D + i]);
+    vm[i] = mv;
     ssm = fma(mv, mv, ssm);
   }
-  ch_sum(&ssm, 1, scratch, sg, lane);
+  ch_sum(&ssm, 1, scratch, sg, lane);  // its barrier also publishes vm
   float invx = 1.0f / precise::sqrt(ssx / float(D) + 1e-6f), invm = 1.0f / precise::sqrt(ssm / float(D) + 1e-6f);
   // h: simdgroup sg computes rows sg * R / 32 ..; lanes split the 2 D pair elements
   uint rper = R / 32, span = 2 * D / 32;
   for (uint rr = 0; rr < rper; rr++) {
     uint r = sg * rper + rr;
     float a = 0;
-    for (uint j = lane * span; j < (lane + 1) * span; j++) {
-      float pv = j < D ? round_bf(xs[j] * invx)
-                       : round_bf((c0 * bf2f(bank0[t * D + j - D]) + c1 * bf2f(bank1[t * D + j - D])) * invm);
-      a = fma(pv, bf2f(down[r * 2 * D + j]), a);
+    for (uint j = lane * span; j < (lane + 1) * span; j += 8) {
+      float w8[8];
+      unpack_bf8(*(device const uint4*)(down + size_t(r) * 2 * D + j), w8);
+      for (uint e = 0; e < 8; e++) {
+        uint jj = j + e;
+        float pv = jj < D ? round_bf(xs[jj] * invx) : round_bf(vm[jj - D] * invm);
+        a = fma(pv, w8[e], a);
+      }
     }
     a = simd_sum(a);
     if (lane == 0) h[r] = round_bf(a);
@@ -159,13 +166,17 @@ inline void ch_ctrl(threadgroup float* xs, float ssx, device const ushort* bank0
   threadgroup_barrier(mem_flags::mem_threadgroup);
   for (uint i = tid; i < D; i += CH_NT) {
     float f = 0, g = 0;
-    for (uint r = 0; r < R; r++) {
-      float hv = h[r];
-      f = fma(hv, bf2f(forget[i * R + r]), f);
-      g = fma(hv, bf2f(gain[i * R + r]), g);
+    for (uint r = 0; r < R; r += 8) {
+      float fw[8], gw[8];
+      unpack_bf8(*(device const uint4*)(forget + size_t(i) * R + r), fw);
+      unpack_bf8(*(device const uint4*)(gain + size_t(i) * R + r), gw);
+      for (uint e = 0; e < 8; e++) {
+        float hv = h[r + e];
+        f = fma(hv, fw[e], f);
+        g = fma(hv, gw[e], g);
+      }
     }
-    float mv = c0 * bf2f(bank0[t * D + i]) + c1 * bf2f(bank1[t * D + i]);
-    dst[i] = (1.0f - precise::tanh(f)) * xs[i] + precise::tanh(g) * mv;
+    dst[i] = (1.0f - precise::tanh(f)) * xs[i] + precise::tanh(g) * vm[i];
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
 }
@@ -220,8 +231,8 @@ kernel void chain_front(device const ushort* mo [[buffer(0)]], device const usho
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     // Local layers: one mix (one query), then with messages three controllers on it. Global layers: three
-    // queries, so a mix per output, each with its own norm weight. vb = mix, va = x until the last mix (nq == 1
-    // frees it after the first mix; nq == 3 keeps x in va and puts controller outputs in vc).
+    // queries, so a mix per output, each with its own norm weight. vb = mix, vc = controller output, va = x for
+    // the mix and then the controller's message (x is reloaded from the device before the next mix).
     float coef[6];
     if (p.has_msg) ch_msg_coef(bank0, bank1, mq, 0, 3, coef, t, D, tid, sg, lane, scratch);
     device ushort* outs[3] = {xq, xk, xv};
@@ -233,6 +244,10 @@ kernel void chain_front(device const ushort* mo [[buffer(0)]], device const usho
     float ssx = 0;
     for (uint c = 0; c < nout; c++) {
       if (c == 0 || p.nq == 3) {
+        if (c > 0 && p.has_msg) {  // va held the previous controller's message: reload x (own elements)
+          for (uint i = tid; i < D; i += CH_NT) va[i] = bf2f(x[t * D + i]);
+          threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
         ch_mix(b0, b1, b2, b3, p.nb, va, query + (p.nq == 3 ? c * D : 0), vb, t, D, tid, sg, lane, scratch);
         if (p.has_msg) {
           ssx = 0;
@@ -243,8 +258,8 @@ kernel void chain_front(device const ushort* mo [[buffer(0)]], device const usho
       if (!p.has_msg) {
         ch_norm(vb, gammas[c], outs[c], p.eps, false, t, D, tid, sg, lane, scratch);
       } else {
-        ch_ctrl(vb, ssx, bank0, bank1, coef[2 * c], coef[2 * c + 1], downs[c], forgets[c], gains[c], vc, h, t, D, p.R,
-                tid, sg, lane, scratch);
+        ch_ctrl(vb, ssx, bank0, bank1, coef[2 * c], coef[2 * c + 1], downs[c], forgets[c], gains[c], va, vc, h, t, D,
+                p.R, tid, sg, lane, scratch);
         ch_norm(vc, gammas[c], outs[c], p.eps, false, t, D, tid, sg, lane, scratch);
       }
     }
@@ -282,22 +297,29 @@ kernel void chain_mid(device const ushort* ao [[buffer(0)]], device const ushort
       va[i] = r;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (p.nq == 101) continue;
     ch_mix(b0, b1, b2, b3, p.nb, va, query, vb, t, D, tid, sg, lane, scratch);  // vb = mlp input mix
+    if (p.nq == 102) continue;
     if (p.has_msg) {
       float coef[2];
       ch_msg_coef(bank0, bank1, mq, 3, 1, coef, t, D, tid, sg, lane, scratch);
       float ssx = 0;
       for (uint i = tid; i < D; i += CH_NT) ssx = fma(vb[i], vb[i], ssx);
       ch_sum(&ssx, 1, scratch, sg, lane);
-      ch_ctrl(vb, ssx, bank0, bank1, coef[0], coef[1], down, forget, gain, vb, h, t, D, p.R, tid, sg, lane, scratch);
+      ch_ctrl(vb, ssx, bank0, bank1, coef[0], coef[1], down, forget, gain, va, vb, h, t, D, p.R, tid, sg, lane, scratch);
     }
     ch_norm(vb, gamma, hn, p.eps, true, t, D, tid, sg, lane, scratch);  // vb = float(hn)
+    if (p.nq == 103) continue;
     // Router: simdgroup sg scores experts sg * E / 32 ..; lanes split the D inputs.
     uint eper = p.E / 32, span = D / 32;
     for (uint ee = 0; ee < eper; ee++) {
       uint e = sg * eper + ee;
       float a = 0;
-      for (uint j = lane * span; j < (lane + 1) * span; j++) a = fma(vb[j], bf2f(gate_w[e * D + j]), a);
+      for (uint j = lane * span; j < (lane + 1) * span; j += 8) {
+        float w8[8];
+        unpack_bf8(*(device const uint4*)(gate_w + size_t(e) * D + j), w8);
+        for (uint k = 0; k < 8; k++) a = fma(vb[j + k], w8[k], a);
+      }
       a = simd_sum(a);
       if (lane == 0) sc[e] = 1.0f / (1.0f + exp(-a));
     }

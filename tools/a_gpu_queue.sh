@@ -12,10 +12,10 @@ case $st in
 chain)
   echo "== chain kernels: accuracy and decode speed, on vs off (teacher-forced, plain decode)"
   for v in on off; do
-    [ $v = off ] && export INK_NO_CHAIN=1 || unset INK_NO_CHAIN
+    [ $v = on ] && export INK_CHAIN=1 || unset INK_CHAIN
     echo "-- chain $v"; ACC_OUT=$S/chain_$v tests/ref/acc_check.sh metal 0 1 2 2>&1 | grep -E "decode|vs|mismatch"
   done
-  unset INK_NO_CHAIN
+  unset INK_CHAIN
   for i in 0 1 2; do cmp -s $S/chain_on/p$i/argmax.i32 $S/chain_off/p$i/argmax.i32 && echo "p$i argmax identical on/off" || echo "p$i argmax DIFFERS on/off"; done
   ./build/inktest --backend metal --ids ref_data/p2.ids --rollback-test --out $S 2>&1 | tail -1
   ;;
