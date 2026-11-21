@@ -119,6 +119,9 @@ struct AgParams {  // kernels/attn_gemm.metal
 struct AttnDecParams {
   uint32_t T, H, KVH, cap, len, ring, window, rel_extent, split_keys, nsplit, causal, first, use_sink, use_gate;
 };
+struct MrAttnParams {  // kernels/multirow.metal (D)
+  uint32_t T, H, KVH, cap, len, ring, window, rel_extent, split_keys, nsplit, causal, first, use_sink, use_gate, prow;
+};
 struct RouterParams {
   uint32_t T, D, E, topk, dt_x;
   float scale;
@@ -394,6 +397,18 @@ class MetalBackend final : public Backend {
   // rows of out computed: [0, N) of w; out row stride = N.
   void linear_rows(const Tensor& x, const Tensor& w, Tensor& out, uint32_t T, uint32_t N, uint32_t K,
                    uint32_t /*unused*/) {
+    if (K % 8 == 0 && T > 4 && T <= 16 && mr_ && !skinny_ && !getenv("INK_MV_T8")) {
+      // D: one pass over W for 5..16 rows; every row equals the 1-row matvec bit for bit (kernels/multirow.metal)
+      MatvecShape ms{N, K, T, K, N};
+      // measured (bench_multirow): up to 8 rows 2 output rows per simdgroup is best, above 8 rows 4
+      pipe(std::string("mr_matvec_") + dtn(x.dtype) + "_" + dtn(out.dtype) + (T <= 8 ? "_t8_r2_s2" : "_t16_r4_s2"));
+      bind(0, w);
+      bind(1, x);
+      bind(2, out);
+      g_.set_value(3, ms);
+      g_.dispatch({cdiv(N, T <= 8 ? 4 : 8), 1, 1}, {64, 1, 1});
+      return;
+    }
     if (K % 8 == 0 && T > 4 && T <= 16 && x.dtype == DType::BF16 && skinny_) {
       SkinnyParams sp{N, K, T, dtc(out.dtype)};
       pipe("gemm_skinny2");
@@ -460,7 +475,7 @@ class MetalBackend final : public Backend {
         return;
       }
     uint32_t K = uint32_t(ws[0]->dim(1)), T = uint32_t(x.numel() / K);
-    bool ok = T <= 4 && ws.size() <= 8 && K % 8 == 0 && !getenv("INK_NO_MULTI");
+    bool ok = (T <= 4 || (T <= 16 && mr_)) && ws.size() <= 8 && K % 8 == 0 && !getenv("INK_NO_MULTI");
     for (auto* w : ws) ok = ok && w->dim(1) == K && w->dim(0) % 4 == 0 && w->dtype == DType::BF16;
     if (!ok) {
       for (size_t i = 0; i < ws.size(); ++i) linear(x, *ws[i], *outs[i]);
@@ -470,7 +485,8 @@ class MetalBackend final : public Backend {
     p.K = K;
     p.T = T;
     p.count = uint32_t(ws.size());
-    pipe(x.dtype == DType::BF16 ? "matvec_multi_bf16" : "matvec_multi_f32");
+    if (T > 4) pipe(std::string("mr_matvec_multi_") + dtn(x.dtype) + (T <= 8 ? "_t8" : "_t16"));  // D
+    else pipe(x.dtype == DType::BF16 ? "matvec_multi_bf16" : "matvec_multi_f32");
     for (uint32_t i = 0; i < 8; i++) {
       uint32_t j = std::min<uint32_t>(i, p.count - 1);
       bind(i, *ws[j]);
@@ -489,7 +505,7 @@ class MetalBackend final : public Backend {
                           const Tensor& gamma, float eps, Tensor& normed) override {
     uint32_t D = uint32_t(states[0]->dim(-1)), T = uint32_t(states[0]->numel() / D);
     bool nq1 = query.ndim == 1 || query.dim(0) == 1;
-    if (!nq1 || T > 4 || D > 2304 || normed.dtype != DType::BF16 || getenv("INK_NO_FUSE"))
+    if (!nq1 || T > 16 || D > 2304 || normed.dtype != DType::BF16 || getenv("INK_NO_FUSE"))  // D: 16 (was 4)
       return Backend::attn_residual_norm(states, query, mixed, gamma, eps, normed);
     mix(states, query, 1, mixed, &gamma, eps, &normed);
   }
@@ -503,7 +519,9 @@ class MetalBackend final : public Backend {
     p.D = D;
     p.nb = uint32_t(states.size());
     p.nq = nq;
-    bool wide = p.T <= 4;  // decode/verify: one threadgroup per token is latency bound, use 1024 threads
+    // decode/verify: one threadgroup per token is latency bound, use 1024 threads. Up to 16 rows (D): the 256-thread
+    // kernel reduces in a different order, so a verify row above 4 would not equal the decode row.
+    bool wide = p.T <= 16;
     p.eps = eps;
     pipe(normed ? "attn_residual_mix_norm_1024" : wide ? "attn_residual_mix_1024" : "attn_residual_mix");
     if (normed) wide = true;
@@ -530,7 +548,8 @@ class MetalBackend final : public Backend {
   void controller_multi(int n, const Tensor* xs, const Tensor* ms, const Tensor* downs, const Tensor* forgets,
                         const Tensor* gains, Tensor* outs) override {
     uint32_t D = uint32_t(xs[0].dim(-1)), T = uint32_t(xs[0].numel() / D), R = uint32_t(downs[0].dim(0));
-    if (n != 3 || T > 4 || getenv("INK_NO_FUSE")) return Backend::controller_multi(n, xs, ms, downs, forgets, gains, outs);
+    if (n != 3 || T > (mr_ ? 16u : 4u) || getenv("INK_NO_FUSE"))
+      return Backend::controller_multi(n, xs, ms, downs, forgets, gains, outs);
     if (skip("ctrl")) return;
     CtrlParams p{T, D, R, D};
     Tensor pair = scratch("ctrl-pair3", DType::BF16, {3 * T, 2 * D});
@@ -548,7 +567,7 @@ class MetalBackend final : public Backend {
     mp.K = 2 * D;
     mp.T = T;
     mp.count = 3;
-    pipe("matvec_multi_bf16");
+    pipe(T <= 4 ? "matvec_multi_bf16" : T <= 8 ? "mr_matvec_multi_bf16_t8" : "mr_matvec_multi_bf16_t16");  // D
     Tensor hv[3];
     for (uint32_t i = 0; i < 8; i++) {
       uint32_t j = std::min<uint32_t>(i, 2);
@@ -720,7 +739,7 @@ class MetalBackend final : public Backend {
     if (skip("attn")) return; attention_impl(a, nullptr, out); }
   void attention_impl(const AttnArgs& a, const Tensor* gate, Tensor& out) {
     uint32_t T = uint32_t(a.q.dim(0)), H = uint32_t(a.q.dim(1)), KVH = uint32_t(a.k_new.dim(1));
-    if (T <= 4 && H == 3 * KVH && !getenv("INK_ATTN_SLOW")) {
+    if (T <= 4 && !(mr_attn_ && T >= mr_attn_min_) && H == 3 * KVH && !getenv("INK_ATTN_SLOW")) {
       uint32_t len = uint32_t(a.kv.len), window = uint32_t(a.window);
       uint32_t first = (window && len + 1 > window) ? len + 1 - window : 0;
       uint32_t nkeys = len + T - first;
@@ -744,6 +763,40 @@ class MetalBackend final : public Backend {
       g_.set_value(8, p);
       g_.dispatch({KVH, nsplit, 1}, {64, 1, 1});
       pipe("attn_decode_combine");
+      bind(0, part);
+      bind(1, a.sink);
+      bind(2, out);
+      g_.set_value(3, p);
+      bind(4, gate ? *gate : out);
+      g_.dispatch({T, H, 1}, {128, 1, 1});
+      return;
+    }
+    if (T <= 16 && H == 3 * KVH && mr_attn_ && !getenv("INK_ATTN_SLOW")) {
+      // D: 5..16 rows (verify). Same splits and per-row arithmetic as the T <= 4 path above (rows == decode), K/V
+      // staged once per split for all rows (kernels/multirow.metal).
+      uint32_t len = uint32_t(a.kv.len), window = uint32_t(a.window);
+      uint32_t first = (window && len + 1 > window) ? len + 1 - window : 0;
+      uint32_t split_keys = window ? split_local_ : split_keys_;
+      uint32_t nsplit = cdiv(len + T, split_keys) - first / split_keys;
+      uint32_t nfg = cdiv(3 * T, 8);
+      MrAttnParams p{T, H, KVH, uint32_t(a.kv.cap), len, a.kv.ring ? 1u : 0u, window, uint32_t(a.rel_proj.dim(1)),
+                     split_keys, nsplit, 1u, first, 1u, gate ? 1u : 0u, 48u};
+      // sized for 16 rows and nsplit rounded up, so the scratch is not regrown (a sync) as T or the context grows
+      Tensor part = scratch("mr-attn-part", DType::F32, {KVH * cdiv(nsplit, 64) * 64 * p.prow, 132});
+      std::string nm = "mr_attn_split_g" + std::to_string(nfg);
+      if (const char* ab = getenv("INK_MR_ABL")) nm = std::string("mr_attn_split_g6_abl") + ab;  // bench only
+      pipe(nm);
+      bind(0, a.q);
+      bind(1, a.k_new);
+      bind(2, a.v_new);
+      bind(3, a.r);
+      bind(4, a.rel_proj);
+      bind(5, a.kv.k.valid() ? a.kv.k : a.k_new);
+      bind(6, a.kv.v.valid() ? a.kv.v : a.v_new);
+      bind(7, part);
+      g_.set_value(8, p);
+      g_.dispatch({KVH, nsplit, 1}, {64 * nfg, 1, 1});
+      pipe("mr_attn_combine");
       bind(0, part);
       bind(1, a.sink);
       bind(2, out);
@@ -1181,6 +1234,12 @@ class MetalBackend final : public Backend {
   bool skinny_ = false;
   uint32_t split_keys_ = 512;
   uint32_t split_local_ = 64;
+  // D: one-pass dense for 5..16 rows. INK_MR=0 restores passes of 4 rows.
+  bool mr_ = !(getenv("INK_MR") && getenv("INK_MR")[0] == '0');
+  // rows from which the multi-row attention kernel is used. 3: it is bit-identical to attn_decode_split and at
+  // T = 3, 4 faster (32k global: 1.11 ms vs 1.94; 128k: 3.8 vs 6.8), at T <= 2 equal.
+  uint32_t mr_attn_min_ = getenv("INK_MR_ATTN_MIN") ? uint32_t(atoi(getenv("INK_MR_ATTN_MIN"))) : 3;
+  bool mr_attn_ = !(getenv("INK_MR_ATTN") && getenv("INK_MR_ATTN")[0] == '0');  // D: 5..16-row attention
   bool ag_stats_ = getenv("INK_AG_STATS") != nullptr;
   // Chain kernels (A), opt-in with INK_CHAIN=1: measured SLOWER than the separate ops (decode 28.6 vs 36.9 tok/s;
   // chain_front 198 us, chain_mid 117 us per call). One threadgroup of 1024 threads has the throughput of one

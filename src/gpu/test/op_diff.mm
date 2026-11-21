@@ -125,6 +125,38 @@ int main(int argc, char** argv) {
     MTL->linear(xf.m, w.m, of.m);
     compare(("linear f32 T=" + std::to_string(T)).c_str(), of);
   }
+  // D: a T-row linear / linear_multi must equal T one-row linears bit for bit (verify rows == decode rows).
+  for (int64_t T : {4, 5, 8, 11, 16}) {
+    size_t bad = 0;
+    for (int f32x = 0; f32x < 2; f32x++)
+      for (int f32y = 0; f32y < 2; f32y++) {
+        const DType xd = f32x ? DType::F32 : DType::BF16, yd = f32y ? DType::F32 : DType::BF16;
+        const int64_t N = 3076;  // not a multiple of 8 rows per threadgroup
+        auto x = make(xd, {T, D});
+        auto w = make(DType::BF16, {N, D}, 0.02f), w2 = make(DType::BF16, {384, D}, 0.02f);
+        Tensor oT = MTL->alloc(yd, {T, N}, "oT"), o1 = MTL->alloc(yd, {1, N}, "o1");
+        Tensor mA = MTL->alloc(yd, {T, N}, "mA"), mB = MTL->alloc(yd, {T, 384}, "mB"), m1 = MTL->alloc(yd, {1, 384}, "m1");
+        MTL->linear(x.m, w.m, oT);
+        MTL->linear_multi(x.m, {&w.m, &w2.m}, {&mA, &mB});
+        for (int64_t t = 0; t < T; t++) {
+          Tensor xt = x.m;
+          xt.set_shape({1, D});
+          xt.offset += size_t(t) * D * dtype_size(xd);
+          MTL->linear(xt, w.m, o1);
+          MTL->linear(xt, w2.m, m1);
+          MTL->sync();
+          const size_t rb = size_t(N) * dtype_size(yd), rb2 = size_t(384) * dtype_size(yd);
+          bad += memcmp(o1.data<char>(), oT.data<char>() + t * rb, rb) != 0;
+          bad += memcmp(o1.data<char>(), mA.data<char>() + t * rb, rb) != 0;
+          bad += memcmp(m1.data<char>(), mB.data<char>() + t * rb2, rb2) != 0;
+        }
+        for (Tensor* tt : {&oT, &o1, &mA, &mB, &m1}) MTL->free(*tt);
+      }
+    char nm[64];
+    snprintf(nm, sizeof nm, "linear rows==T1 T=%lld", (long long)T);
+    printf("%-28s %s  rows differing: %zu\n", nm, bad ? "FAIL" : "ok  ", bad);
+    if (bad) fails++;
+  }
   for (int64_t T : {1, 3}) {  // linear_multi vs separate CPU linears (bit-equal to Metal linear expected)
     auto x = make(DType::BF16, {T, D});
     auto w1 = make(DType::BF16, {3072, D}, 0.02f), w2 = make(DType::BF16, {384, D}, 0.02f),
@@ -141,8 +173,7 @@ int main(int argc, char** argv) {
     CPU->copy(o1.c, c.c);
     compare("copy", c, 0, 0);
   }
-  {  // attn residual
-    int64_t T = 3;
+  for (int64_t T : {3, 5, 8, 11, 16}) {  // attn residual (T > 4: D, same kernels as decode up to 16 rows)
     auto s0 = make(DType::BF16, {T, D}, 2.0f), s1 = make(DType::F32, {T, D}, 1.0f), s2 = make(DType::F32, {T, D}, 5.0f);
     auto q = make(DType::F32, {3, D}, 0.05f);
     auto o = zeros(DType::F32, {3, T, D});
@@ -184,7 +215,7 @@ int main(int argc, char** argv) {
     // neighbours (sum order), every output of that token moves by ~1e-3. Bound, not bit-exactness.
     compare("controller", o, 2e-2);
   }
-  for (int64_t T : {1, 3}) {  // controller_multi / rms_norm_multi (Metal fused) vs CPU loops
+  for (int64_t T : {1, 3, 8, 16}) {  // controller_multi / rms_norm_multi (Metal fused) vs CPU loops
     Pair xs[3], ms[3], dn[3], fg[3], gn[3], os[3];
     for (int i = 0; i < 3; i++) {
       xs[i] = make(DType::F32, {T, D});
@@ -356,25 +387,27 @@ int main(int argc, char** argv) {
     compare("kv_append ring T>cap", kc, 0, 0);
   }
   // Verify (T=4 at len L) must equal decode (T=1 at len L+t) bit for bit, row by row (speculative identity).
+  // T = 5..16 go through the multi-row kernel (D, kernels/multirow.metal).
+  for (int TV : {4, 5, 8, 11, 16})
   for (int local = 0; local < 2; local++) {
     int64_t cap = local ? 1536 : 8192, L = local ? 3001 : 4093;  // ring wrapped / split boundary crossing
-    auto q = make(DType::BF16, {4, 24, 128}, 0.5f), r = make(DType::BF16, {4, 24, 16}, 1.0f),
-         rp = make(DType::BF16, {16, 1024}, 0.5f), sk = make(DType::BF16, {4, 24}, 1.0f);
+    auto q = make(DType::BF16, {TV, 24, 128}, 0.5f), r = make(DType::BF16, {TV, 24, 16}, 1.0f),
+         rp = make(DType::BF16, {16, 1024}, 0.5f), sk = make(DType::BF16, {TV, 24}, 1.0f);
     auto kc = make(DType::BF16, {8, cap, 128}, 0.5f), vc = make(DType::BF16, {8, cap, 128});
     // new keys = cache rows at positions L..L+3 (so the T=1 runs read them from the cache)
-    Tensor kn = MTL->alloc(DType::BF16, {4, 8, 128}, "kn"), vn = MTL->alloc(DType::BF16, {4, 8, 128}, "vn");
+    Tensor kn = MTL->alloc(DType::BF16, {TV, 8, 128}, "kn"), vn = MTL->alloc(DType::BF16, {TV, 8, 128}, "vn");
     MTL->sync();
-    for (int t = 0; t < 4; t++)
+    for (int t = 0; t < TV; t++)
       for (int h = 0; h < 8; h++) {
         int64_t slot = local ? (L + t) % cap : L + t;
         memcpy(kn.data<uint16_t>() + (t * 8 + h) * 128, kc.m.data<uint16_t>() + (h * cap + slot) * 128, 256);
         memcpy(vn.data<uint16_t>() + (t * 8 + h) * 128, vc.m.data<uint16_t>() + (h * cap + slot) * 128, 256);
       }
-    Tensor o4 = MTL->alloc(DType::BF16, {4, 24 * 128}, "o4");
+    Tensor o4 = MTL->alloc(DType::BF16, {TV, 24 * 128}, "o4");
     AttnArgs a4{q.m, kn, vn, r.m, rp.m, sk.m, KvView{kc.m, vc.m, cap, L, bool(local)}, local ? 1024 : 0};
     MTL->attention(a4, o4);
     size_t bad = 0;
-    for (int t = 0; t < 4; t++) {
+    for (int t = 0; t < TV; t++) {
       auto rowv = [&](const Tensor& x, int64_t w) {
         Tensor v = x;
         v.set_shape({1, x.dim(1), w > 0 ? x.dim(2) : 0});
@@ -393,8 +426,12 @@ int main(int argc, char** argv) {
       if (memcmp(o1.data<uint16_t>(), o4.data<uint16_t>() + t * 3072, 3072 * 2) != 0) bad++;
       MTL->free(o1);
     }
-    printf("%-28s %s  rows differing: %zu/4\n", local ? "verify==decode local ring" : "verify==decode global",
-           bad ? "FAIL" : "ok  ", bad);
+    char nm[64];
+    snprintf(nm, sizeof nm, "verify==decode %s T=%d", local ? "local ring" : "global", TV);
+    printf("%-28s %s  rows differing: %zu/%d\n", nm, bad ? "FAIL" : "ok  ", bad, TV);
+    MTL->free(o4);
+    MTL->free(kn);
+    MTL->free(vn);
     if (bad) fails++;
   }
 
