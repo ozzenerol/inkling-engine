@@ -18,7 +18,8 @@ Format: `LOCK <agent> <what> <start time>` / `UNLOCK <agent> <time>`.
 (none held)
 UNLOCK B 2026-11-21 (C next: server run)  [A ran the MLX reference dump 17:22, done]
 LOCK C MLX-VLM baseline (serve_inkling.sh :8091, qh e2e + ctxbench) 17:43 / UNLOCK C 17:50
-LOCK C inkling-server real engine (:8091, smoke + qh e2e + ctxbench) 17:56 / UNLOCK C 18:08 (queue: A, then B)
+LOCK C inkling-server real engine (:8091, smoke + qh e2e + ctxbench) 17:56 / UNLOCK C 18:08 (queue: A, then B) / UNLOCK C
+LOCK A CPU p3 run + fp32 MLX reference dump 18:08 / UNLOCK A 18:10 (B next)
 
 ## Module layout and file ownership
 
@@ -313,3 +314,21 @@ Findings (CPU backend vs MLX-bf16 GPU reference, one run each):
     chat_template_kwargs.reasoning_effort, so its baseline ran at the template default 0.9 ("0.9" = 3 tokens vs "0").
   - Gotcha: building from the shared tree embeds others' uncommitted .metal edits; for runs I build HEAD in a
     git worktree.
+
+## A: fp32 reference verdict (2026-11-21, one run each)
+
+`dump_ref.py ref_data/fp32 64 --fp32 --gen-from ref_data` = MLX with every bf16 param/activation in fp32 (experts
+unchanged), same forced tokens. Scored up to the stop token (argmax agreement with fp32 argmax, KL(fp32||x)):
+
+| prompt | MLX-bf16 | Metal (B) | CPU (A) |
+|---|---|---|---|
+| p0 (8 steps) | 8/8, 7.0e-4 | 8/8, 1.0e-3 | 8/8, 1.7e-4 |
+| p1 (37 steps) | 37/37, 6.5e-4 | 37/37, 7.1e-4 | - |
+| p2 (64) | 63/64, 8.5e-4 | 63/64, 6.8e-4 | - |
+| p3 (64, 2886-token prompt) | 60/64, 8.2e-3 | 61/64, 7.8e-3 | KL 5.0e-3 |
+
+Verdict: the engine is as accurate as MLX-bf16 against the higher-precision reference on all four prompts; the
+p3 "mismatches" vs MLX-bf16 are MLX's own bf16 rounding (MLX-bf16 itself only gets 60/64 vs fp32). The CPU
+oracle is the most accurate; Metal has some headroom on long prompts (fp32-accumulated pieces could close it).
+Going forward, speed changes are checked against BOTH: greedy == MLX-bf16 up to near-ties, and KL vs fp32 not
+worse than MLX-bf16's.
