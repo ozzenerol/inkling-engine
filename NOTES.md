@@ -18,7 +18,7 @@ Format: `LOCK <agent> <what> <start time>` / `UNLOCK <agent> <time>`.
 (none held)
 UNLOCK B 2026-11-21 (C next: server run)  [A ran the MLX reference dump 17:22, done]
 LOCK C MLX-VLM baseline (serve_inkling.sh :8091, qh e2e + ctxbench) 17:43 / UNLOCK C 17:50
-
+LOCK C inkling-server real engine (:8091, smoke + qh e2e + ctxbench) 17:56
 
 ## Module layout and file ownership
 
@@ -261,3 +261,39 @@ Decode went 11 -> 33 tok/s after making router and controller parallel (they wer
 Profile tool: `INK_PROFILE=1` on any binary using MetalBackend prints GPU ms per kernel (each dispatch waited
 separately, so totals are inflated; use for ranking). Known slow spots, next: attention prefill (0.9-1.8 TFLOPS),
 skinny GEMM T=5..16 (110 GB/s), dispatch count (~1500/token), decode attention at long context (180 GB/s).
+
+## A: model + accuracy status (2026-11-21)
+
+Files (A): src/core/* (json, safetensors index, config, thread pool, bf16/fp8/fp4 helpers), src/model/backend.h
+(op interface, exact rounding points per op), src/model/cpu_backend.cpp (CPU oracle), src/model/model.{h,cpp}
+(forward over 48 visits, loop bank/messages, attention residuals, KV rings, conv history + rollback,
+debug hooks), src/engine/engine.{h,cpp} (prefill chunking, sampling, rewind, checkpoints, speculative hook),
+tests/ref/* (MLX dump, inktest, compare, single-visit MLX recompute).
+
+Accuracy tooling:
+- `tests/ref/dump_ref.py OUT [N] [--fp32] [--prompts ..] [--gen-from DIR]`: MLX greedy dump (ids, gen, logits per
+  step; p0 also hidden_v). --fp32 = all bf16 params/activations in fp32 (experts stay NVFP4/MXFP8): higher-precision
+  reference. --gen-from forces another dump's tokens so steps line up.
+- `build/inktest --backend cpu|metal --ids ref_data/pN.ids --gen ref_data/pN.gen --steps 64 --out DIR`:
+  teacher-forced run (feeds the ref greedy tokens), writes logits.f32 / argmax.i32 (--hidden: per-visit inputs).
+- `tests/ref/compare.py ref_data/pN.npz DIR|other.npz`: greedy match, KL(ref||ours), every mismatch with the
+  ref's top-2 gap (gap < ~0.1 = rounding flip; larger = suspicious).
+- `inktest --isolate ref_data/p0.h [--debug-visit V]` + `tests/ref/debug_visit.py`: each visit fed MLX's own
+  inputs; with --debug-visit, named intermediates (mixed, msg, ctrl0, xq/xk/xv, q_raw.., q,k,v,r, sink, attn, o,
+  hid_mix, hn, moe, res, out) compared against MLX recomputing the same visit.
+
+Findings (CPU backend vs MLX-bf16 GPU reference, one run each):
+- p0 (25-token prompt, 8 steps): greedy 8/8, KL mean 1.0e-3 / max 5.8e-3.
+- Isolation: prelude + pass-1 visits at bf16 noise (rel 1.0-2.0e-3 per visit). Loop passes 2-3 and layer 12 show
+  larger per-visit error (up to 5e-2), but float64 checks of the same inputs show controller (7e-5) and attention
+  (1.6e-3 = output rounding) are exact; the error is bf16-rounding noise amplified by the rank-64 controller
+  bottleneck (a 1-ulp flip of h moves the gates) and sharp heads. MLX's own CPU vs GPU differ by the same order.
+  => no model-math bug found.
+- MLX rounding rules confirmed by test: rms_norm on bf16 input rounds twice (bf16(w * bf16(x*inv))), fp32 input
+  none; NVFP4 dequant = e2m1 * e4m3 * weight_scale_2 with the global applied to the accumulator (B's note).
+- Metal (B's runs, scored by A): p1 mismatches only after the forced stop token (degenerate region), p2 near-ties
+  (gaps 0.013/0.11); p3 (2886 tokens) KL mean 1.2e-2 with two non-tie mismatches -> under investigation:
+  CPU p3 + fp32 reference (MLX steel prefill attention rounds P to bf16; long prompts may make MLX-bf16 itself
+  the less accurate side).
+- Open: Engine::rewind only works at n == len, 0, or inside the last spec-verify rows (conv states can't rewind);
+  cross-turn reuse goes through checkpoint()/restore(), which C uses.
