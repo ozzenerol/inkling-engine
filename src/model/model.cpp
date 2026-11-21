@@ -339,12 +339,18 @@ void Model::run_visit(int v, Tensor& x, std::vector<Tensor>& blocks, const Tenso
   const auto& w = lw_[L];
   const bool boundary = L % cfg_.block == 0;
   const int nq = w.local ? 1 : 3;
+  const bool fused_in = L > 0 && w.local && !msg.valid();  // mix + input norm in one op (B)
   if (L > 0) {
     Tensor mixed = view(mixed_, {nq, T, D});
     std::vector<const Tensor*> states;
     for (auto& b : blocks) states.push_back(&b);
     states.push_back(&x);
-    be_.attn_residual(states, w.attn_query, mixed);
+    if (fused_in) {
+      Tensor xqn = view(partsb_[0], {T, D});
+      be_.attn_residual_norm(states, w.attn_query, mixed, w.in_norm, cfg_.rms_eps, xqn);
+    } else {
+      be_.attn_residual(states, w.attn_query, mixed);
+    }
     dbg("mixed", mixed);
   }
   auto part = [&](int i) -> Tensor {
@@ -354,8 +360,10 @@ void Model::run_visit(int v, Tensor& x, std::vector<Tensor>& blocks, const Tenso
   Tensor xq, xk, xv;
   if (w.local && !msg.valid()) {
     xq = view(partsb_[0], {T, D});
-    Tensor p0 = part(0);
-    be_.rms_norm(p0, &w.in_norm, cfg_.rms_eps, D, xq);
+    if (!fused_in) {
+      Tensor p0 = part(0);
+      be_.rms_norm(p0, &w.in_norm, cfg_.rms_eps, D, xq);
+    }
     xk = xv = xq;
   } else {
     Tensor ins[3];
@@ -472,16 +480,21 @@ void Model::run_visit(int v, Tensor& x, std::vector<Tensor>& blocks, const Tenso
     std::vector<const Tensor*> states;
     for (auto& b : blocks) states.push_back(&b);
     states.push_back(&res);
-    be_.attn_residual(states, w.mlp_query, hid);
+    if (!msg.valid()) {
+      Tensor hn0 = view(hn_, {T, D});
+      be_.attn_residual_norm(states, w.mlp_query, hid, w.post_norm, cfg_.rms_eps, hn0);  // mix + post norm (B)
+    } else {
+      be_.attn_residual(states, w.mlp_query, hid);
+    }
   }
   dbg("hid_mix", hid);
   Tensor hid2 = view(hid_, {T, D});
+  Tensor hn = view(hn_, {T, D});
   if (msg.valid()) {
     Tensor m3 = row_view(msg, 3, {T, D});
     be_.controller(hid2, m3, w.ctrl_down[3], w.ctrl_forget[3], w.ctrl_gain[3], hid2);
+    be_.rms_norm(hid2, &w.post_norm, cfg_.rms_eps, D, hn);
   }
-  Tensor hn = view(hn_, {T, D});
-  be_.rms_norm(hid2, &w.post_norm, cfg_.rms_eps, D, hn);
   dbg("hn", hn);
   Tensor ridx = view(ridx_, {T, cfg_.topk}), rw = view(rw_, {T, cfg_.topk});
   be_.router(hn, w.moe, cfg_.topk, cfg_.route_scale, ridx, rw);

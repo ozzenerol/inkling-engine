@@ -141,6 +141,12 @@ class Backend {
     rms_norm(vc, nullptr, eps, k3.dim(2), v3);
     l2_clip(r3, &rel_scale, rel_clip, nullptr, r3);
   }
+  // attn_residual(states, query (nq = 1), mixed) then rms_norm(mixed, &gamma, eps, D, normed).
+  virtual void attn_residual_norm(const std::vector<const Tensor*>& states, const Tensor& query, Tensor& mixed,
+                                  const Tensor& gamma, float eps, Tensor& normed) {
+    attn_residual(states, query, mixed);
+    rms_norm(mixed, &gamma, eps, mixed.dim(-1), normed);
+  }
   // attention() then sigmoid_gate(out, gate, out).
   virtual void attention_gated(const AttnArgs& a, const Tensor& gate, Tensor& out) {
     attention(a, out);
