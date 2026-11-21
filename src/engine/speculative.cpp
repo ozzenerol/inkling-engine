@@ -27,7 +27,10 @@ struct Spec {
   // Adaptive draft length (A): running estimates, kept across requests.
   double acc[8] = {0.7, 0.7, 0.7, 0.7, 0.7, 0.7, 0.7, 0.7};  // P(draft j accepted | drafts before it accepted)
   double t_plain = 0, t_draft = 0, t_verify[9] = {0, 0, 0, 0, 0, 0, 0, 0, 0};  // ms, 0 = not measured yet
-  long plain_steps = 0, since_full = 0, since_plain = 0;
+  long plain_steps = 0;
+  double arm_rate[9] = {0, 0, 0, 0, 0, 0, 0, 0, 0};  // tokens per ms delivered by draft count k (EMA)
+  long arm_n[9] = {0, 0, 0, 0, 0, 0, 0, 0, 0};
+  int since_probe = 0, probe = 0;
   std::mt19937_64 rng{0x9E3779B97F4A7C15ull};  // speculative sampling uniforms
   uint64_t seeded = ~0ull;
   std::vector<float> pt;
@@ -115,23 +118,28 @@ bool speculative_generate(Engine& e, Model& m, const SamplingParams& p, int max_
   // exact target sample whatever k is, so the choice changes speed only. Unmeasured costs are extrapolated from
   // the plain step (+25% per extra row); a full-length round and a plain step are retried now and then so the
   // estimates follow the text (acceptance at temperature 0.7 is far lower than greedy).
+  // Draft count per round as a bandit over the arms k = 0 (plain step) .. kmax: each arm keeps an EMA of the
+  // tokens per ms it actually delivered; the best arm runs, every arm is tried 3 times first and a non-best arm
+  // is probed every 24 rounds. Measured speed only, no acceptance model: an earlier model-based version stopped
+  // drafting after a few rejections and never learned that drafting had become good again.
   auto choose_k = [&](int kmax) {
     if (!adaptive) return kmax;
-    if (s.rounds < 4 || s.since_full >= 48) return kmax;
-    if (s.t_plain == 0 || s.since_plain >= 96) return 0;
-    double best = 1.0 / s.t_plain, cum = 1.0, tokens = 1.0;
-    int bk = 0;
-    for (int k = 1; k <= kmax; k++) {
-      cum *= s.acc[k - 1];
-      tokens += cum;
-      double tv = s.t_verify[k + 1] > 0 ? s.t_verify[k + 1] : s.t_plain * (1.0 + 0.25 * k);
-      double rate = tokens / (tv + (s.t_draft > 0 ? s.t_draft : 0.3 * s.t_plain));
-      if (rate > best) {
-        best = rate;
-        bk = k;
-      }
+    for (int k = kmax; k >= 0; k--)
+      if (s.arm_n[k] < 3) return k;
+    int best = 0;
+    for (int k = 1; k <= kmax; k++)
+      if (s.arm_rate[k] > s.arm_rate[best]) best = k;
+    if (++s.since_probe >= 24) {
+      s.since_probe = 0;
+      s.probe = (s.probe + 1) % (kmax + 1);
+      if (s.probe == best) s.probe = (s.probe + 1) % (kmax + 1);
+      return s.probe;
     }
-    return bk;
+    return best;
+  };
+  auto arm_update = [&](int k, int tokens, double ms) {
+    ema(s.arm_rate[k], tokens / ms, 0.15);
+    s.arm_n[k]++;
   };
   while (true) {
     int k = std::min(count_max, max_tokens - emitted);
@@ -143,17 +151,14 @@ bool speculative_generate(Engine& e, Model& m, const SamplingParams& p, int max_
       m.forward(&b, 1, false);
       int32_t t = sample_last();
       ema(s.t_plain, ms_since(t0), 0.2);
+      arm_update(0, 1, ms_since(t0));
       s.plain_steps++;
-      s.since_plain = 0;
-      s.since_full++;
       bool more = on_token(t);
       emitted++;
       if (is_stop(t) || !more || emitted >= max_tokens) break;
       b = t;
       continue;
     }
-    s.since_plain++;
-    s.since_full = k == std::min(count_max, max_tokens - emitted) ? 0 : s.since_full + 1;
     auto c0 = std::chrono::steady_clock::now();
     // Temperature > 0 with a sampling drafter: real speculative sampling (drafts sampled from the drafter's
     // q = softmax(z / T), accepted with probability min(1, p / q), residual resample on the first rejection;
@@ -161,7 +166,9 @@ bool speculative_generate(Engine& e, Model& m, const SamplingParams& p, int max_
     bool sampled = false;
     std::vector<float> q_tok;
 #ifdef INK_DSPARK_HAS_SAMPLE
-    sampled = p.temperature > 0.0f && !getenv("INK_SPEC_COMPARE");
+    // Opt-in (INK_SPEC_SAMPLE=1): with q at the target's temperature the drafter is flatter than the target and
+    // 1 - TV(p, q) came out BELOW p(greedy draft) (1.31 vs 1.47 accepted per round on p2); needs a sharper q.
+    sampled = p.temperature > 0.0f && getenv("INK_SPEC_SAMPLE");
 #endif
     std::vector<int32_t> drafts;
     if (sampled) {
@@ -232,6 +239,7 @@ bool speculative_generate(Engine& e, Model& m, const SamplingParams& p, int max_
     s.drafted += k;
     s.accepted += a;
     for (int j = 0; j < k && j <= a; j++) ema(s.acc[j], j < a ? 1.0 : 0.0, 0.08);  // positions reached this round
+    arm_update(k, a + 1, std::chrono::duration<double, std::milli>(c2 - c0).count());
     // emit d_0..d_{a-1}, then y_a; stop as soon as a stop token / limit / on_token=false shows up
     int keep = a + 1;  // cache rows kept: [b, d_0..d_{a-1}]
     bool done = false;
@@ -260,9 +268,9 @@ bool speculative_generate(Engine& e, Model& m, const SamplingParams& p, int max_
             s.rounds ? s.draft_ms / s.rounds : 0.0, s.rounds ? s.verify_ms / s.rounds : 0.0);
   if (getenv("INK_SPEC_STATS"))
     fprintf(stderr, "dspark adaptive: %ld plain steps, plain %.1f ms, draft %.1f ms, verify T=2..5 %.1f %.1f %.1f %.1f ms, "
-                    "acceptance by position %.2f %.2f %.2f\n",
+                    "acceptance by position %.2f %.2f %.2f, tok/s by draft count %.1f %.1f %.1f %.1f\n",
             s.plain_steps, s.t_plain, s.t_draft, s.t_verify[2], s.t_verify[3], s.t_verify[4], s.t_verify[5], s.acc[0],
-            s.acc[1], s.acc[2]);
+            s.acc[1], s.acc[2], 1e3 * s.arm_rate[0], 1e3 * s.arm_rate[1], 1e3 * s.arm_rate[2], 1e3 * s.arm_rate[3]);
   return true;
 }
 
