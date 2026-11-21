@@ -20,3 +20,9 @@ for m in $HOME/llm/mlx-models/Inkling-2-Mini-MLX-4-8bit $M8; do for v in "X=1" "
   echo -n "[$(basename $m) $v] "; env $v INK_MODEL=$m $(bin spec_check) plain ref_data/p2.ids 200 4 "$BS/f2_$(basename $m)_$v.i32" 2>&1 | grep -oE "decode [0-9.]+ s -> [0-9.]+ tok/s"
 done; cmp "$BS/f2_$(basename $m)_X=1.i32" "$BS/f2_$(basename $m)_INK_FUSE2=1.i32" && echo "fuse2 tokens IDENTICAL"; done
 echo -n "[fuse2 dspark identity] "; INK_FUSE2=1 tools/spec_check.sh ref_data/p2.ids 200 8 2>&1 | grep -E "IDENT|DIFF"
+echo "== B T=1 vs forced T=2 verify on the 8-bit build: step times and per-kernel profile (2-row kernels off / on)"
+SP="INK_NO_LOOKUP=1 INK_SPEC_FIXED=1 INK_SPEC_STATS=1 INK_MODEL=$M8"
+for v in "INK_NO_T2=1" "X=1"; do echo "[$v]"; env $SP $v $(bin spec_check) dspark ref_data/p2.ids 120 2 "$BS/t2_$v.i32" 2>&1 | grep -E "rounds|verify|tok/s"; done
+cmp "$BS/t2_INK_NO_T2=1.i32" "$BS/t2_X=1.i32" && echo "t2 kernels tokens IDENTICAL"
+echo "[profile plain T=1]"; INK_PROFILE=1 INK_MODEL=$M8 $(bin spec_check) plain ref_data/p2.ids 60 4 /dev/null 2>&1 | grep -A14 "kernel profile"
+echo "[profile dspark block 2 (T=2 verifies + drafts)]"; env $SP INK_PROFILE=1 $(bin spec_check) dspark ref_data/p2.ids 60 2 /dev/null 2>&1 | grep -A22 "kernel profile"

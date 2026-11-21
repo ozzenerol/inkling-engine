@@ -383,7 +383,7 @@ class MetalBackend final : public Backend {
     if (T <= 16) {
       for (uint32_t t0 = 0; t0 < T; t0 += 4) {
         uint32_t tt = std::min<uint32_t>(4, T - t0);
-        std::string nm = std::string("matvec_q8_") + dtn(x.dtype) + "_" + dtn(out.dtype) + (tt == 1 ? "_t1" : "_t4");
+        std::string nm = std::string("matvec_q8_") + dtn(x.dtype) + "_" + dtn(out.dtype) + (tt == 1 ? "_t1" : (tt == 2 && !t2_off_) ? "_t2" : "_t4");
         Q8Params qp{N, K, tt, K, N};
         pipe(nm);
         bind(0, w);
@@ -462,7 +462,7 @@ class MetalBackend final : public Backend {
     if (K % 8 == 0 && T <= 16) {
       for (uint32_t t0 = 0; t0 < T; t0 += 4) {
         uint32_t tt = std::min<uint32_t>(4, T - t0);
-        std::string nm = std::string("matvec_bf16_") + dtn(x.dtype) + "_" + dtn(out.dtype) + (tt == 1 ? "_t1" : "_t4") +
+        std::string nm = std::string("matvec_bf16_") + dtn(x.dtype) + "_" + dtn(out.dtype) + (tt == 1 ? "_t1" : (tt == 2 && !t2_off_) ? "_t2" : "_t4") +
                          "_r4_s2";
         MatvecShape s{N, K, tt, K, N};
         pipe(nm);
@@ -1442,6 +1442,7 @@ class MetalBackend final : public Backend {
   bool pending_ = false;
   bool profile_ = false;
   bool gpu_time_ = false;
+  bool t2_off_ = getenv("INK_NO_T2") != nullptr;  // 2-row matvec kernels (same per-row arithmetic as t1 / t4)
   bool fuse2_ = getenv("INK_FUSE2") != nullptr;
   std::string skip_;
   std::chrono::steady_clock::time_point last_sync_;
