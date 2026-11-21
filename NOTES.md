@@ -19,7 +19,7 @@ Format: `LOCK <agent> <what> <start time>` / `UNLOCK <agent> <time>`.
 UNLOCK B 2026-11-21 (C next: server run)  [A ran the MLX reference dump 17:22, done]
 LOCK C MLX-VLM baseline (serve_inkling.sh :8091, qh e2e + ctxbench) 17:43 / UNLOCK C 17:50
 LOCK C inkling-server real engine (:8091, smoke + qh e2e + ctxbench) 17:56 / UNLOCK C 18:08 (queue: A, then B)
-LOCK B kernel benches + DSpark spec_check + acc_check 18:11 / UNLOCK C
+UNLOCK B 18:41 (was: LOCK B kernel benches + DSpark spec_check + acc_check 18:11 / UNLOCK C
 LOCK A CPU p3 run + fp32 MLX reference dump 18:08 / UNLOCK A 18:10 (B next)
 
 ## Module layout and file ownership
@@ -343,3 +343,24 @@ worse than MLX-bf16's.
     (SSE write per token), non-streaming 0.14-0.19 us; independent of a 30k prompt. At 90 tok/s that is <0.05% of
     a token. Render + tokenize of a 143k-token prompt: 42 ms per request. Now reported live as
     `server_us_per_token` in timings and the [req] log line.
+
+## B: decode speed work, DSpark, accuracy (2026-11-21 evening, one run each unless noted)
+
+- **DSpark works**: tools/spec_check.sh IDS N BLOCK (plain vs dspark in separate processes, greedy, stop ids).
+  Token streams IDENTICAL on p2 and on a 58-token coding prompt. Coding prompt, 400 tokens: plain 33.3 tok/s,
+  DSpark block 4 47.2 tok/s, acceptance 1.80 drafts/round (MLX-VLM DSpark on the same prompt: 1.53). Drafts are
+  token-identical to MLX's drafter for the first 16 rounds of p2 (then the target text diverges). Per round: draft
+  8.6 ms, verify (T=4) 50 ms. Verify = decode + ~3 x 6.7 ms of extra MoE (real consecutive tokens share few experts).
+  Temperature > 0: sample-and-compare walk (as mlx_vlm), exact target samples.
+- Fixed: the weak speculative stubs in engine.cpp shadowed speculative.cpp at link time (DSpark was silently off).
+- **Determinism**: attention splits are fixed-size and position-aligned (local 64 keys, global 512), so verify
+  rows == decode bit for bit (op_diff "verify==decode"). Ring kv_append raced for chunks longer than the ring
+  (2048 > 1536): p3 logits were non-deterministic; fixed (only the last cap rows are written).
+- Decode 31.8 -> 36.7 tok/s (p2-like short context): 1024-thread mix for T<=4, wider router matvec, concurrent
+  encoder with own hazard barriers (weights read-only), fused attn_prep_local / attention_gated / conv_add
+  (CPU p0 logits byte-identical before/after, cmp). Ablation (INK_SKIP=class, timing only) per token at ~29 ms:
+  moe 6.8, linear 9.4, attn 2.6, logits 2.1, mix 3.6->1.7, small 3.5, ctrl 2.2, router 1.8 ms. GPU span == wall,
+  so the remaining overhead is dependent-dispatch stalls (~1200 barriers / 1600 dispatches per token).
+- acc_check (metal, after the above, 64 steps): p0 64/64 fp32-KL 1.7e-3; p1 63/64 1.7e-3; p2 63/64 8.3e-4;
+  p3 62/64 fp32-KL 1.18e-2 with A's attention_gemm, **4.8e-3 with the flash prefill attention**
+  (INK_AG_MIN_T=1000000), i.e. the GEMM attention costs accuracy on long prompts (MLX-bf16: 8.2e-3).
