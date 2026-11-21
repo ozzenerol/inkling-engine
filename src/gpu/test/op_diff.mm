@@ -125,6 +125,22 @@ int main(int argc, char** argv) {
     MTL->linear(xf.m, w.m, of.m);
     compare(("linear f32 T=" + std::to_string(T)).c_str(), of);
   }
+  for (int64_t T : {1, 3}) {  // linear_multi vs separate CPU linears (bit-equal to Metal linear expected)
+    auto x = make(DType::BF16, {T, D});
+    auto w1 = make(DType::BF16, {3072, D}, 0.02f), w2 = make(DType::BF16, {384, D}, 0.02f),
+         w3 = make(DType::BF16, {24, D}, 0.02f);
+    auto o1 = zeros(DType::BF16, {T, 3072}), o2 = zeros(DType::BF16, {T, 384}), o3 = zeros(DType::BF16, {T, 24});
+    CPU->linear_multi(x.c, {&w1.c, &w2.c, &w3.c}, {&o1.c, &o2.c, &o3.c});
+    MTL->linear_multi(x.m, {&w1.m, &w2.m, &w3.m}, {&o1.m, &o2.m, &o3.m});
+    compare("linear_multi o1", o1);
+    compare("linear_multi o2", o2);
+    compare("linear_multi o3 (N=24)", o3);
+    // copy
+    auto c = zeros(DType::BF16, {T, 3072});
+    MTL->copy(o1.m, c.m);
+    CPU->copy(o1.c, c.c);
+    compare("copy", c, 0, 0);
+  }
   {  // attn residual
     int64_t T = 3;
     auto s0 = make(DType::BF16, {T, D}, 2.0f), s1 = make(DType::F32, {T, D}, 1.0f), s2 = make(DType::F32, {T, D}, 5.0f);

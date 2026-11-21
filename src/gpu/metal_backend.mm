@@ -37,6 +37,11 @@ Buf bufof(const Tensor& t) {
 struct MatvecShape {
   uint32_t N, K, T, x_stride, y_stride;
 };
+struct MatvecMultiParams {
+  uint32_t K, T, count;
+  uint32_t row_start[9];
+  uint32_t dt_out[8];
+};
 struct EwParams {
   uint32_t n, dt_a, dt_b, dt_out;
 };
@@ -151,8 +156,17 @@ class MetalBackend final : public Backend {
   }
   void copy(const Tensor& src, Tensor& dst, size_t src_off, size_t dst_off, size_t bytes) override {
     if (bytes == 0) bytes = src.nbytes();
-    g_.blit_copy(bufof(src), src.offset + src_off, bufof(dst), dst.offset + dst_off, bytes);
-    pending_ = true;
+    if (bytes >= (64u << 20)) {  // large copies (cache snapshots): blit engine
+      g_.blit_copy(bufof(src), src.offset + src_off, bufof(dst), dst.offset + dst_off, bytes);
+      pending_ = true;
+      return;
+    }
+    uint32_t n = uint32_t(bytes);
+    pipe("copy_bytes");
+    g_.set_buffer(0, bufof(src), src.offset + src_off);
+    g_.set_buffer(1, bufof(dst), dst.offset + dst_off);
+    g_.set_value(2, n);
+    g_.dispatch({cdiv(cdiv(n, 16), 256), 1, 1}, {256, 1, 1});
   }
   void read(const Tensor& t, void* dst, size_t bytes, size_t off) override {
     if (pending_) sync();
@@ -251,6 +265,33 @@ class MetalBackend final : public Backend {
     bind(2, out);
     g_.set_value(3, p);
     g_.dispatch({cdiv(N, 4), T, 1}, {32, 1, 1});
+  }
+
+  void linear_multi(const Tensor& x, const std::vector<const Tensor*>& ws, const std::vector<Tensor*>& outs) override {
+    uint32_t K = uint32_t(ws[0]->dim(1)), T = uint32_t(x.numel() / K);
+    bool ok = T <= 4 && ws.size() <= 8 && K % 8 == 0 && !getenv("INK_NO_MULTI");
+    for (auto* w : ws) ok = ok && w->dim(1) == K && w->dim(0) % 4 == 0 && w->dtype == DType::BF16;
+    if (!ok) {
+      for (size_t i = 0; i < ws.size(); ++i) linear(x, *ws[i], *outs[i]);
+      return;
+    }
+    MatvecMultiParams p{};
+    p.K = K;
+    p.T = T;
+    p.count = uint32_t(ws.size());
+    pipe(x.dtype == DType::BF16 ? "matvec_multi_bf16" : "matvec_multi_f32");
+    for (uint32_t i = 0; i < 8; i++) {
+      uint32_t j = std::min<uint32_t>(i, p.count - 1);
+      bind(i, *ws[j]);
+      bind(8 + i, *outs[j]);
+    }
+    for (uint32_t i = 0; i < p.count; i++) {
+      p.row_start[i + 1] = p.row_start[i] + uint32_t(ws[i]->dim(0));
+      p.dt_out[i] = dtc(outs[i]->dtype);
+    }
+    bind(16, x);
+    g_.set_value(17, p);
+    g_.dispatch({cdiv(p.row_start[p.count], 8), 1, 1}, {64, 1, 1});
   }
 
   void mix(const std::vector<const Tensor*>& states, const Tensor& query, uint32_t nq, Tensor& out) {
