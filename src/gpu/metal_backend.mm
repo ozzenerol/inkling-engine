@@ -397,6 +397,17 @@ class MetalBackend final : public Backend {
   // rows of out computed: [0, N) of w; out row stride = N.
   void linear_rows(const Tensor& x, const Tensor& w, Tensor& out, uint32_t T, uint32_t N, uint32_t K,
                    uint32_t /*unused*/) {
+    if (K % 8 == 0 && T > 4 && T <= 16 && mr_ && !skinny_ && !getenv("INK_MV_T8")) {
+      // D: one pass over W for 5..16 rows; every row equals the 1-row matvec bit for bit (kernels/multirow.metal)
+      MatvecShape ms{N, K, T, K, N};
+      pipe(std::string("mr_matvec_") + dtn(x.dtype) + "_" + dtn(out.dtype) + (T <= 8 ? "_t8" : "_t16") + mr_rs_);
+      bind(0, w);
+      bind(1, x);
+      bind(2, out);
+      g_.set_value(3, ms);
+      g_.dispatch({cdiv(N, mr_rows_), 1, 1}, {mr_threads_, 1, 1});
+      return;
+    }
     if (K % 8 == 0 && T > 4 && T <= 16 && x.dtype == DType::BF16 && skinny_) {
       SkinnyParams sp{N, K, T, dtc(out.dtype)};
       pipe("gemm_skinny2");
@@ -463,7 +474,7 @@ class MetalBackend final : public Backend {
         return;
       }
     uint32_t K = uint32_t(ws[0]->dim(1)), T = uint32_t(x.numel() / K);
-    bool ok = T <= 4 && ws.size() <= 8 && K % 8 == 0 && !getenv("INK_NO_MULTI");
+    bool ok = (T <= 4 || (T <= 16 && mr_)) && ws.size() <= 8 && K % 8 == 0 && !getenv("INK_NO_MULTI");
     for (auto* w : ws) ok = ok && w->dim(1) == K && w->dim(0) % 4 == 0 && w->dtype == DType::BF16;
     if (!ok) {
       for (size_t i = 0; i < ws.size(); ++i) linear(x, *ws[i], *outs[i]);
@@ -473,7 +484,8 @@ class MetalBackend final : public Backend {
     p.K = K;
     p.T = T;
     p.count = uint32_t(ws.size());
-    pipe(x.dtype == DType::BF16 ? "matvec_multi_bf16" : "matvec_multi_f32");
+    if (T > 4) pipe(std::string("mr_matvec_multi_") + dtn(x.dtype) + (T <= 8 ? "_t8" : "_t16"));  // D
+    else pipe(x.dtype == DType::BF16 ? "matvec_multi_bf16" : "matvec_multi_f32");
     for (uint32_t i = 0; i < 8; i++) {
       uint32_t j = std::min<uint32_t>(i, p.count - 1);
       bind(i, *ws[j]);
@@ -1217,6 +1229,12 @@ class MetalBackend final : public Backend {
   bool skinny_ = false;
   uint32_t split_keys_ = 512;
   uint32_t split_local_ = 64;
+  // D: one-pass dense for 5..16 rows. INK_MR=0 restores passes of 4 rows; INK_MR_RS=r_s picks the bench variant.
+  bool mr_ = !(getenv("INK_MR") && getenv("INK_MR")[0] == '0');
+  std::string mr_rs_ = std::string("_r") + (getenv("INK_MR_RS") ? std::string(1, getenv("INK_MR_RS")[0]) : "4") +
+                       "_s" + (getenv("INK_MR_RS") ? std::string(1, getenv("INK_MR_RS")[2]) : "2");
+  uint32_t mr_rows_ = uint32_t(mr_rs_[2] - '0') * uint32_t(mr_rs_[5] - '0');
+  uint32_t mr_threads_ = 32u * uint32_t(mr_rs_[5] - '0');
   bool mr_attn_ = !(getenv("INK_MR_ATTN") && getenv("INK_MR_ATTN")[0] == '0');  // D: 5..16-row attention
   bool ag_stats_ = getenv("INK_AG_STATS") != nullptr;
   // Chain kernels (A), opt-in with INK_CHAIN=1: measured SLOWER than the separate ops (decode 28.6 vs 36.9 tok/s;

@@ -125,6 +125,38 @@ int main(int argc, char** argv) {
     MTL->linear(xf.m, w.m, of.m);
     compare(("linear f32 T=" + std::to_string(T)).c_str(), of);
   }
+  // D: a T-row linear / linear_multi must equal T one-row linears bit for bit (verify rows == decode rows).
+  for (int64_t T : {4, 5, 8, 11, 16}) {
+    size_t bad = 0;
+    for (int f32x = 0; f32x < 2; f32x++)
+      for (int f32y = 0; f32y < 2; f32y++) {
+        const DType xd = f32x ? DType::F32 : DType::BF16, yd = f32y ? DType::F32 : DType::BF16;
+        const int64_t N = 3076;  // not a multiple of 8 rows per threadgroup
+        auto x = make(xd, {T, D});
+        auto w = make(DType::BF16, {N, D}, 0.02f), w2 = make(DType::BF16, {384, D}, 0.02f);
+        Tensor oT = MTL->alloc(yd, {T, N}, "oT"), o1 = MTL->alloc(yd, {1, N}, "o1");
+        Tensor mA = MTL->alloc(yd, {T, N}, "mA"), mB = MTL->alloc(yd, {T, 384}, "mB"), m1 = MTL->alloc(yd, {1, 384}, "m1");
+        MTL->linear(x.m, w.m, oT);
+        MTL->linear_multi(x.m, {&w.m, &w2.m}, {&mA, &mB});
+        for (int64_t t = 0; t < T; t++) {
+          Tensor xt = x.m;
+          xt.set_shape({1, D});
+          xt.offset += size_t(t) * D * dtype_size(xd);
+          MTL->linear(xt, w.m, o1);
+          MTL->linear(xt, w2.m, m1);
+          MTL->sync();
+          const size_t rb = size_t(N) * dtype_size(yd), rb2 = size_t(384) * dtype_size(yd);
+          bad += memcmp(o1.data<char>(), oT.data<char>() + t * rb, rb) != 0;
+          bad += memcmp(o1.data<char>(), mA.data<char>() + t * rb, rb) != 0;
+          bad += memcmp(m1.data<char>(), mB.data<char>() + t * rb2, rb2) != 0;
+        }
+        for (Tensor* tt : {&oT, &o1, &mA, &mB, &m1}) MTL->free(*tt);
+      }
+    char nm[64];
+    snprintf(nm, sizeof nm, "linear rows==T1 T=%lld", (long long)T);
+    printf("%-28s %s  rows differing: %zu\n", nm, bad ? "FAIL" : "ok  ", bad);
+    if (bad) fails++;
+  }
   for (int64_t T : {1, 3}) {  // linear_multi vs separate CPU linears (bit-equal to Metal linear expected)
     auto x = make(DType::BF16, {T, D});
     auto w1 = make(DType::BF16, {3072, D}, 0.02f), w2 = make(DType::BF16, {384, D}, 0.02f),
