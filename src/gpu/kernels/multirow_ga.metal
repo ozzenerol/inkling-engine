@@ -25,33 +25,36 @@ struct GaParams {
 };
 constant float GA_SCALE = 0.08838834764831845f;
 
-// R = rows per threadgroup = 3 * tokens per group (3, 6 or 12). Grid: (nblk, KVH, ceil(T / (R / 3))), 128 threads.
-template <uint R>
+// One simdgroup = the 3 query rows (GQA group) of ONE token over a 64-key block; a threadgroup holds 1, 2 or 4
+// simdgroups = tokens t0 .. t0+3 on the same keys (the K chunks are loaded by each of them; q stays in registers,
+// 24 values). Grid: (nblk, KVH, ceil(T / tok)), 32 * tok threads.
 kernel void ga_scores(device const ushort* q [[buffer(0)]], device const ushort* k_new [[buffer(1)]],
                       device const ushort* r [[buffer(2)]], device const ushort* rel_proj [[buffer(3)]],
                       device const ushort* kc [[buffer(4)]], device float* S [[buffer(5)]],
                       device float* Bmax [[buffer(6)]], constant GaParams& p [[buffer(7)]],
-                      uint3 tg [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
+                      constant uint& tok [[buffer(8)]], uint3 tg [[threadgroup_position_in_grid]],
                       uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {
-  threadgroup float bm[4][R];
+  constexpr uint R = 3;
   const uint blk = tg.x, kvh = tg.y;
-  const uint G = p.H / p.KVH;
-  const uint t0 = tg.z * (R / G);
+  const uint t = tg.z * tok + sg;
+  if (t >= p.T) return;
   const uint c = lane % 16, hf = lane / 16;
-  const uint nkeys = p.len + p.T;
+  const uint nkeys = p.len + p.T, qpos = p.len + t;
+  const size_t rowbase = size_t(kvh) * p.sr + t * R;
   float qv[R][8], bmx[R];
   for (uint rr = 0; rr < R; rr++) {
-    uint t = min(t0 + rr / G, p.T - 1), h = kvh * G + rr % G;
-    unpack_bf8(*(device const packed_uint4*)(q + (t * p.H + h) * 128 + c * 8), qv[rr]);
+    unpack_bf8(*(device const packed_uint4*)(q + (t * p.H + kvh * R + rr) * 128 + c * 8), qv[rr]);
     bmx[rr] = -INFINITY;
   }
-  for (uint it = 0; it < 8; it++) {
-    const uint key = blk * 64 + sg * 16 + it * 2 + hf;
+  for (uint it = 0; it < 32; it++) {
+    const uint key = blk * 64 + it * 2 + hf;
     const uint kcl = min(key, nkeys - 1);
     device const ushort* kp = kcl < p.len ? kc + (size_t(kvh) * p.cap + kcl) * 128
                                           : k_new + (size_t(kcl - p.len) * p.KVH + kvh) * 128;
     float kv[8];
     unpack_bf8(*(device const packed_uint4*)(kp + c * 8), kv);
+    const bool vis = key < nkeys && key <= qpos;
+    const uint dist = qpos - key;
     for (uint rr = 0; rr < R; rr++) {
       float a = 0;
       for (uint i = 0; i < 8; i++) a = fma(qv[rr][i], kv[i], a);
@@ -59,32 +62,24 @@ kernel void ga_scores(device const ushort* q [[buffer(0)]], device const ushort*
       a += simd_shuffle_xor(a, 2);
       a += simd_shuffle_xor(a, 4);
       a += simd_shuffle_xor(a, 8);
-      const uint tr = t0 + rr / G;
-      const bool valid = tr < p.T;
-      const uint t = min(tr, p.T - 1), h = kvh * G + rr % G;
-      const uint qpos = p.len + t;
       float sc = -INFINITY;
-      if (valid && key < nkeys && key <= qpos) {
+      if (vis) {
         sc = a * GA_SCALE;
-        const uint dist = qpos - key;
         if (dist < p.rel_extent) {
           float b = 0;
           for (uint d = 0; d < 16; d++)
-            b = fma(bf2f(r[(t * p.H + h) * 16 + d]), bf2f(rel_proj[d * p.rel_extent + dist]), b);
+            b = fma(bf2f(r[(t * p.H + kvh * R + rr) * 16 + d]), bf2f(rel_proj[d * p.rel_extent + dist]), b);
           sc += round_bf(b);
         }
       }
-      if (c == 0 && valid) S[(size_t(kvh) * p.sr + t0 * G + rr) * p.sk + key] = sc;
+      if (c == 0) S[(rowbase + rr) * p.sk + key] = sc;
       bmx[rr] = max(bmx[rr], sc);
     }
   }
   for (uint rr = 0; rr < R; rr++) {
     float m = max(bmx[rr], simd_shuffle_xor(bmx[rr], 16));
-    if (lane == 0) bm[sg][rr] = m;
+    if (lane == rr) Bmax[(rowbase + rr) * p.nblk + blk] = m;
   }
-  threadgroup_barrier(mem_flags::mem_threadgroup);
-  if (tid < R && t0 + tid / G < p.T)
-    Bmax[(size_t(kvh) * p.sr + t0 * G + tid) * p.nblk + blk] = max(max(bm[0][tid], bm[1][tid]), max(bm[2][tid], bm[3][tid]));
 }
 
 // Grid: (sr rows, KVH), 32 threads.
@@ -104,26 +99,24 @@ kernel void ga_rowmax(device const float* Bmax [[buffer(0)]], device const ushor
   if (lane == 0) M[size_t(kvh) * p.sr + row] = m;
 }
 
-// Grid: (nsplit, KVH, ceil(T / (R / 3))), 128 threads. part[(kvh * nsplit + split) * sr + row] = {l, -, -, -, o[128]}.
-template <uint R>
+// One simdgroup = one token (3 rows) over a 512-key split; 1, 2 or 4 tokens per threadgroup as in ga_scores.
+// Grid: (nsplit, KVH, ceil(T / tok)), 32 * tok threads. part[(kvh * nsplit + split) * sr + row] = {l, -, -, -, o[128]}.
 kernel void ga_pv(device const float* S [[buffer(0)]], device const float* Bmax [[buffer(1)]],
                   device const float* M [[buffer(2)]], device const ushort* v_new [[buffer(3)]],
                   device const ushort* vc [[buffer(4)]], device float* part [[buffer(5)]],
-                  constant GaParams& p [[buffer(6)]], uint3 tg [[threadgroup_position_in_grid]],
-                  uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {
-  threadgroup float xo[3][R][128];
-  threadgroup float xl[3][R];
+                  constant GaParams& p [[buffer(6)]], constant uint& tok [[buffer(7)]],
+                  uint3 tg [[threadgroup_position_in_grid]], uint sg [[simdgroup_index_in_threadgroup]],
+                  uint lane [[thread_index_in_simdgroup]]) {
+  constexpr uint R = 3;
   const uint split = tg.x, kvh = tg.y;
-  const uint G = p.H / p.KVH;
-  const uint t0 = tg.z * (R / G);
+  const uint t = tg.z * tok + sg;
+  if (t >= p.T) return;
   const uint c = lane % 16, hf = lane / 16;
   const uint nkeys = p.len + p.T;
-  const size_t rowbase = size_t(kvh) * p.sr + t0 * G;
+  const size_t rowbase = size_t(kvh) * p.sr + t * R;
   float acc[R][8], l[R], mr[R];
-  bool valid[R];
   for (uint rr = 0; rr < R; rr++) {
-    valid[rr] = t0 + rr / G < p.T;
-    mr[rr] = valid[rr] ? M[rowbase + rr] : 0.0f;
+    mr[rr] = M[rowbase + rr];
     l[rr] = 0;
     for (uint i = 0; i < 8; i++) acc[rr][i] = 0;
   }
@@ -132,46 +125,33 @@ kernel void ga_pv(device const float* S [[buffer(0)]], device const float* Bmax 
     if (blk >= p.nblk) break;
     bool live = false;
     for (uint rr = 0; rr < R; rr++)
-      if (valid[rr] && Bmax[(rowbase + rr) * p.nblk + blk] - mr[rr] > -p.thr) live = true;
+      if (Bmax[(rowbase + rr) * p.nblk + blk] - mr[rr] > -p.thr) live = true;
     if (!live) continue;
-    for (uint it = 0; it < 8; it++) {
-      const uint key = blk * 64 + sg * 16 + it * 2 + hf;
+    for (uint it = 0; it < 32; it++) {
+      const uint key = blk * 64 + it * 2 + hf;
       const uint kcl = min(key, nkeys - 1);
       device const ushort* vp = kcl < p.len ? vc + (size_t(kvh) * p.cap + kcl) * 128
                                             : v_new + (size_t(kcl - p.len) * p.KVH + kvh) * 128;
       float vv[8];
       unpack_bf8(*(device const packed_uint4*)(vp + c * 8), vv);
       for (uint rr = 0; rr < R; rr++) {
-        float pr = 0;
-        if (valid[rr]) {
-          const float d = S[(rowbase + rr) * p.sk + key] - mr[rr];
-          if (d > -p.thr) pr = exp(d);
-        }
+        const float d = S[(rowbase + rr) * p.sk + key] - mr[rr];
+        const float pr = d > -p.thr ? exp(d) : 0.0f;
         l[rr] += pr;
         for (uint i = 0; i < 8; i++) acc[rr][i] = fma(pr, vv[i], acc[rr][i]);
       }
     }
   }
-  // streams: half 0 + half 1 per simdgroup, then simdgroups 0..3 in order
+  // the two streams of the split: even keys + odd keys
   for (uint rr = 0; rr < R; rr++) {
     l[rr] += simd_shuffle_xor(l[rr], 16);
     for (uint i = 0; i < 8; i++) acc[rr][i] += simd_shuffle_xor(acc[rr][i], 16);
-    if (sg > 0 && hf == 0) {
-      if (c == 0) xl[sg - 1][rr] = l[rr];
-      for (uint i = 0; i < 8; i++) xo[sg - 1][rr][c * 8 + i] = acc[rr][i];
+    if (hf == 0) {
+      device float* dst = part + (size_t(kvh * p.nsplit + split) * p.sr + t * R + rr) * 132;
+      if (c == 0) dst[0] = l[rr];
+      for (uint i = 0; i < 8; i++) dst[4 + c * 8 + i] = acc[rr][i];
     }
   }
-  threadgroup_barrier(mem_flags::mem_threadgroup);
-  if (sg == 0 && hf == 0)
-    for (uint rr = 0; rr < R; rr++) {
-      if (!valid[rr]) continue;
-      device float* dst = part + (size_t(kvh * p.nsplit + split) * p.sr + t0 * G + rr) * 132;
-      if (c == 0) dst[0] = ((l[rr] + xl[0][rr]) + xl[1][rr]) + xl[2][rr];
-      for (uint i = 0; i < 8; i++) {
-        const uint d = c * 8 + i;
-        dst[4 + d] = ((acc[rr][i] + xo[0][rr][d]) + xo[1][rr][d]) + xo[2][rr][d];
-      }
-    }
 }
 
 // Grid: (T, H), 128 threads (= dims).
@@ -194,13 +174,3 @@ kernel void ga_combine(device const float* part [[buffer(0)]], device const floa
   out[oi] = f2bf(o);
 }
 
-#define GA_INST(R)                                                                                             \
-  template [[host_name("ga_scores_r" #R)]] kernel void ga_scores<R>(                                           \
-      device const ushort*, device const ushort*, device const ushort*, device const ushort*,                  \
-      device const ushort*, device float*, device float*, constant GaParams&, uint3, uint, uint, uint);        \
-  template [[host_name("ga_pv_r" #R)]] kernel void ga_pv<R>(                                                   \
-      device const float*, device const float*, device const float*, device const ushort*, device const ushort*, \
-      device float*, constant GaParams&, uint3, uint, uint);
-GA_INST(3)
-GA_INST(6)
-GA_INST(12)
