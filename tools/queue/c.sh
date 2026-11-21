@@ -1,7 +1,8 @@
 #!/bin/bash
 # Owner: C. Batch items (tools/WORKFLOW.md): server benchmarks on the freshly built main, last in the batch.
 # Short set (every batch, ~8 min): ctxbench at 1.2k and 9.5k and agent_bench base 0 (10 turns), for the lossless
-# 4-8bit build and for the 8-bit build (INK_Q8_KERNELS=1); then qh end-to-end x1 on the lossless build.
+# 4-8bit build and for the 8-bit build, plus the copy-heavy agent scenario; then qh end-to-end x1 on the
+# server's default model (8-bit).
 # FULL=1 (on request, ~15 min): ctxbench 1.2k..127.5k, agent_bench base 0 and 30000, qh end-to-end x2.
 # MLX=1 (on request, ~20 min more): the same agent_bench against MLX-VLM for a same-day baseline.
 # Results: $OUT (default bench/queue-c), then the tables from tools/bench_report.py.
@@ -18,11 +19,15 @@ if [ -n "${FULL:-}" ]; then
 else
 	sizes=1000,8000; bases="0"
 fi
-SIZES=$sizes AGENT_BASES=$bases "$here/tools/bench_c.sh" inkling
-# The 8-bit build (the one the user wants to use), same items, second column. SKIP_Q8=1 skips it.
+# Lossless 4/8-bit build (label inkling), then the 8-bit build, the server default (label inkling-8bit).
+# SKIP_LOSSLESS=1 / SKIP_Q8=1 skip one of them.
+lossless=${LOSSLESS_MODEL:-$HOME/llm/mlx-models/Inkling-2-Mini-MLX-4-8bit}
 q8=${Q8_MODEL:-$HOME/llm/mlx-models/Inkling-2-Mini-MLX-8bit}
+if [ -z "${SKIP_LOSSLESS:-}" ]; then
+	SERVER_ARGS="--model $lossless ${SERVER_ARGS:-}" SIZES=$sizes AGENT_BASES=$bases "$here/tools/bench_c.sh" inkling
+fi
 if [ -z "${SKIP_Q8:-}" ] && [ -d "$q8" ]; then
-	INK_Q8_KERNELS=${INK_Q8_KERNELS:-1} SERVER_ARGS="--model $q8 ${SERVER_ARGS:-}" SIZES=$sizes AGENT_BASES=$bases \
+	SERVER_ARGS="--model $q8 ${SERVER_ARGS:-}" SIZES=$sizes AGENT_BASES=$bases \
 		"$here/tools/bench_c.sh" inkling inkling-8bit
 fi
 # qh end-to-end needs a running server: start it again for the agent test only.

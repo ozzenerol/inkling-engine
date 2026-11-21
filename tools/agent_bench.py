@@ -8,6 +8,7 @@ So both servers see a prompt that grows the same way, whatever the model writes.
 streamed delta of any kind (TTFT), wall time, prompt / cached / completion tokens.
 
   agent_bench.py --url http://127.0.0.1:8091 --label inkling --turns 10 [--base-tokens 30000] --out X.json
+  agent_bench.py --scenario copy ...        copy-heavy turns: print each pasted file back with one edit
   agent_bench.py --report A.json B.json     markdown table
 """
 import argparse
@@ -25,6 +26,10 @@ TASK = ("The project in /work/repo has a slow, buggy order pipeline split over m
         "then read the next one (read step<N+1>.py). Keep answers short.")
 
 
+COPY_TASK = ("I will paste Python files from /work/repo one at a time. For each file, print the whole file again with "
+             "the one change I ask for and nothing else: no explanation, no tools, just the code in one block.")
+
+
 def file_text(k, n_tokens):
     """Deterministic Python source of about n_tokens tokens (2.46 chars per token, measured)."""
     lines = [f"# step{k}.py: stage {k} of the order pipeline"]
@@ -38,6 +43,11 @@ def file_text(k, n_tokens):
                      f"    return total - {i}\n")
         i += 1
     return "\n".join(lines)
+
+
+def copy_request(k, n_tokens):
+    return (f"step{k}.py:\n```python\n{file_text(k, n_tokens)}\n```\n"
+            f"Change: rename the parameter `rate` to `factor` in stage{k}_1 only.")
 
 
 def run_turn(url, model, messages, tools, max_tokens, temperature):
@@ -90,7 +100,12 @@ def bench(args):
         messages.append({"role": "user", "content": "Earlier I pasted the whole old version of the project, for "
                          "reference:\n" + "\n".join(file_text(1000 + j, 2000) for j in range(args.base_tokens // 2000))})
         messages.append({"role": "assistant", "content": "Understood. I have the old version for reference."})
-    messages.append({"role": "user", "content": TASK})
+    copy = args.scenario == "copy"
+    if copy:
+        # Copy-heavy turns (rewrite a file with one edit): where prompt-lookup drafts pay.
+        messages.append({"role": "user", "content": COPY_TASK + "\n\n" + copy_request(0, args.tool_tokens)})
+    else:
+        messages.append({"role": "user", "content": TASK})
     turns = []
     t_start = time.perf_counter()
     for k in range(args.turns):
@@ -99,7 +114,11 @@ def bench(args):
         if r["reasoning"].strip():
             a["reasoning_content"] = r["reasoning"].strip()
         text = file_text(k, args.tool_tokens)
-        if r["calls"]:
+        if copy:
+            a.pop("tool_calls", None)
+            messages.append(a)
+            messages.append({"role": "user", "content": copy_request(k + 1, args.tool_tokens)})
+        elif r["calls"]:
             a["tool_calls"] = [{"id": c["id"] or f"call_{k}_{i}", "type": "function",
                                 "function": {"name": c["name"], "arguments": c["arguments"]}}
                                for i, c in enumerate(r["calls"])]
@@ -119,7 +138,7 @@ def bench(args):
               f"({row['finish']}, {row['tool_calls']} calls)", flush=True)
     total = time.perf_counter() - t_start
     return {"label": args.label, "url": args.url, "date": time.ctime(), "turns": turns, "total_wall": total,
-            "base_tokens": args.base_tokens, "tool_tokens": args.tool_tokens, "max_tokens": args.max_tokens,
+            "scenario": args.scenario, "base_tokens": args.base_tokens, "tool_tokens": args.tool_tokens, "max_tokens": args.max_tokens,
             "temperature": args.temperature,
             "ttft_median_after_1": statistics.median([t["ttft"] for t in turns[1:]]) if len(turns) > 1 else None,
             "ttft_sum": sum(t["ttft"] for t in turns),
@@ -135,6 +154,10 @@ def turn_gen(t):
     return (n - 1) / dt if n > 1 and dt > 0 else None
 
 
+def name(r):
+    return r["label"] + (" copy" if r.get("scenario") == "copy" else "")
+
+
 def gen_median(r):
     v = [turn_gen(t) for t in r["turns"] if turn_gen(t)]
     return statistics.median(v) if v else 0.0
@@ -146,11 +169,11 @@ def report(paths):
           "median gen tok/s | tokens out |")
     print("|---|---|---|---|---|---|---|---|---|")
     for r in rs:
-        print(f"| {r['label']} | {r['base_tokens']} | {len(r['turns'])} | {r['turns'][-1]['prompt_tokens']} | "
+        print(f"| {name(r)} | {r['base_tokens']} | {len(r['turns'])} | {r['turns'][-1]['prompt_tokens']} | "
               f"{r['total_wall']:.1f} | {r['ttft_sum']:.1f} | {r['ttft_median_after_1']:.2f} | "
               f"{gen_median(r):.1f} | {r['completion_tokens']} |")
     print()
-    print("| turn | " + " | ".join(f"{r['label']}@{r['base_tokens']} TTFT s, gen tok/s (prompt/cached)" for r in rs)
+    print("| turn | " + " | ".join(f"{name(r)}@{r['base_tokens']} TTFT s, gen tok/s (prompt/cached)" for r in rs)
           + " |")
     print("|---|" + "---|" * len(rs))
     for k in range(max(len(r["turns"]) for r in rs)):
@@ -171,7 +194,9 @@ def main():
     ap.add_argument("--turns", type=int, default=10)
     ap.add_argument("--tool-tokens", type=int, default=800)
     ap.add_argument("--base-tokens", type=int, default=0, help="extra context before the task, in ~tokens")
-    ap.add_argument("--max-tokens", type=int, default=512)
+    ap.add_argument("--max-tokens", type=int, default=None, help="default 512 (read) or 1536 (copy)")
+    ap.add_argument("--scenario", choices=["read", "copy"], default="read",
+                    help="read: comment on each file (default). copy: print each file back with one edit")
     ap.add_argument("--temperature", type=float, default=0.0)
     ap.add_argument("--model", default=os.path.expanduser("~/llm/mlx-models/Inkling-2-Mini-MLX-4-8bit"),
                     help="model id when /v1/models lists none (MLX before its first load)")
@@ -181,6 +206,10 @@ def main():
     if args.report:
         report(args.report)
         return 0
+    if args.max_tokens is None:
+        args.max_tokens = 1536 if args.scenario == "copy" else 512
+    if args.scenario == "copy" and args.tool_tokens == 800:
+        args.tool_tokens = 500
     res = bench(args)
     print(f"  {args.label}: total {res['total_wall']:.1f} s, sum TTFT {res['ttft_sum']:.1f} s, "
           f"median TTFT after turn 1 {res['ttft_median_after_1']:.2f} s", flush=True)
