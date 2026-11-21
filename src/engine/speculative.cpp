@@ -367,9 +367,12 @@ bool speculative_generate(Engine& e, Model& m, const SamplingParams& p, int max_
             s.lk_accepted, s.lk_drafted, 1e3 * s.lk_rate);
   if (getenv("INK_SPEC_STATS"))
     fprintf(stderr, "dspark adaptive: %ld plain steps, plain %.1f ms, draft %.1f ms, verify T=2..5 %.1f %.1f %.1f %.1f ms, "
-                    "acceptance by position %.2f %.2f %.2f, tok/s by draft count %.1f %.1f %.1f %.1f\n",
+                    "acceptance by position %.2f %.2f %.2f, tok/s by draft count %.1f %.1f %.1f %.1f %.1f %.1f %.1f %.1f, "
+                    "verify T=8 %.1f T=16 %.1f ms\n",
             s.plain_steps, s.t_plain, s.t_draft, s.t_verify[2], s.t_verify[3], s.t_verify[4], s.t_verify[5], s.acc[0],
-            s.acc[1], s.acc[2], 1e3 * s.arm_rate[0], 1e3 * s.arm_rate[1], 1e3 * s.arm_rate[2], 1e3 * s.arm_rate[3]);
+            s.acc[1], s.acc[2], 1e3 * s.arm_rate[0], 1e3 * s.arm_rate[1], 1e3 * s.arm_rate[2], 1e3 * s.arm_rate[3],
+            1e3 * s.arm_rate[4], 1e3 * s.arm_rate[5], 1e3 * s.arm_rate[6], 1e3 * s.arm_rate[7], s.t_verify[8],
+            s.t_verify[16]);
   return true;
 }
 

@@ -23,3 +23,13 @@ for ids in copy edit; do
   done
   echo "-- $ids temp 0.7 dspark (lookup max 3)"; env INK_SPEC_STATS=1 ./build/src/gpu/spec_check dspark ref_data/$ids.ids 600 4 $OUT/a-$ids-t07.i32 0.7 2>&1 | grep -E "tok/s|dspark:|lookup:"
 done
+# Block 8 (7 drafter drafts) and long lookup blocks: only meaningful once forwards of 5..16 rows are fast (D).
+for ids in copy edit p2; do
+  [ -f $OUT/a-$ids-plain.i32 ] || ./build/src/gpu/spec_check plain ref_data/$ids.ids 600 4 $OUT/a-$ids-plain.i32 >/dev/null 2>&1
+  for v in "INK_NO_LOOKUP=1" "INK_LOOKUP_MAX=15"; do
+    echo "-- $ids greedy dspark BLOCK 8 $v"
+    env INK_SPEC_STATS=1 $v ./build/src/gpu/spec_check dspark ref_data/$ids.ids 600 8 $OUT/a-$ids-b8-$v.i32 2>&1 | grep -E "tok/s|dspark:|lookup:|adaptive"
+    cmp -s $OUT/a-$ids-plain.i32 $OUT/a-$ids-b8-$v.i32 && echo "   token-identical to plain" || echo "   DIFFERS from plain"
+  done
+  echo "-- $ids temp 0.7 dspark BLOCK 8 lookup 15"; env INK_SPEC_STATS=1 INK_LOOKUP_MAX=15 ./build/src/gpu/spec_check dspark ref_data/$ids.ids 600 8 $OUT/a-$ids-b8-t07.i32 0.7 2>&1 | grep -E "tok/s|dspark:|lookup:"
+done
