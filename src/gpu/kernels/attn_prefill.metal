@@ -8,6 +8,7 @@
 struct AttnPreParams {
   uint T, H, KVH;
   uint cap, len, ring, window, rel_extent;
+  uint use_gate;
 };
 
 constant uint AP_BQ = 32, AP_BK = 32, AP_SG = 12;
@@ -17,6 +18,7 @@ kernel void attn_prefill(device const ushort* q [[buffer(0)]], device const usho
                          device const ushort* rel_proj [[buffer(4)]], device const ushort* sink [[buffer(5)]],
                          device const ushort* kc [[buffer(6)]], device const ushort* vc [[buffer(7)]],
                          device ushort* out [[buffer(8)]], constant AttnPreParams& p [[buffer(9)]],
+                         device const ushort* gate [[buffer(10)]],
                          uint2 tg [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
                          uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {
   constexpr uint LDK = 128 + 8;
@@ -163,8 +165,11 @@ kernel void attn_prefill(device const ushort* q [[buffer(0)]], device const usho
   if (row_ok)
     for (uint j = 0; j < 16; j++) {
       thread auto& oe = of[j].thread_elements();
-      device ushort* o = out + (t_me * p.H + h) * 128 + j * 8 + fn;
-      o[0] = f2bf(oe[0] * inv);
-      o[1] = f2bf(oe[1] * inv);
+      uint oi = (t_me * p.H + h) * 128 + j * 8 + fn;
+      for (uint e = 0; e < 2; e++) {
+        float ov = round_bf(oe[e] * inv);
+        if (p.use_gate) ov = ov * (1.0f / (1.0f + exp(-bf2f(gate[oi + e]))));
+        out[oi + e] = f2bf(ov);
+      }
     }
 }

@@ -18,7 +18,8 @@ Format: `LOCK <agent> <what> <start time>` / `UNLOCK <agent> <time>`.
 (none held)
 UNLOCK B 2026-11-21 (C next: server run)  [A ran the MLX reference dump 17:22, done]
 LOCK C MLX-VLM baseline (serve_inkling.sh :8091, qh e2e + ctxbench) 17:43 / UNLOCK C 17:50
-LOCK C inkling-server real engine (:8091, smoke + qh e2e + ctxbench) 17:56 / UNLOCK C 18:08 (queue: A, then B) / UNLOCK C
+LOCK C inkling-server real engine (:8091, smoke + qh e2e + ctxbench) 17:56 / UNLOCK C 18:08 (queue: A, then B)
+LOCK B kernel benches + DSpark spec_check + acc_check 18:11 / UNLOCK C
 LOCK A CPU p3 run + fp32 MLX reference dump 18:08 / UNLOCK A 18:10 (B next)
 
 ## Module layout and file ownership

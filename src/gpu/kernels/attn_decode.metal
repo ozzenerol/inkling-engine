@@ -11,6 +11,7 @@ struct AttnDecParams {
   uint causal;  // 0: every query sees all keys in range (DSpark draft block)
   uint first;   // oldest key position (computed by the host)
   uint use_sink;
+  uint use_gate;  // combine: out = bf16(bf16(attn) * sigmoid(gate))
 };
 
 constant uint AD_MAXR = 24;  // partial rows per (kvh, split)
@@ -205,6 +206,7 @@ template [[host_name("attn_decode_split_f2")]] kernel void attn_decode_split<2>(
 // One threadgroup (128 threads = dims) per (t, h): reduce splits + sink, write bf16.
 kernel void attn_decode_combine(device const float* part [[buffer(0)]], device const ushort* sink [[buffer(1)]],
                                 device ushort* out [[buffer(2)]], constant AttnDecParams& p [[buffer(3)]],
+                                device const ushort* gate [[buffer(4)]],
                                 uint2 tg [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]]) {
   uint t = tg.x, h = tg.y;
   uint G = p.H / p.KVH, kvh = h / G, rr = t * G + h % G;
@@ -219,5 +221,8 @@ kernel void attn_decode_combine(device const float* part [[buffer(0)]], device c
     L += src[1] * c;
     O += src[4 + tid] * c;
   }
-  out[(t * p.H + h) * 128 + tid] = f2bf(O / L);
+  uint oi = (t * p.H + h) * 128 + tid;
+  float o = round_bf(O / L);
+  if (p.use_gate) o = o * (1.0f / (1.0f + exp(-bf2f(gate[oi]))));
+  out[oi] = f2bf(o);
 }

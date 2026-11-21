@@ -84,10 +84,10 @@ struct KvAppendParams {
   uint32_t T, heads, cap, pos0, ring;
 };
 struct AttnParams {
-  uint32_t T, H, KVH, cap, len, ring, window, rel_extent;
+  uint32_t T, H, KVH, cap, len, ring, window, rel_extent, use_gate;
 };
 struct AttnDecParams {
-  uint32_t T, H, KVH, cap, len, ring, window, rel_extent, split_keys, nsplit, causal, first, use_sink;
+  uint32_t T, H, KVH, cap, len, ring, window, rel_extent, split_keys, nsplit, causal, first, use_sink, use_gate;
 };
 struct RouterParams {
   uint32_t T, D, E, topk, dt_x;
@@ -445,7 +445,8 @@ class MetalBackend final : public Backend {
   void add(const Tensor& a, const Tensor& b, Tensor& out) override { ew("ew_add", a, &b, out); }
   void cast(const Tensor& a, Tensor& out) override { ew("ew_cast", a, nullptr, out); }
 
-  void attention(const AttnArgs& a, Tensor& out) override {
+  void attention(const AttnArgs& a, Tensor& out) override { attention_impl(a, nullptr, out); }
+  void attention_impl(const AttnArgs& a, const Tensor* gate, Tensor& out) {
     uint32_t T = uint32_t(a.q.dim(0)), H = uint32_t(a.q.dim(1)), KVH = uint32_t(a.k_new.dim(1));
     if (T <= 4 && H == 3 * KVH && !getenv("INK_ATTN_SLOW")) {
       uint32_t len = uint32_t(a.kv.len), window = uint32_t(a.window);
@@ -455,7 +456,7 @@ class MetalBackend final : public Backend {
       uint32_t nsplit = cdiv(len + T, split_keys) - first / split_keys;
       (void)nkeys;
       AttnDecParams p{T, H, KVH, uint32_t(a.kv.cap), len, a.kv.ring ? 1u : 0u, window, uint32_t(a.rel_proj.dim(1)),
-                      split_keys, nsplit, 1u, first, 1u};
+                      split_keys, nsplit, 1u, first, 1u, gate ? 1u : 0u};
       Tensor part = scratch("attn-part", DType::F32, {KVH * nsplit * 24, 132});
       pipe(T <= 2 ? "attn_decode_split_f1" : "attn_decode_split_f2");
       bind(0, a.q);
@@ -473,11 +474,12 @@ class MetalBackend final : public Backend {
       bind(1, a.sink);
       bind(2, out);
       g_.set_value(3, p);
+      bind(4, gate ? *gate : out);
       g_.dispatch({T, H, 1}, {128, 1, 1});
       return;
     }
     AttnParams p{T, H, KVH, uint32_t(a.kv.cap), uint32_t(a.kv.len), a.kv.ring ? 1u : 0u, uint32_t(a.window),
-                 uint32_t(a.rel_proj.dim(1))};
+                 uint32_t(a.rel_proj.dim(1)), gate ? 1u : 0u};
     if (H == 3 * KVH && !getenv("INK_ATTN_SLOW")) {
       pipe("attn_prefill");
       bind(0, a.q);
@@ -490,9 +492,11 @@ class MetalBackend final : public Backend {
       bind(7, a.kv.v.valid() ? a.kv.v : a.v_new);
       bind(8, out);
       g_.set_value(9, p);  // same layout as AttnPreParams
+      bind(10, gate ? *gate : out);
       g_.dispatch({cdiv(T, 32), KVH, 1}, {384, 1, 1});
       return;
     }
+    if (gate) fail("attention_generic: no gate");
     pipe("attention_generic");
     bind(0, a.q);
     bind(1, a.k_new);

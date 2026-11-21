@@ -57,3 +57,13 @@ inline float tg_sum(float v, threadgroup float* scratch, uint tid, uint lane, ui
   return r;
 }
 
+
+// dt codes: 0 = f32, 1 = bf16
+inline float ldv(device const void* p, uint dt, uint i) {
+  return dt == 0 ? ((device const float*)p)[i] : bf2f(((device const ushort*)p)[i]);
+}
+inline void stv(device void* p, uint dt, uint i, float v) {
+  if (dt == 0) ((device float*)p)[i] = v;
+  else ((device ushort*)p)[i] = f2bf(v);
+}
+

@@ -50,7 +50,7 @@ struct ArgmaxParams {
   uint32_t n, out_index;
 };
 struct AttnDecParams {
-  uint32_t T, H, KVH, cap, len, ring, window, rel_extent, split_keys, nsplit, causal, first, use_sink;
+  uint32_t T, H, KVH, cap, len, ring, window, rel_extent, split_keys, nsplit, causal, first, use_sink, use_gate;
 };
 
 Tensor view(const Tensor& t, std::initializer_list<int64_t> shape, int64_t first_row = 0) {
@@ -111,7 +111,7 @@ struct DSpark::Impl {
     uint32_t nsplit = cdiv(len + uint32_t(T), split_keys) - first / split_keys;
     (void)nkeys;
     AttnDecParams p{uint32_t(T), uint32_t(H), uint32_t(KVH), uint32_t(l.kv.cap), len, l.kv.ring ? 1u : 0u, 0u, 0u,
-                    split_keys, nsplit, 0u, first, 0u};
+                    split_keys, nsplit, 0u, first, 0u, 0u};
     if (apart.numel() < int64_t(KVH * nsplit * 24 * 132)) {
       be.sync();
       if (apart.valid()) be.free(apart);
@@ -133,6 +133,7 @@ struct DSpark::Impl {
     bind(1, qt);  // sink unused
     bind(2, out);
     g.set_value(3, p);
+    bind(4, out);
     g.dispatch({uint32_t(T), uint32_t(H), 1}, {128, 1, 1});
   }
 };
