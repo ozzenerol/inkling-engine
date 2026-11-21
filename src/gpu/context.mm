@@ -36,6 +36,20 @@ static struct BarrierReport {
   }
 } g_barrier_report;
 
+// Pipeline plus the set of buffer indices its kernel can write (anything not `const`), from reflection.
+static id<MTLComputePipelineState> make_pipeline(id<MTLDevice> dev, id<MTLFunction> f, uint32_t* wmask, NSError** err) {
+  MTLComputePipelineReflection* refl = nil;
+  id<MTLComputePipelineState> p = [dev newComputePipelineStateWithFunction:f
+                                                                   options:MTLPipelineOptionBindingInfo
+                                                                reflection:&refl
+                                                                     error:err];
+  uint32_t m = 0;
+  for (id<MTLBinding> b in refl.bindings)
+    if (b.type == MTLBindingTypeBuffer && b.access != MTLBindingAccessReadOnly && b.index < 32) m |= 1u << b.index;
+  *wmask = p ? m : 0xffffffffu;
+  return p;
+}
+
 struct Context::Impl {
   id<MTLDevice> device;
   id<MTLCommandQueue> queue;
@@ -64,6 +78,13 @@ struct Context::Impl {
   bool smart = true;  // concurrent encoder + barriers only on buffer hazards (INK_SERIAL=1: serial encoder)
   std::unordered_set<void*> readonly;      // weights: never written by kernels
   std::unordered_set<void*> touched;       // buffers bound by dispatches since the last barrier
+  // INK_RW=1: reads and writes tracked separately (write indices from pipeline reflection), so dispatches that only
+  // read a common buffer do not force a barrier
+  bool rw = false;
+  std::unordered_map<void*, uint32_t> wmask;  // pipeline -> writable buffer indices
+  uint32_t cur_wmask = 0xffffffffu;
+  std::vector<std::pair<uint32_t, void*>> cur_ix;  // (index, buffer) bound for the next dispatch
+  std::unordered_set<void*> touched_w;
   std::vector<void*> cur;                  // buffers bound for the next dispatch
   long barriers = 0, dispatches = 0;
   std::unordered_map<void*, std::pair<std::string, size_t>> live;  // mtl ptr -> tag, size
@@ -102,6 +123,7 @@ Context::Context() : impl_(new Impl) {
     if (const char* ws = getenv("INK_WARM_SECS")) impl_->warm_secs = atof(ws);
     impl_->concurrent = getenv("INK_CONCURRENT") != nullptr;
     impl_->null_mode = getenv("INK_NULL") != nullptr;
+    impl_->rw = getenv("INK_RW") != nullptr;
     impl_->smart = getenv("INK_SERIAL") == nullptr && !impl_->concurrent;
     g_barrier_report.b = &impl_->barriers;
     g_barrier_report.d = &impl_->dispatches;
@@ -116,15 +138,20 @@ Context::Context() : impl_(new Impl) {
       id<MTLLibrary> lib = impl_->libs.back();
       id<MTLDevice> dev = impl_->device;
       __strong id<MTLComputePipelineState>* out = ps.data();
+      std::vector<uint32_t> masks(fn.size(), 0xffffffffu);
+      uint32_t* masks_p = masks.data();
       const std::string* names_p = fn.data();
       dispatch_apply(fn.size(), dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^(size_t i) {
         @autoreleasepool {
           id<MTLFunction> f = [lib newFunctionWithName:[NSString stringWithUTF8String:names_p[i].c_str()]];
-          if (f) out[i] = [dev newComputePipelineStateWithFunction:f error:nil];
+          if (f) out[i] = make_pipeline(dev, f, &masks_p[i], nil);
         }
       });
       for (size_t i = 0; i < fn.size(); i++)
-        if (ps[i]) impl_->pipelines[fn[i]] = ps[i];
+        if (ps[i]) {
+          impl_->pipelines[fn[i]] = ps[i];
+          impl_->wmask[(__bridge void*)ps[i]] = masks[i];
+        }
     }
   }
 }
@@ -155,7 +182,9 @@ Pipeline Context::pipeline(const std::string& function) {
       id<MTLFunction> fn = [*it2 newFunctionWithName:fname];
       if (!fn) continue;
       NSError* err = nil;
-      id<MTLComputePipelineState> p = [impl_->device newComputePipelineStateWithFunction:fn error:&err];
+      uint32_t wm = 0xffffffffu;
+      id<MTLComputePipelineState> p = make_pipeline(impl_->device, fn, &wm, &err);
+      if (p) impl_->wmask[(__bridge void*)p] = wm;
       if (!p) die("pipeline " + function + ": " + (err ? [[err description] UTF8String] : "?"));
       impl_->pipelines[function] = p;
       return (__bridge void*)p;
@@ -304,6 +333,7 @@ void Context::ensure_encoder() {
   impl_->enc = [impl_->cmd computeCommandEncoderWithDispatchType:((impl_->concurrent || impl_->smart)
                                                                                      ? MTLDispatchTypeConcurrent
                                                                                      : MTLDispatchTypeSerial)];
+  impl_->touched_w.clear();
   impl_->touched.clear();  // a new encoder starts after the previous one (tracked resources across encoders)
 }
 
@@ -317,12 +347,17 @@ void Context::end_encoder() {
 void Context::set_pipeline(Pipeline p) {
   ensure_encoder();
   [impl_->enc setComputePipelineState:(__bridge id<MTLComputePipelineState>)p];
+  auto wm = impl_->wmask.find(p);
+  impl_->cur_wmask = wm == impl_->wmask.end() ? 0xffffffffu : wm->second;
 }
 
 void Context::set_buffer(uint32_t index, Buf b, size_t offset) {
   ensure_encoder();
   [impl_->enc setBuffer:(__bridge id<MTLBuffer>)b.mtl offset:offset atIndex:index];
-  if (impl_->smart && !impl_->readonly.count(b.mtl)) impl_->cur.push_back(b.mtl);
+  if (impl_->smart && !impl_->readonly.count(b.mtl)) {
+    impl_->cur.push_back(b.mtl);
+    impl_->cur_ix.push_back({index, b.mtl});
+  }
 }
 
 void Context::set_bytes(uint32_t index, const void* data, size_t n) {
@@ -340,18 +375,42 @@ void Context::dispatch(Dim3 g, Dim3 t) {
   if (impl_->smart) {
     // Conservative: any non-weight buffer bound here that a dispatch since the last barrier also bound is a hazard.
     bool hazard = false;
-    for (void* b : impl_->cur)
-      if (impl_->touched.count(b)) {
-        hazard = true;
-        break;
+    if (impl_->rw) {
+      // later binds at the same index replace earlier ones; a buffer is written if any of its indices is writable
+      std::unordered_map<uint32_t, void*> last;
+      for (auto& ib : impl_->cur_ix) last[ib.first] = ib.second;
+      std::unordered_map<void*, bool> use;  // buffer -> written
+      for (auto& kv : last) use[kv.second] = use[kv.second] || (kv.first < 32 && (impl_->cur_wmask >> kv.first) & 1u);
+      for (auto& u : use)
+        if (impl_->touched_w.count(u.first) || (u.second && impl_->touched.count(u.first))) {
+          hazard = true;
+          break;
+        }
+      if (hazard) {
+        [impl_->enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+        impl_->touched.clear();
+        impl_->touched_w.clear();
+        impl_->barriers++;
       }
-    if (hazard) {
-      [impl_->enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
-      impl_->touched.clear();
-      impl_->barriers++;
+      for (auto& u : use) {
+        impl_->touched.insert(u.first);
+        if (u.second) impl_->touched_w.insert(u.first);
+      }
+    } else {
+      for (void* b : impl_->cur)
+        if (impl_->touched.count(b)) {
+          hazard = true;
+          break;
+        }
+      if (hazard) {
+        [impl_->enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+        impl_->touched.clear();
+        impl_->barriers++;
+      }
+      for (void* b : impl_->cur) impl_->touched.insert(b);
     }
-    for (void* b : impl_->cur) impl_->touched.insert(b);
     impl_->cur.clear();
+    impl_->cur_ix.clear();
     impl_->dispatches++;
   }
   if (impl_->null_mode) {
