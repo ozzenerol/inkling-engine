@@ -626,3 +626,82 @@ kernel void mr_moe_wsum(device const ushort* dd [[buffer(0)]], device const floa
       device const int*, device ushort*, constant MoeFastParams&, uint2, uint, uint);
 MR_MOE_INST("nvfp4", 0)
 MR_MOE_INST("mxfp8", 1)
+
+// ---------------------------------------------------------------------------------------------------------------
+// MLX affine 8-bit dense weights (8-bit build), one pass for up to 16 rows. Per (t, row) the arithmetic of
+// matvec_q8 (q8.metal, B): lane l takes the 16-code chunks l, l + 32, ...; per chunk xs = sum of the 16 x in order,
+// d = fma chain over the 16 codes in order, acc = fma(s, d, fma(b, xs, acc)); simd_sum at the end.
+struct MrQ8Params {  // = Q8Params (q8.metal comes after this file in the library)
+  uint N, K, T;
+  uint x_stride, y_stride;
+};
+inline void mr_ldx16(device const bf16_in* p, thread float* o) {
+  device const packed_uint4* q = (device const packed_uint4*)p;
+  unpack_bf8(q[0], o);
+  unpack_bf8(q[1], o + 8);
+}
+inline void mr_ldx16(device const float* p, thread float* o) {
+  device const packed_float4* q = (device const packed_float4*)p;
+  for (uint j = 0; j < 4; j++) {
+    float4 v = q[j];
+    o[j * 4] = v.x; o[j * 4 + 1] = v.y; o[j * 4 + 2] = v.z; o[j * 4 + 3] = v.w;
+  }
+}
+template <typename XT, typename YT, uint TT, uint R, uint S>
+kernel void mr_matvec_q8(device const uint4* W [[buffer(0)]], device const ushort* Sc [[buffer(1)]],
+                         device const ushort* Bi [[buffer(2)]], device const XT* x [[buffer(3)]],
+                         device YT* y [[buffer(4)]], constant MrQ8Params& s [[buffer(5)]],
+                         uint tg [[threadgroup_position_in_grid]], uint simd [[simdgroup_index_in_threadgroup]],
+                         uint lane [[thread_index_in_simdgroup]]) {
+  uint row0 = (tg * S + simd) * R;
+  if (row0 >= s.N) return;
+  const uint kc = s.K / 16, ng = s.K / 64;
+  const uint nt = min(s.T, TT);
+  float acc[TT][R];
+  for (uint t = 0; t < TT; t++)
+    for (uint r = 0; r < R; r++) acc[t][r] = 0;
+  for (uint c = lane; c < kc; c += 32) {
+    const uint g = c / 4;
+    float qf[R][16], sc[R], bi[R];
+#pragma clang loop unroll(full)
+    for (uint r = 0; r < R; r++) {
+      uint row = min(row0 + r, s.N - 1);
+      uint4 q = W[row * kc + c];
+      sc[r] = bf2f(Sc[row * ng + g]);
+      bi[r] = bf2f(Bi[row * ng + g]);
+      uint qs[4] = {q.x, q.y, q.z, q.w};
+      for (uint j = 0; j < 4; j++)
+        for (uint i = 0; i < 4; i++) qf[r][j * 4 + i] = float((qs[j] >> (8 * i)) & 255u);
+    }
+    for (uint t = 0; t < TT; t++) {
+      float xv[16];
+      mr_ldx16(x + min(t, nt - 1) * s.x_stride + c * 16, xv);
+      float xs = 0;
+      for (uint i = 0; i < 16; i++) xs += xv[i];
+#pragma clang loop unroll(full)
+      for (uint r = 0; r < R; r++) {
+        float d = 0;
+        for (uint i = 0; i < 16; i++) d = fma(xv[i], qf[r][i], d);
+        acc[t][r] = fma(sc[r], d, fma(bi[r], xs, acc[t][r]));
+      }
+    }
+  }
+  for (uint t = 0; t < nt; t++)
+    for (uint r = 0; r < R; r++) {
+      float v = simd_sum(acc[t][r]);
+      if (lane == 0 && row0 + r < s.N) y[t * s.y_stride + row0 + r] = YT(v);
+    }
+}
+#define MR_Q8_INST(XN, XT, YN, YT, TT, R, S)                                                                  \
+  template [[host_name("mr_matvec_q8_" #XN "_" #YN "_t" #TT "_r" #R "_s" #S)]] kernel void                    \
+  mr_matvec_q8<XT, YT, TT, R, S>(device const uint4*, device const ushort*, device const ushort*,             \
+                                 device const XT*, device YT*, constant MrQ8Params&, uint, uint, uint);
+#define MR_Q8_SET(TT, R, S)                           \
+  MR_Q8_INST(bf16, bf16_in, bf16, bf16_out, TT, R, S) \
+  MR_Q8_INST(bf16, bf16_in, f32, float, TT, R, S)     \
+  MR_Q8_INST(f32, float, f32, float, TT, R, S)        \
+  MR_Q8_INST(f32, float, bf16, bf16_out, TT, R, S)
+MR_Q8_SET(8, 2, 2)
+MR_Q8_SET(8, 4, 2)
+MR_Q8_SET(16, 2, 2)
+MR_Q8_SET(16, 4, 2)
