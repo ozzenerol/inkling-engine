@@ -112,7 +112,7 @@ int main(int argc, char** argv) {
     MTL->rms_norm(x.m, nullptr, 1e-6f, D, of.m);
     compare("rms_norm f32 nogamma", of);
   }
-  for (int64_t T : {1, 3, 4, 7, 40}) {  // linear
+  for (int64_t T : {1, 3, 4, 5, 7, 8, 9, 16, 40}) {  // linear
     auto x = make(DType::BF16, {T, D});
     auto w = make(DType::BF16, {3072, D}, 0.02f);
     auto o = zeros(DType::BF16, {T, 3072});
@@ -171,9 +171,11 @@ int main(int argc, char** argv) {
     for (int64_t T : {5, 1}) {
       auto x = make(DType::BF16, {T, C});
       auto o = zeros(DType::BF16, {T, C});
-      CPU->short_conv(x.c, w.c, st.c, o.c);
-      MTL->short_conv(x.m, w.m, st.m, o.m);
+      auto hs = zeros(DType::F32, {T, 3, C});
+      CPU->short_conv(x.c, w.c, st.c, o.c, &hs.c);
+      MTL->short_conv(x.m, w.m, st.m, o.m, &hs.m);
       compare(("short_conv C=" + std::to_string(C) + " T=" + std::to_string(T)).c_str(), o, 0, 0);
+      compare("short_conv hist", hs, 0);
     }
     compare("short_conv state", st, 0);
   }
@@ -185,9 +187,11 @@ int main(int argc, char** argv) {
       auto x = make(DType::BF16, {T, C});
       auto dy = make(DType::BF16, {T, 32}, 0.3f);
       auto o = zeros(DType::BF16, {T, C});
-      CPU->dyn_conv(x.c, dy.c, sw.c, st.c, o.c);
-      MTL->dyn_conv(x.m, dy.m, sw.m, st.m, o.m);
+      auto hs = zeros(DType::F32, {T, 3, C});
+      CPU->dyn_conv(x.c, dy.c, sw.c, st.c, o.c, &hs.c);
+      MTL->dyn_conv(x.m, dy.m, sw.m, st.m, o.m, &hs.m);
       compare(("dyn_conv T=" + std::to_string(T)).c_str(), o, 0, 0);
+      compare("dyn_conv hist", hs, 0);
     }
   }
   {  // l2 clip

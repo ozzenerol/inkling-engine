@@ -154,3 +154,68 @@ kernel void copy_bytes(device const uchar* src [[buffer(0)]], device uchar* dst 
     for (uint j = b; j < n; j++) dst[j] = src[j];
   }
 }
+
+// Skinny GEMM for 5..16 rows of x (draft blocks, verify > 4): out^T[N, T] = W[N, K] x^T, simdgroup matrices.
+// A simdgroup computes 8 output rows x 16 tokens (2 frags); W and x frags are loaded straight from device memory
+// (W rows are reused over consecutive k steps through L1). x rows past T are clamped (results not stored).
+struct SkinnyParams {
+  uint N, K, T;
+  uint dt_out;
+};
+template <typename XT>
+kernel void gemm_skinny(device const bfloat* W [[buffer(0)]], device const XT* x [[buffer(1)]],
+                        device void* y [[buffer(2)]], constant SkinnyParams& s [[buffer(3)]],
+                        uint tg [[threadgroup_position_in_grid]], uint sg [[simdgroup_index_in_threadgroup]],
+                        uint lane [[thread_index_in_simdgroup]]) {
+  uint n0 = (tg * 4 + sg) * 8;
+  if (n0 >= s.N) return;
+  uint nrow = min(n0, s.N - 8);  // last tile overlaps (N >= 8 assumed); stores are guarded
+  threadgroup XT xs_dummy[1];
+  (void)xs_dummy;
+  simdgroup_float8x8 acc[2] = {simdgroup_float8x8(0), simdgroup_float8x8(0)};
+  device const bfloat* wp = W + size_t(nrow) * s.K;
+  uint t1 = min(8u, s.T), t2 = s.T;
+  for (uint k = 0; k < s.K; k += 8) {
+    simdgroup_bfloat8x8 wf;
+    simdgroup_load(wf, wp + k, s.K);
+    for (uint j = 0; j < 2; j++) {
+      // x^T frag: element (row = k-offset, col = token): load x[t][k..k+8] transposed
+      simdgroup_matrix<XT, 8, 8> xf;
+      uint tb = min(j * 8, s.T - 1);
+      simdgroup_load(xf, x + size_t(tb) * s.K + k, s.K, ulong2(0, 0), true);
+      if (j == 1 && s.T <= 8) break;
+      simdgroup_float8x8 xff;
+      thread auto& a = xf.thread_elements();
+      thread auto& b = xff.thread_elements();
+      b[0] = float(a[0]);
+      b[1] = float(a[1]);
+      simdgroup_float8x8 wff;
+      thread auto& wa = wf.thread_elements();
+      thread auto& wb = wff.thread_elements();
+      wb[0] = float(wa[0]);
+      wb[1] = float(wa[1]);
+      simdgroup_multiply_accumulate(acc[j], wff, xff, acc[j]);
+    }
+  }
+  (void)t1;
+  (void)t2;
+  short2 fc = frag_coord(lane);
+  uint fm = uint(fc.y), fn = uint(fc.x);
+  for (uint j = 0; j < 2; j++) {
+    thread auto& e = acc[j].thread_elements();
+    for (uint c = 0; c < 2; c++) {
+      uint n = nrow + fm, t = j * 8 + fn + c;
+      if (n >= n0 && n < s.N && t < s.T) {
+        size_t o = size_t(t) * s.N + n;
+        if (s.dt_out == 0) ((device float*)y)[o] = e[c];
+        else ((device ushort*)y)[o] = f2bf(e[c]);
+      }
+    }
+  }
+}
+template [[host_name("gemm_skinny_bf16")]] kernel void gemm_skinny<bfloat>(device const bfloat*, device const bfloat*,
+                                                                          device void*, constant SkinnyParams&, uint,
+                                                                          uint, uint);
+template [[host_name("gemm_skinny_f32")]] kernel void gemm_skinny<float>(device const bfloat*, device const float*,
+                                                                        device void*, constant SkinnyParams&, uint,
+                                                                        uint, uint);

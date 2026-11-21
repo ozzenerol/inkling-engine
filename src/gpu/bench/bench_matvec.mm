@@ -57,18 +57,29 @@ int main(int argc, char** argv) {
   for (int i = 0; i < 3072 * 16; i++) xp[i] = f2bf(nd(rng) * 50);
 
   int R = argc > 2 ? atoi(argv[2]) : 4, S = argc > 3 ? atoi(argv[3]) : 2;
-  std::string name = "matvec_bf16_bf16_bf16_t" + std::to_string(T == 1 ? 1 : (T <= 4 ? 4 : 8)) + "_r" +
-                     std::to_string(R) + "_s" + std::to_string(S);
+  bool skinny = T > 4;
+  std::string name = skinny ? "gemm_skinny_bf16"
+                            : "matvec_bf16_bf16_bf16_t" + std::to_string(T == 1 ? 1 : 4) + "_r" + std::to_string(R) +
+                                  "_s" + std::to_string(S);
   Pipeline p = g.pipeline(name);
+  struct SkinnyParams {
+    uint32_t N, K, T, dt_out;
+  };
   auto run = [&] {
     for (auto& m : mats) {
-      MatvecShape s{m.N, m.K, (uint32_t)T, 3072, 3072};
       g.set_pipeline(p);
       g.set_buffer(0, m.w);
       g.set_buffer(1, x);
       g.set_buffer(2, y);
-      g.set_value(3, s);
-      g.dispatch({(m.N + R * S - 1) / (R * S), 1, 1}, {32u * S, 1, 1});
+      if (skinny) {
+        SkinnyParams s{m.N, m.K, (uint32_t)T, 1};
+        g.set_value(3, s);
+        g.dispatch({(m.N + 31) / 32, 1, 1}, {128, 1, 1});
+      } else {
+        MatvecShape s{m.N, m.K, (uint32_t)T, 3072, 3072};
+        g.set_value(3, s);
+        g.dispatch({(m.N + R * S - 1) / (R * S), 1, 1}, {32u * S, 1, 1});
+      }
     }
     g.commit_and_wait();
     return g.last_gpu_ms();

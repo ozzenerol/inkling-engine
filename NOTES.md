@@ -15,7 +15,8 @@ Append-only log plus the agreed layout. Read before each chunk of work.
 One model on the GPU at a time. Before loading weights: add a line here AND message the others.
 Format: `LOCK <agent> <what> <start time>` / `UNLOCK <agent> <time>`.
 
-(none held)  [A ran the MLX reference dump 17:22, done]
+(none held)
+LOCK B inktest --backend metal (full model, ~20 GB) 2026-11-21  [A ran the MLX reference dump 17:22, done]
 LOCK C MLX-VLM baseline (serve_inkling.sh :8091, qh e2e + ctxbench) 17:43 / UNLOCK C 17:50
 
 

@@ -81,7 +81,8 @@ kernel void rms_norm_rows(device const void* x [[buffer(0)]], device const ushor
   float inv = metal::precise::rsqrt(ss / float(p.dim) + p.eps);
   for (uint i = tid; i < p.dim; i += RT) {
     float v = ldv(x, p.dt_x, base + i) * inv;
-    if (p.has_gamma) v = bf2f(gamma[i]) * v;
+    if (p.dt_x == 1) v = round_bf(v);  // MLX: out = T(w * T(x * inv)), T = input dtype
+    if (p.has_gamma) v = v * bf2f(gamma[i]);
     stv(out, p.dt_out, base + i, v);
   }
 }
@@ -224,10 +225,12 @@ kernel void controller_mix(device const float* x [[buffer(0)]], device const flo
 struct ConvParams {
   uint T, C;
   uint heads;  // dyn conv: kv heads (C / heads channels each)
+  uint has_hist;
 };
 kernel void short_conv4(device const ushort* x [[buffer(0)]], device const ushort* w [[buffer(1)]],
                         device float* state [[buffer(2)]], device ushort* out [[buffer(3)]],
-                        constant ConvParams& p [[buffer(4)]], uint c [[thread_position_in_grid]]) {
+                        constant ConvParams& p [[buffer(4)]], device float* hist [[buffer(5)]],
+                        uint c [[thread_position_in_grid]]) {
   if (c >= p.C) return;
   float s0 = state[0 * p.C + c], s1 = state[1 * p.C + c], s2 = state[2 * p.C + c];
   float w0 = bf2f(w[c * 4 + 0]), w1 = bf2f(w[c * 4 + 1]), w2 = bf2f(w[c * 4 + 2]), w3 = bf2f(w[c * 4 + 3]);
@@ -243,6 +246,11 @@ kernel void short_conv4(device const ushort* x [[buffer(0)]], device const ushor
     s0 = s1;
     s1 = s2;
     s2 = xv;
+    if (p.has_hist) {
+      hist[(t * 3 + 0) * p.C + c] = s0;
+      hist[(t * 3 + 1) * p.C + c] = s1;
+      hist[(t * 3 + 2) * p.C + c] = s2;
+    }
   }
   state[0 * p.C + c] = s0;
   state[1 * p.C + c] = s1;
@@ -253,7 +261,7 @@ kernel void short_conv4(device const ushort* x [[buffer(0)]], device const ushor
 kernel void dyn_conv4(device const ushort* x [[buffer(0)]], device const ushort* dyn [[buffer(1)]],
                       device const ushort* static_w [[buffer(2)]], device float* state [[buffer(3)]],
                       device ushort* out [[buffer(4)]], constant ConvParams& p [[buffer(5)]],
-                      uint c [[thread_position_in_grid]]) {
+                      device float* histo [[buffer(6)]], uint c [[thread_position_in_grid]]) {
   if (c >= p.C) return;
   uint h = c / (p.C / p.heads);
   float hist[4];  // hist[lag] = xin[t - lag]
@@ -274,6 +282,11 @@ kernel void dyn_conv4(device const ushort* x [[buffer(0)]], device const ushort*
     hist[3] = hist[2];
     hist[2] = hist[1];
     hist[1] = hist[0];
+    if (p.has_hist) {
+      histo[(t * 3 + 0) * p.C + c] = hist[3];
+      histo[(t * 3 + 1) * p.C + c] = hist[2];
+      histo[(t * 3 + 2) * p.C + c] = hist[1];
+    }
   }
   state[0 * p.C + c] = hist[3];
   state[1 * p.C + c] = hist[2];

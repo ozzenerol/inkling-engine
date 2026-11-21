@@ -56,6 +56,9 @@ struct RmsParams {
 struct GemmParams {
   uint32_t T, N, K, dt_x, dt_out, ldo;
 };
+struct SkinnyParams {
+  uint32_t N, K, T, dt_out;
+};
 struct LinParams {
   uint32_t T, N, K, dt_x, dt_out;
 };
@@ -67,7 +70,7 @@ struct CtrlParams {
   uint32_t T, D, R, m_stride;
 };
 struct ConvParams {
-  uint32_t T, C, heads;
+  uint32_t T, C, heads, has_hist;
 };
 struct ClipParams {
   uint32_t rows, d, H;
@@ -233,6 +236,16 @@ class MetalBackend final : public Backend {
   // rows of out computed: [0, N) of w; out row stride = N.
   void linear_rows(const Tensor& x, const Tensor& w, Tensor& out, uint32_t T, uint32_t N, uint32_t K,
                    uint32_t /*unused*/) {
+    if (K % 8 == 0 && T > 4 && T <= 16 && N >= 8 && !getenv("INK_NO_SKINNY")) {
+      SkinnyParams sp{N, K, T, dtc(out.dtype)};
+      pipe(x.dtype == DType::BF16 ? "gemm_skinny_bf16" : "gemm_skinny_f32");
+      bind(0, w);
+      bind(1, x);
+      bind(2, out);
+      g_.set_value(3, sp);
+      g_.dispatch({cdiv(N, 32), 1, 1}, {128, 1, 1});
+      return;
+    }
     if (K % 8 == 0 && T <= 16) {
       for (uint32_t t0 = 0; t0 < T; t0 += 4) {
         uint32_t tt = std::min<uint32_t>(4, T - t0);
@@ -337,21 +350,25 @@ class MetalBackend final : public Backend {
     g_.dispatch({p.T, 1, 1}, {256, 1, 1});
   }
 
-  void short_conv(const Tensor& x, const Tensor& w, Tensor& state, Tensor& out) override {
+  void short_conv(const Tensor& x, const Tensor& w, Tensor& state, Tensor& out, Tensor* hist) override {
     uint32_t C = uint32_t(x.dim(-1));
-    ConvParams p{uint32_t(x.numel() / C), C, 0};
+    bool hh = hist && hist->valid();
+    ConvParams p{uint32_t(x.numel() / C), C, 0, hh ? 1u : 0u};
     pipe("short_conv4");
     bind(0, x);
     bind(1, w);
     bind(2, state);
     bind(3, out);
     g_.set_value(4, p);
+    bind(5, hh ? *hist : state);
     g_.dispatch({cdiv(C, 256), 1, 1}, {256, 1, 1});
   }
 
-  void dyn_conv(const Tensor& x, const Tensor& dyn, const Tensor& static_w, Tensor& state, Tensor& out) override {
+  void dyn_conv(const Tensor& x, const Tensor& dyn, const Tensor& static_w, Tensor& state, Tensor& out,
+                Tensor* hist) override {
     uint32_t C = uint32_t(x.dim(-1));
-    ConvParams p{uint32_t(x.numel() / C), C, uint32_t(dyn.dim(-1) / 4)};
+    bool hh = hist && hist->valid();
+    ConvParams p{uint32_t(x.numel() / C), C, uint32_t(dyn.dim(-1) / 4), hh ? 1u : 0u};
     pipe("dyn_conv4");
     bind(0, x);
     bind(1, dyn);
@@ -359,6 +376,7 @@ class MetalBackend final : public Backend {
     bind(3, state);
     bind(4, out);
     g_.set_value(5, p);
+    bind(6, hh ? *hist : state);
     g_.dispatch({cdiv(C, 256), 1, 1}, {256, 1, 1});
   }
 
