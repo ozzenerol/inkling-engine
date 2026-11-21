@@ -1,6 +1,7 @@
 // Owner: A. Forward pass of Inkling 2 Mini (mirrors mlx_vlm/models/inkling2/language.py).
 #include "model/model.h"
 
+#include <cstdlib>
 #include <cstring>
 
 #include "core/bf16.h"
@@ -86,6 +87,9 @@ void Model::load(const std::string&) {
     return v;
   };
   long inexact = 0;
+  // INK_Q8=0 forces the load-time conversion even when the backend has 8-bit kernels (A/B checks).
+  const char* q8env = std::getenv("INK_Q8");
+  const bool q8_inplace = be_.supports_q8() && !(q8env && q8env[0] == '0');
   // Dense weight in canonical form: bf16 [N,K] (or the stored dtype when it is not bf16-like).
   auto W = [&](const std::string& canon) -> Tensor {
     const std::string n = name(canon);
@@ -94,6 +98,11 @@ void Model::load(const std::string&) {
     const auto* es = st_.find(base + ".scales");
     const auto* eb = st_.find(base + ".biases");
     if (e.dtype == DType::U32 && es && eb && es->dtype == DType::BF16) {
+      if (q8_inplace) {
+        Tensor codes = be_.load_weight(e);
+        be_.bind_affine(codes, be_.load_weight(*es), be_.load_weight(*eb));
+        return codes;
+      }
       // MLX affine 8-bit: 4 codes per u32 (low byte first), group 64.
       const int64_t N = e.shape[0], K = e.shape[1] * 4, G = es->shape[1];
       if (G * 64 != K) throw std::runtime_error("affine group size != 64: " + n);

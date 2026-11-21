@@ -68,6 +68,16 @@ class Backend {
   virtual void free(Tensor&) = 0;
   // Load a weight from its safetensors file into resident memory (B: pread into wired buffers).
   virtual Tensor load_weight(const SafeTensors::Entry&) = 0;
+  // MLX affine 8-bit dense weights (8-bit build). A backend that returns true from supports_q8() gets such
+  // weights as they are stored: `codes` U32 [N, K/4] (4 uint8 codes per word, low byte first) with bf16 `scales`
+  // and `biases` [N, K/64]; value = bf16(scale * q + bias) (what the load-time conversion produces, so results
+  // match the converted path up to summation order). Model::load calls bind_affine once per weight; afterwards
+  // linear / linear_multi / embed / logits receive the codes tensor (dtype U32) where they normally get the bf16
+  // weight and look the scales up by (buf, offset). Without support, Model::load converts to bf16 itself.
+  virtual bool supports_q8() const { return false; }
+  virtual void bind_affine(const Tensor& codes, const Tensor& scales, const Tensor& biases) {
+    (void)codes; (void)scales; (void)biases;
+  }
   virtual void sync() = 0;                         // wait for all enqueued work
   virtual void copy(const Tensor& src, Tensor& dst, size_t src_off = 0, size_t dst_off = 0, size_t bytes = 0) = 0;
   // Host access (tests, logits): read back after sync.
