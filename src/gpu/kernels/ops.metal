@@ -48,18 +48,6 @@ kernel void embed_rows(device const int* ids [[buffer(0)]], device const ushort*
   out[gid.y * p.D + gid.x] = table[size_t(ids[gid.y]) * p.D + gid.x];
 }
 
-// ---------------------------------------------------------------- reductions helper (threadgroup of 256)
-constant uint RT = 256;
-inline float tg_sum(float v, threadgroup float* scratch, uint tid, uint lane, uint sg) {
-  v = simd_sum(v);
-  if (lane == 0) scratch[sg] = v;
-  threadgroup_barrier(mem_flags::mem_threadgroup);
-  float r = 0;
-  for (uint i = 0; i < RT / 32; i++) r += scratch[i];
-  threadgroup_barrier(mem_flags::mem_threadgroup);
-  return r;
-}
-
 // ---------------------------------------------------------------- rms_norm: one threadgroup (256) per row
 struct RmsParams {
   uint rows, dim;

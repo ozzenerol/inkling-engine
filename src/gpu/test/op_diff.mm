@@ -251,6 +251,49 @@ int main(int argc, char** argv) {
     }
   }
 
+  // Verify (T=4 at len L) must equal decode (T=1 at len L+t) bit for bit, row by row (speculative identity).
+  for (int local = 0; local < 2; local++) {
+    int64_t cap = local ? 1536 : 8192, L = local ? 3001 : 4093;  // ring wrapped / split boundary crossing
+    auto q = make(DType::BF16, {4, 24, 128}, 0.5f), r = make(DType::BF16, {4, 24, 16}, 1.0f),
+         rp = make(DType::BF16, {16, 1024}, 0.5f), sk = make(DType::BF16, {4, 24}, 1.0f);
+    auto kc = make(DType::BF16, {8, cap, 128}, 0.5f), vc = make(DType::BF16, {8, cap, 128});
+    // new keys = cache rows at positions L..L+3 (so the T=1 runs read them from the cache)
+    Tensor kn = MTL->alloc(DType::BF16, {4, 8, 128}, "kn"), vn = MTL->alloc(DType::BF16, {4, 8, 128}, "vn");
+    MTL->sync();
+    for (int t = 0; t < 4; t++)
+      for (int h = 0; h < 8; h++) {
+        int64_t slot = local ? (L + t) % cap : L + t;
+        memcpy(kn.data<uint16_t>() + (t * 8 + h) * 128, kc.m.data<uint16_t>() + (h * cap + slot) * 128, 256);
+        memcpy(vn.data<uint16_t>() + (t * 8 + h) * 128, vc.m.data<uint16_t>() + (h * cap + slot) * 128, 256);
+      }
+    Tensor o4 = MTL->alloc(DType::BF16, {4, 24 * 128}, "o4");
+    AttnArgs a4{q.m, kn, vn, r.m, rp.m, sk.m, KvView{kc.m, vc.m, cap, L, bool(local)}, local ? 1024 : 0};
+    MTL->attention(a4, o4);
+    size_t bad = 0;
+    for (int t = 0; t < 4; t++) {
+      auto rowv = [&](const Tensor& x, int64_t w) {
+        Tensor v = x;
+        v.set_shape({1, x.dim(1), w > 0 ? x.dim(2) : 0});
+        v.ndim = x.ndim;
+        v.shape[0] = 1;
+        v.offset = x.offset + size_t(t) * (x.nbytes() / x.dim(0));
+        return v;
+      };
+      Tensor qt = rowv(q.m, 1), rt = rowv(r.m, 1), kt = rowv(kn, 1), vt = rowv(vn, 1), st = sk.m;
+      st.set_shape({1, 24});
+      st.offset += size_t(t) * 48;
+      Tensor o1 = MTL->alloc(DType::BF16, {1, 24 * 128}, "o1");
+      AttnArgs a1{qt, kt, vt, rt, rp.m, st, KvView{kc.m, vc.m, cap, L + t, bool(local)}, local ? 1024 : 0};
+      MTL->attention(a1, o1);
+      MTL->sync();
+      if (memcmp(o1.data<uint16_t>(), o4.data<uint16_t>() + t * 3072, 3072 * 2) != 0) bad++;
+      MTL->free(o1);
+    }
+    printf("%-28s %s  rows differing: %zu/4\n", local ? "verify==decode local ring" : "verify==decode global",
+           bad ? "FAIL" : "ok  ", bad);
+    if (bad) fails++;
+  }
+
   // MoE and router with real weights: layer 0 (NVFP4) and layer 23 (MXFP8)
   SafeTensors st;
   st.add_dir(dir);

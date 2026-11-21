@@ -54,9 +54,12 @@ kernel void attn_decode_split(device const ushort* q [[buffer(0)]], device const
     qpos[f] = p.len + t;
     for (uint d = 0; d < 16; d++) rrv[f][d] = p.rel_extent ? bf2f(r[(t * p.H + h) * 16 + d]) : 0.0f;
   }
+  // Splits are aligned to absolute positions (multiples of split_keys) so a row's keys are partitioned the same
+  // way whatever T and len are: a verify row and a plain decode at the same position sum in the same order.
   uint last = p.len + p.T - 1;
-  uint k0 = p.first + split * p.split_keys;
-  uint k1 = min(k0 + p.split_keys, last + 1);
+  uint kbase = (p.first / p.split_keys + split) * p.split_keys;
+  uint k0 = max(kbase, p.first);
+  uint k1 = min(kbase + p.split_keys, last + 1);
   const float scale = 0.08838834764831845f;
   float m[NF], l[NF];
   simdgroup_float8x8 of[NF][16];
@@ -67,10 +70,10 @@ kernel void attn_decode_split(device const ushort* q [[buffer(0)]], device const
   }
   threadgroup bfloat* K_ = KVs + sg * 2 * AD_BK * LDK;
   threadgroup bfloat* V_ = K_ + AD_BK * LDK;
-  for (uint kb = k0 + sg * AD_BK; kb < k1; kb += AD_BK * AD_SG) {
+  for (uint kb = kbase + sg * AD_BK; kb < k1; kb += AD_BK * AD_SG) {
     for (uint i = lane; i < AD_BK * 16; i += 32) {
       uint kr = i / 16, c8 = (i % 16) * 8;
-      uint pos = min(kb + kr, k1 - 1);
+      uint pos = clamp(kb + kr, k0, k1 - 1);
       device const ushort* kp;
       device const ushort* vp;
       if (pos < p.len) {
@@ -98,7 +101,7 @@ kernel void attn_decode_split(device const ushort* q [[buffer(0)]], device const
         thread auto& el = sf[j].thread_elements();
         for (uint e = 0; e < 2; e++) {
           uint kpos = kb + j * 8 + fn + e;
-          bool vis = rok[f] && kpos < k1 &&
+          bool vis = rok[f] && kpos >= k0 && kpos < k1 &&
                      (!p.causal || (kpos <= qpos[f] && (p.window == 0 || qpos[f] - kpos < p.window)));
           float sc = -INFINITY;
           if (vis) {

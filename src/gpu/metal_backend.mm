@@ -448,8 +448,9 @@ class MetalBackend final : public Backend {
       uint32_t len = uint32_t(a.kv.len), window = uint32_t(a.window);
       uint32_t first = (window && len + 1 > window) ? len + 1 - window : 0;
       uint32_t nkeys = len + T - first;
-      uint32_t split_keys = std::max<uint32_t>(256, (cdiv(nkeys, 96) + 127) / 128 * 128);
-      uint32_t nsplit = cdiv(nkeys, split_keys);
+      uint32_t split_keys = 512;  // fixed and position-aligned: verify == decode bit for bit
+      uint32_t nsplit = cdiv(len + T, split_keys) - first / split_keys;
+      (void)nkeys;
       AttnDecParams p{T, H, KVH, uint32_t(a.kv.cap), len, a.kv.ring ? 1u : 0u, window, uint32_t(a.rel_proj.dim(1)),
                       split_keys, nsplit, 1u, first, 1u};
       Tensor part = scratch("attn-part", DType::F32, {KVH * nsplit * 24, 132});

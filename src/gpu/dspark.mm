@@ -107,8 +107,9 @@ struct DSpark::Impl {
     uint32_t len = uint32_t(l.kv.len);
     uint32_t first = (l.local && len > window) ? uint32_t(len - window) : 0;
     uint32_t nkeys = len + uint32_t(T) - first;
-    uint32_t split_keys = std::max<uint32_t>(256, (cdiv(nkeys, 96) + 127) / 128 * 128);
-    uint32_t nsplit = cdiv(nkeys, split_keys);
+    uint32_t split_keys = 512;
+    uint32_t nsplit = cdiv(len + uint32_t(T), split_keys) - first / split_keys;
+    (void)nkeys;
     AttnDecParams p{uint32_t(T), uint32_t(H), uint32_t(KVH), uint32_t(l.kv.cap), len, l.kv.ring ? 1u : 0u, 0u, 0u,
                     split_keys, nsplit, 0u, first, 0u};
     if (apart.numel() < int64_t(KVH * nsplit * 24 * 132)) {
