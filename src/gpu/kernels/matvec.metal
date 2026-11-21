@@ -62,14 +62,12 @@ struct bf16_in {
   template [[host_name("matvec_bf16_" #XN "_" #YN "_t" #TT "_r" #R "_s" #S)]] kernel void                    \
   matvec_bf16<XT, YT, TT, R, S>(device const uint4*, device const XT*, device YT*, constant MatvecShape&, uint, \
                                 uint, uint);
-#define MV_SWEEP(TT) \
-  MV_INST(bf16, bf16_in, bf16, bf16_out, TT, 1, 2) MV_INST(bf16, bf16_in, bf16, bf16_out, TT, 2, 2) \
-  MV_INST(bf16, bf16_in, bf16, bf16_out, TT, 4, 2) MV_INST(bf16, bf16_in, bf16, bf16_out, TT, 8, 2) \
-  MV_INST(bf16, bf16_in, bf16, bf16_out, TT, 2, 4) MV_INST(bf16, bf16_in, bf16, bf16_out, TT, 4, 4) \
-  MV_INST(bf16, bf16_in, bf16, bf16_out, TT, 1, 8) MV_INST(bf16, bf16_in, bf16, bf16_out, TT, 2, 8)
-MV_SWEEP(1)
-MV_SWEEP(4)
-MV_SWEEP(8)
+MV_INST(bf16, bf16_in, bf16, bf16_out, 1, 4, 2)
 MV_INST(bf16, bf16_in, f32, float, 1, 4, 2)
 MV_INST(f32, float, f32, float, 1, 4, 2)
 MV_INST(f32, float, bf16, bf16_out, 1, 4, 2)
+MV_INST(bf16, bf16_in, bf16, bf16_out, 4, 4, 2)
+MV_INST(bf16, bf16_in, f32, float, 4, 4, 2)
+MV_INST(f32, float, f32, float, 4, 4, 2)
+MV_INST(f32, float, bf16, bf16_out, 4, 4, 2)
+MV_INST(bf16, bf16_in, bf16, bf16_out, 8, 4, 2)

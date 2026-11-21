@@ -1,0 +1,283 @@
+// Op-by-op diff of MetalBackend against CpuBackend on identical random inputs (and real expert weights).
+// Owner: B. Usage: op_diff [model_dir]
+#include <cmath>
+#include <cstdio>
+#include <cstring>
+#include <functional>
+#include <random>
+#include <string>
+#include <vector>
+
+#include "core/bf16.h"
+#include "core/safetensors.h"
+#include "model/backend.h"
+
+using namespace ink;
+
+static std::mt19937 rng(42);
+
+struct Pair {
+  Tensor c, m;
+};
+
+static Backend* CPU;
+static Backend* MTL;
+
+static Pair make(DType dt, std::initializer_list<int64_t> shape, float sd = 1.0f, float mean = 0.0f) {
+  Pair p{CPU->alloc(dt, shape, "t"), MTL->alloc(dt, shape, "t")};
+  std::normal_distribution<float> nd(mean, sd);
+  size_t n = size_t(p.c.numel());
+  if (dt == DType::F32) {
+    std::vector<float> v(n);
+    for (auto& x : v) x = nd(rng);
+    CPU->write(p.c, v.data(), n * 4);
+    MTL->write(p.m, v.data(), n * 4);
+  } else if (dt == DType::BF16) {
+    std::vector<uint16_t> v(n);
+    for (auto& x : v) x = f32_to_bf16(nd(rng));
+    CPU->write(p.c, v.data(), n * 2);
+    MTL->write(p.m, v.data(), n * 2);
+  }
+  return p;
+}
+static Pair zeros(DType dt, std::initializer_list<int64_t> shape) {
+  return {CPU->alloc(dt, shape, "z"), MTL->alloc(dt, shape, "z")};
+}
+static void fill_i32(Pair& p, const std::vector<int32_t>& v) {
+  CPU->write(p.c, v.data(), v.size() * 4);
+  MTL->write(p.m, v.data(), v.size() * 4);
+}
+
+static std::vector<float> host_f32(Backend* b, const Tensor& t) {
+  size_t n = size_t(t.numel());
+  std::vector<float> out(n);
+  if (t.dtype == DType::F32) b->read(t, out.data(), n * 4);
+  else {
+    std::vector<uint16_t> v(n);
+    b->read(t, v.data(), n * 2);
+    for (size_t i = 0; i < n; i++) out[i] = bf16_to_f32(v[i]);
+  }
+  return out;
+}
+
+static int fails = 0;
+// bf16: count elements differing by more than `ulps` bf16 ulps; f32: max relative diff vs max |ref|.
+static void compare(const char* name, Pair& p, double tol = 1e-5, int ulps = 1, double bad_frac = 0.001) {
+  MTL->sync();
+  auto a = host_f32(CPU, p.c), b = host_f32(MTL, p.m);
+  double maxabs = 0, maxref = 0;
+  size_t bad = 0, exact = 0, nan = 0;
+  for (size_t i = 0; i < a.size(); i++) {
+    if (std::isnan(b[i]) != std::isnan(a[i])) nan++;
+    double d = std::fabs(double(a[i]) - b[i]);
+    maxabs = std::max(maxabs, d);
+    maxref = std::max(maxref, std::fabs(double(a[i])));
+    if (a[i] == b[i]) exact++;
+    if (p.c.dtype == DType::BF16) {
+      double ulp = std::ldexp(1.0, std::ilogb(std::max(std::fabs(a[i]), 1e-30f)) - 7);
+      if (d > ulps * ulp * 1.0001) bad++;
+    }
+  }
+  double rel = maxabs / std::max(maxref, 1e-30);
+  bool ok = nan == 0 && (p.c.dtype == DType::BF16 ? bad <= a.size() * bad_frac : rel <= tol);
+  if (!ok) fails++;
+  printf("%-28s %s  n=%zu exact=%.2f%%  max|d|=%.3g (rel %.2e)%s  %s\n", name, ok ? "ok  " : "FAIL", a.size(),
+         100.0 * exact / a.size(), maxabs, rel,
+         p.c.dtype == DType::BF16 ? (" >" + std::to_string(ulps) + "ulp=" + std::to_string(bad)).c_str() : "",
+         nan ? "NAN MISMATCH" : "");
+}
+
+int main(int argc, char** argv) {
+  std::string dir = argc > 1 ? argv[1] : std::string(getenv("HOME")) + "/llm/mlx-models/Inkling-2-Mini-MLX-4-8bit";
+  auto cpu = make_cpu_backend();
+  auto mtl = make_metal_backend();
+  CPU = cpu.get();
+  MTL = mtl.get();
+  const int64_t D = 2304;
+
+  {  // rms_norm
+    auto x = make(DType::BF16, {5, D}, 3.0f);
+    auto g = make(DType::BF16, {D}, 0.2f, 1.0f);
+    auto o = zeros(DType::BF16, {5, D});
+    CPU->rms_norm(x.c, &g.c, 1e-6f, D, o.c);
+    MTL->rms_norm(x.m, &g.m, 1e-6f, D, o.m);
+    compare("rms_norm bf16 gamma", o);
+    auto of = zeros(DType::F32, {5, D});
+    CPU->rms_norm(x.c, nullptr, 1e-6f, D, of.c);
+    MTL->rms_norm(x.m, nullptr, 1e-6f, D, of.m);
+    compare("rms_norm f32 nogamma", of);
+  }
+  for (int64_t T : {1, 3, 4, 7, 40}) {  // linear
+    auto x = make(DType::BF16, {T, D});
+    auto w = make(DType::BF16, {3072, D}, 0.02f);
+    auto o = zeros(DType::BF16, {T, 3072});
+    CPU->linear(x.c, w.c, o.c);
+    MTL->linear(x.m, w.m, o.m);
+    compare(("linear bf16 T=" + std::to_string(T)).c_str(), o);
+    auto xf = make(DType::F32, {T, D});
+    auto of = zeros(DType::F32, {T, 3072});
+    CPU->linear(xf.c, w.c, of.c);
+    MTL->linear(xf.m, w.m, of.m);
+    compare(("linear f32 T=" + std::to_string(T)).c_str(), of);
+  }
+  {  // attn residual
+    int64_t T = 3;
+    auto s0 = make(DType::BF16, {T, D}, 2.0f), s1 = make(DType::F32, {T, D}, 1.0f), s2 = make(DType::F32, {T, D}, 5.0f);
+    auto q = make(DType::F32, {3, D}, 0.05f);
+    auto o = zeros(DType::F32, {3, T, D});
+    CPU->attn_residual({&s0.c, &s1.c, &s2.c}, q.c, o.c);
+    MTL->attn_residual({&s0.m, &s1.m, &s2.m}, q.m, o.m);
+    compare("attn_residual nq=3", o, 1e-5);
+  }
+  {  // controller
+    int64_t T = 2;
+    auto x = make(DType::F32, {T, D}), m = make(DType::F32, {4, T, D});
+    auto dn = make(DType::BF16, {64, 2 * D}, 0.02f), fg = make(DType::BF16, {D, 64}, 0.1f),
+         gn = make(DType::BF16, {D, 64}, 0.1f);
+    auto o = zeros(DType::F32, {T, D});
+    Tensor mc = m.c, mm = m.m;  // second message row view [T,D]
+    mc.offset += T * D * 4;
+    mm.offset += T * D * 4;
+    mc.set_shape({T, D});
+    mm.set_shape({T, D});
+    CPU->controller(x.c, mc, dn.c, fg.c, gn.c, o.c);
+    MTL->controller(x.m, mm, dn.m, fg.m, gn.m, o.m);
+    compare("controller", o, 1e-4);
+  }
+  for (int64_t C : {1024, 2304}) {  // short conv, two calls to exercise the state
+    auto w = make(DType::BF16, {C, 4}, 0.3f);
+    auto st = zeros(DType::F32, {3, C});
+    for (int64_t T : {5, 1}) {
+      auto x = make(DType::BF16, {T, C});
+      auto o = zeros(DType::BF16, {T, C});
+      CPU->short_conv(x.c, w.c, st.c, o.c);
+      MTL->short_conv(x.m, w.m, st.m, o.m);
+      compare(("short_conv C=" + std::to_string(C) + " T=" + std::to_string(T)).c_str(), o, 0, 0);
+    }
+    compare("short_conv state", st, 0);
+  }
+  {  // dyn conv
+    int64_t C = 1024;
+    auto sw = make(DType::BF16, {4, C}, 0.3f);
+    auto st = zeros(DType::F32, {3, C});
+    for (int64_t T : {6, 1}) {
+      auto x = make(DType::BF16, {T, C});
+      auto dy = make(DType::BF16, {T, 32}, 0.3f);
+      auto o = zeros(DType::BF16, {T, C});
+      CPU->dyn_conv(x.c, dy.c, sw.c, st.c, o.c);
+      MTL->dyn_conv(x.m, dy.m, sw.m, st.m, o.m);
+      compare(("dyn_conv T=" + std::to_string(T)).c_str(), o, 0, 0);
+    }
+  }
+  {  // l2 clip
+    int64_t T = 4;
+    auto x = make(DType::BF16, {T, 24, 128}, 4.0f);
+    auto sc = make(DType::BF16, {24, 128}, 0.1f, 1.0f);
+    auto tau = make(DType::F32, {T}, 0.05f, 1.1f);
+    auto o = zeros(DType::BF16, {T, 24, 128});
+    CPU->l2_clip(x.c, &sc.c, 22.627417f, &tau.c, o.c);
+    MTL->l2_clip(x.m, &sc.m, 22.627417f, &tau.m, o.m);
+    compare("l2_clip scale+tau", o, 0, 0);
+    auto r = make(DType::BF16, {T, 24, 16}, 4.0f);
+    auto ro = zeros(DType::BF16, {T, 24, 16});
+    CPU->l2_clip(r.c, nullptr, 8.0f, nullptr, ro.c);
+    MTL->l2_clip(r.m, nullptr, 8.0f, nullptr, ro.m);
+    compare("l2_clip d=16", ro, 0, 0);
+  }
+  {  // elementwise
+    auto a = make(DType::BF16, {3, D}, 2.0f), b = make(DType::F32, {3, D}, 2.0f);
+    auto o = zeros(DType::BF16, {3, D}), of = zeros(DType::F32, {3, D});
+    CPU->sigmoid_gate(a.c, b.c, o.c);
+    MTL->sigmoid_gate(a.m, b.m, o.m);
+    compare("sigmoid_gate", o, 0, 1);
+    CPU->add(a.c, b.c, of.c);
+    MTL->add(a.m, b.m, of.m);
+    compare("add f32", of, 0);
+    CPU->cast(b.c, o.c);
+    MTL->cast(b.m, o.m);
+    compare("cast f32->bf16", o, 0, 0);
+  }
+  // attention: global (linear cache) and local (wrapped ring)
+  for (int local = 0; local < 2; local++) {
+    int64_t T = local ? 2 : 3, cap = local ? 1536 : 4096, len = local ? 2000 : 1500;
+    auto q = make(DType::BF16, {T, 24, 128}, 0.5f), kn = make(DType::BF16, {T, 8, 128}, 0.5f),
+         vn = make(DType::BF16, {T, 8, 128});
+    auto r = make(DType::BF16, {T, 24, 16}, 1.0f), rp = make(DType::BF16, {16, 1024}, 0.5f),
+         sk = make(DType::BF16, {T, 24}, 1.0f);
+    auto kc = make(DType::BF16, {8, cap, 128}, 0.5f), vc = make(DType::BF16, {8, cap, 128});
+    auto o = zeros(DType::BF16, {T, 24 * 128});
+    AttnArgs ac{q.c, kn.c, vn.c, r.c, rp.c, sk.c, KvView{kc.c, vc.c, cap, len, bool(local)}, local ? 1024 : 0};
+    AttnArgs am{q.m, kn.m, vn.m, r.m, rp.m, sk.m, KvView{kc.m, vc.m, cap, len, bool(local)}, local ? 1024 : 0};
+    CPU->attention(ac, o.c);
+    MTL->attention(am, o.m);
+    compare(local ? "attention local ring" : "attention global", o, 0, 2);
+    CPU->kv_append(kn.c, vn.c, ac.kv);
+    MTL->kv_append(kn.m, vn.m, am.kv);
+    compare("kv_append k", kc, 0, 0);
+    if (ac.kv.len != am.kv.len) {
+      printf("kv_append len mismatch\n");
+      fails++;
+    }
+  }
+
+  // MoE and router with real weights: layer 0 (NVFP4) and layer 23 (MXFP8)
+  SafeTensors st;
+  st.add_dir(dir);
+  for (int layer : {0, 23}) {
+    std::string pre = "language_model.model.layers." + std::to_string(layer) + ".mlp.";
+    auto load = [&](const std::string& n) -> Pair {
+      const auto& e = st.at(pre + n);
+      return {CPU->load_weight(e), MTL->load_weight(e)};
+    };
+    MoeWeights mc, mm;
+    auto gw = load("gate_weight"), bias = load("e_score_correction_bias");
+    mc.gate_w = gw.c, mm.gate_w = gw.m, mc.bias = bias.c, mm.bias = bias.m;
+    QuantMode mode = layer < 20 ? QuantMode::NVFP4 : QuantMode::MXFP8;
+    for (const char* pj : {"gate_proj", "up_proj", "down_proj"}) {
+      std::string b = std::string("switch_mlp.") + pj + ".";
+      auto w = load(b + "weight"), s = load(b + "scales");
+      Pair g{};
+      if (mode == QuantMode::NVFP4) g = load(b + "weight_scale_2");
+      int64_t n = w.c.dim(1), k = mode == QuantMode::NVFP4 ? w.c.dim(2) * 8 : w.c.dim(2) * 4;
+      QuantProj qc{mode, w.c, s.c, g.c, n, k}, qm{mode, w.m, s.m, g.m, n, k};
+      if (pj[0] == 'g') mc.gate = qc, mm.gate = qm;
+      else if (pj[0] == 'u') mc.up = qc, mm.up = qm;
+      else mc.down = qc, mm.down = qm;
+    }
+    for (int64_t T : {1, 5}) {
+      auto x = make(DType::BF16, {T, D}, 1.0f);
+      auto ic = zeros(DType::I32, {T, 8}), wc = zeros(DType::F32, {T, 8});
+      CPU->router(x.c, mc, 8, 8.0f, ic.c, wc.c);
+      MTL->router(x.m, mm, 8, 8.0f, ic.m, wc.m);
+      MTL->sync();
+      std::vector<int32_t> i1(T * 8), i2(T * 8);
+      CPU->read(ic.c, i1.data(), T * 32);
+      MTL->read(ic.m, i2.data(), T * 32);
+      int same = 0;
+      for (size_t i = 0; i < i1.size(); i++) same += i1[i] == i2[i];
+      printf("router L%d T=%lld: idx same %d/%zu (order-sensitive)\n", layer, (long long)T, same, i1.size());
+      if (same != int(i1.size())) fails++;
+      compare("router weights", wc, 1e-5);
+      // MoE on the CPU's routes (same idx/w on both)
+      MTL->write(ic.m, i1.data(), T * 32);
+      std::vector<float> wv(T * 8);
+      CPU->read(wc.c, wv.data(), T * 32);
+      MTL->write(wc.m, wv.data(), T * 32);
+      auto o = zeros(DType::BF16, {T, D});
+      CPU->moe(x.c, ic.c, wc.c, mc, o.c);
+      MTL->moe(x.m, ic.m, wc.m, mm, o.m);
+      compare((std::string("moe ") + (layer < 20 ? "nvfp4" : "mxfp8") + " T=" + std::to_string(T)).c_str(), o, 0,
+              2, 0.01);  // three bf16 roundings (g/u, act, down) after differently ordered fp32 sums
+    }
+  }
+  {  // logits (small random head)
+    auto h = make(DType::F32, {2, D}, 1.0f);
+    auto head = make(DType::BF16, {1000, D}, 0.05f);
+    auto o = zeros(DType::F32, {2, 900});
+    CPU->logits(h.c, head.c, 900, 30.0f, o.c);
+    MTL->logits(h.m, head.m, 900, 30.0f, o.m);
+    compare("logits", o, 1e-5);
+  }
+  printf("%s: %d failing\n", fails ? "FAILED" : "ALL OK", fails);
+  return fails ? 1 : 0;
+}

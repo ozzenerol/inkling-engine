@@ -1,0 +1,443 @@
+// MetalBackend: ink::Backend on the GPU. Owner: B. Ops only encode into the current command buffer; sync()
+// commits and waits. Rounding points follow src/model/backend.h.
+#include <cmath>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <stdexcept>
+#include <string>
+#include <unordered_map>
+
+#include "gpu/context.h"
+#include "model/backend.h"
+
+namespace ink {
+namespace {
+
+using gpu::Buf;
+using gpu::Context;
+using gpu::Dim3;
+
+[[noreturn]] void fail(const std::string& m) { throw std::runtime_error("metal backend: " + m); }
+
+uint32_t dtc(DType d) {
+  if (d == DType::F32) return 0;
+  if (d == DType::BF16) return 1;
+  fail(std::string("unsupported dtype ") + dtype_name(d));
+}
+const char* dtn(DType d) { return d == DType::F32 ? "f32" : "bf16"; }
+
+Buf bufof(const Tensor& t) {
+  Buf b;
+  b.mtl = t.buf;
+  b.host = t.host;
+  return b;
+}
+
+struct MatvecShape {
+  uint32_t N, K, T, x_stride, y_stride;
+};
+struct EwParams {
+  uint32_t n, dt_a, dt_b, dt_out;
+};
+struct EmbedParams {
+  uint32_t T, D;
+};
+struct RmsParams {
+  uint32_t rows, dim;
+  float eps;
+  uint32_t has_gamma, dt_x, dt_out;
+};
+struct LinParams {
+  uint32_t T, N, K, dt_x, dt_out;
+};
+struct ResParams {
+  uint32_t T, D, nb, nq;
+  uint32_t dt[8];
+};
+struct CtrlParams {
+  uint32_t T, D, R, m_stride;
+};
+struct ConvParams {
+  uint32_t T, C, heads;
+};
+struct ClipParams {
+  uint32_t rows, d, H;
+  float thr;
+  uint32_t has_scale, has_tau;
+};
+struct KvAppendParams {
+  uint32_t T, heads, cap, pos0, ring;
+};
+struct AttnParams {
+  uint32_t T, H, KVH, cap, len, ring, window, rel_extent;
+};
+struct RouterParams {
+  uint32_t T, D, E, topk, dt_x;
+  float scale;
+};
+struct QmvParams {
+  uint32_t N, K, routes, x_div, mode;
+};
+struct CombineParams {
+  uint32_t T, D, topk;
+};
+struct SoftcapParams {
+  uint32_t n;
+  float cap;
+};
+
+uint32_t cdiv(uint64_t a, uint64_t b) { return uint32_t((a + b - 1) / b); }
+
+class MetalBackend final : public Backend {
+ public:
+  MetalBackend() : g_(Context::get()) {}
+  ~MetalBackend() override {
+    sync();
+    for (auto& [k, b] : scratch_) g_.release(b);
+  }
+  const char* name() const override { return "metal"; }
+
+  // ---------------------------------------------------------------- memory
+  Tensor alloc(DType dt, std::initializer_list<int64_t> shape, const char* tag) override {
+    Tensor t;
+    t.dtype = dt;
+    t.set_shape(shape);
+    Buf b = g_.alloc(t.nbytes(), tag, true);
+    memset(b.host, 0, b.size);
+    t.buf = b.mtl;
+    t.host = b.host;
+    sizes_[t.buf] = b.size;
+    return t;
+  }
+  void free(Tensor& t) override {
+    if (!t.buf) return;
+    sync();
+    Buf b = bufof(t);
+    b.size = sizes_[t.buf];
+    sizes_.erase(t.buf);
+    g_.release(b);
+    t = Tensor{};
+  }
+  Tensor load_weight(const SafeTensors::Entry& e) override {
+    Buf b = g_.load_file(e.file, e.offset, e.bytes, "weights");
+    Tensor t;
+    t.dtype = e.dtype;
+    t.ndim = e.ndim;
+    for (int i = 0; i < 4; i++) t.shape[i] = e.shape[i];
+    t.buf = b.mtl;
+    t.host = b.host;
+    sizes_[t.buf] = b.size;
+    return t;
+  }
+  void sync() override {
+    g_.commit_and_wait();
+    pending_ = false;
+  }
+  void copy(const Tensor& src, Tensor& dst, size_t src_off, size_t dst_off, size_t bytes) override {
+    if (bytes == 0) bytes = src.nbytes();
+    g_.blit_copy(bufof(src), src.offset + src_off, bufof(dst), dst.offset + dst_off, bytes);
+    pending_ = true;
+  }
+  void read(const Tensor& t, void* dst, size_t bytes, size_t off) override {
+    if (pending_) sync();
+    memcpy(dst, (const char*)t.host + t.offset + off, bytes);
+  }
+  void write(Tensor& t, const void* src, size_t bytes, size_t off) override {
+    if (pending_) sync();  // the GPU may still read the old contents
+    memcpy((char*)t.host + t.offset + off, src, bytes);
+  }
+
+  // ---------------------------------------------------------------- helpers
+  void bind(uint32_t i, const Tensor& t) { g_.set_buffer(i, bufof(t), t.offset); }
+  void pipe(const std::string& name) {
+    g_.set_pipeline(g_.pipeline(name));
+    pending_ = true;
+  }
+  // Scratch buffers reused across ops (serial encoder orders the uses). Grown buffers are retired at sync.
+  Tensor scratch(const char* key, DType dt, std::initializer_list<int64_t> shape) {
+    Tensor t;
+    t.dtype = dt;
+    t.set_shape(shape);
+    auto& b = scratch_[key];
+    if (b.size < t.nbytes()) {
+      if (b.mtl) {
+        sync();
+        g_.release(b);
+      }
+      b = g_.alloc(std::max<size_t>(t.nbytes(), 1 << 20), key, true);
+    }
+    t.buf = b.mtl;
+    t.host = b.host;
+    return t;
+  }
+
+  // ---------------------------------------------------------------- ops
+  void embed(const Tensor& ids, const Tensor& table, Tensor& out) override {
+    EmbedParams p{uint32_t(ids.numel()), uint32_t(table.dim(-1))};
+    pipe("embed_rows");
+    bind(0, ids);
+    bind(1, table);
+    bind(2, out);
+    g_.set_value(3, p);
+    g_.dispatch({cdiv(p.D, 256), p.T, 1}, {256, 1, 1});
+  }
+
+  void rms_norm(const Tensor& x, const Tensor* gamma, float eps, int64_t dim, Tensor& out) override {
+    bool hg = gamma && gamma->valid();
+    RmsParams p{uint32_t(x.numel() / dim), uint32_t(dim), eps, hg ? 1u : 0u, dtc(x.dtype), dtc(out.dtype)};
+    if (hg && gamma->dtype != DType::BF16) fail("rms_norm gamma must be bf16");
+    pipe("rms_norm_rows");
+    bind(0, x);
+    bind(1, hg ? *gamma : x);
+    bind(2, out);
+    g_.set_value(3, p);
+    g_.dispatch({p.rows, 1, 1}, {256, 1, 1});
+  }
+
+  void linear(const Tensor& x, const Tensor& w, Tensor& out) override {
+    if (w.dtype != DType::BF16) fail("linear weight must be bf16");
+    uint32_t K = uint32_t(w.dim(1)), N = uint32_t(w.dim(0));
+    uint32_t T = uint32_t(x.numel() / K);
+    linear_rows(x, w, out, T, N, K, 0);
+  }
+  // rows of out computed: [0, N) of w; out row stride = N.
+  void linear_rows(const Tensor& x, const Tensor& w, Tensor& out, uint32_t T, uint32_t N, uint32_t K,
+                   uint32_t /*unused*/) {
+    if (K % 8 == 0 && T <= 16) {
+      for (uint32_t t0 = 0; t0 < T; t0 += 4) {
+        uint32_t tt = std::min<uint32_t>(4, T - t0);
+        std::string nm = std::string("matvec_bf16_") + dtn(x.dtype) + "_" + dtn(out.dtype) + (tt == 1 ? "_t1" : "_t4") +
+                         "_r4_s2";
+        MatvecShape s{N, K, tt, K, N};
+        pipe(nm);
+        bind(0, w);
+        g_.set_buffer(1, bufof(x), x.offset + size_t(t0) * K * dtype_size(x.dtype));
+        g_.set_buffer(2, bufof(out), out.offset + size_t(t0) * N * dtype_size(out.dtype));
+        g_.set_value(3, s);
+        g_.dispatch({cdiv(N, 8), 1, 1}, {64, 1, 1});
+      }
+      return;
+    }
+    LinParams p{T, N, K, dtc(x.dtype), dtc(out.dtype)};
+    pipe("linear_generic");
+    bind(0, w);
+    bind(1, x);
+    bind(2, out);
+    g_.set_value(3, p);
+    g_.dispatch({cdiv(N, 4), T, 1}, {32, 1, 1});
+  }
+
+  void mix(const std::vector<const Tensor*>& states, const Tensor& query, uint32_t nq, Tensor& out) {
+    if (states.size() > 8 || states.empty()) fail("attn_residual: 1..8 states");
+    uint32_t D = uint32_t(states[0]->dim(-1));
+    ResParams p{};
+    p.T = uint32_t(states[0]->numel() / D);
+    p.D = D;
+    p.nb = uint32_t(states.size());
+    p.nq = nq;
+    pipe("attn_residual_mix");
+    for (uint32_t i = 0; i < 8; i++) {
+      const Tensor& s = *states[std::min<size_t>(i, states.size() - 1)];
+      bind(i, s);
+      p.dt[i] = dtc(s.dtype);
+    }
+    bind(8, query);
+    bind(9, out);
+    g_.set_value(10, p);
+    g_.dispatch({p.T, 1, 1}, {256, 1, 1});
+  }
+  void attn_residual(const std::vector<const Tensor*>& states, const Tensor& query, Tensor& out) override {
+    uint32_t nq = query.ndim == 1 ? 1 : uint32_t(query.dim(0));
+    mix(states, query, nq, out);
+  }
+  void loop_messages(const std::vector<const Tensor*>& states, const Tensor& query, Tensor& out) override {
+    mix(states, query, uint32_t(query.dim(0)), out);
+  }
+
+  void controller(const Tensor& x, const Tensor& m, const Tensor& down, const Tensor& forget, const Tensor& gain,
+                  Tensor& out) override {
+    uint32_t D = uint32_t(x.dim(-1));
+    if (D > 2304 || down.dim(0) > 64) fail("controller: shape");
+    CtrlParams p{uint32_t(x.numel() / D), D, uint32_t(down.dim(0)), D};
+    pipe("controller_mix");
+    bind(0, x);
+    bind(1, m);
+    bind(2, down);
+    bind(3, forget);
+    bind(4, gain);
+    bind(5, out);
+    g_.set_value(6, p);
+    g_.dispatch({p.T, 1, 1}, {256, 1, 1});
+  }
+
+  void short_conv(const Tensor& x, const Tensor& w, Tensor& state, Tensor& out) override {
+    uint32_t C = uint32_t(x.dim(-1));
+    ConvParams p{uint32_t(x.numel() / C), C, 0};
+    pipe("short_conv4");
+    bind(0, x);
+    bind(1, w);
+    bind(2, state);
+    bind(3, out);
+    g_.set_value(4, p);
+    g_.dispatch({cdiv(C, 256), 1, 1}, {256, 1, 1});
+  }
+
+  void dyn_conv(const Tensor& x, const Tensor& dyn, const Tensor& static_w, Tensor& state, Tensor& out) override {
+    uint32_t C = uint32_t(x.dim(-1));
+    ConvParams p{uint32_t(x.numel() / C), C, uint32_t(dyn.dim(-1) / 4)};
+    pipe("dyn_conv4");
+    bind(0, x);
+    bind(1, dyn);
+    bind(2, static_w);
+    bind(3, state);
+    bind(4, out);
+    g_.set_value(5, p);
+    g_.dispatch({cdiv(C, 256), 1, 1}, {256, 1, 1});
+  }
+
+  void l2_clip(const Tensor& x, const Tensor* scale, float thr, const Tensor* tau, Tensor& out) override {
+    uint32_t d = uint32_t(x.dim(-1)), H = uint32_t(x.dim(-2));
+    if (d > 128) fail("l2_clip: d > 128");
+    bool hs = scale && scale->valid(), ht = tau && tau->valid();
+    ClipParams p{uint32_t(x.numel() / d), d, H, thr, hs ? 1u : 0u, ht ? 1u : 0u};
+    pipe("l2_clip_rows");
+    bind(0, x);
+    bind(1, hs ? *scale : x);
+    bind(2, ht ? *tau : x);
+    bind(3, out);
+    g_.set_value(4, p);
+    g_.dispatch({p.rows, 1, 1}, {32, 1, 1});
+  }
+
+  void ew(const char* k, const Tensor& a, const Tensor* b, Tensor& out) {
+    EwParams p{uint32_t(out.numel()), dtc(a.dtype), b ? dtc(b->dtype) : 0u, dtc(out.dtype)};
+    pipe(k);
+    bind(0, a);
+    bind(1, b ? *b : a);
+    bind(2, out);
+    g_.set_value(3, p);
+    g_.dispatch({cdiv(p.n, 256), 1, 1}, {256, 1, 1});
+  }
+  void sigmoid_gate(const Tensor& a, const Tensor& gt, Tensor& out) override { ew("ew_sigmoid_gate", a, &gt, out); }
+  void add(const Tensor& a, const Tensor& b, Tensor& out) override { ew("ew_add", a, &b, out); }
+  void cast(const Tensor& a, Tensor& out) override { ew("ew_cast", a, nullptr, out); }
+
+  void attention(const AttnArgs& a, Tensor& out) override {
+    uint32_t T = uint32_t(a.q.dim(0)), H = uint32_t(a.q.dim(1)), KVH = uint32_t(a.k_new.dim(1));
+    AttnParams p{T, H, KVH, uint32_t(a.kv.cap), uint32_t(a.kv.len), a.kv.ring ? 1u : 0u, uint32_t(a.window),
+                 uint32_t(a.rel_proj.dim(1))};
+    pipe("attention_generic");
+    bind(0, a.q);
+    bind(1, a.k_new);
+    bind(2, a.v_new);
+    bind(3, a.r);
+    bind(4, a.rel_proj);
+    bind(5, a.sink);
+    bind(6, a.kv.k.valid() ? a.kv.k : a.k_new);
+    bind(7, a.kv.v.valid() ? a.kv.v : a.v_new);
+    bind(8, out);
+    g_.set_value(9, p);
+    g_.dispatch({T, H, 1}, {256, 1, 1});
+  }
+
+  void kv_append(const Tensor& k_new, const Tensor& v_new, KvView& kv) override {
+    uint32_t T = uint32_t(k_new.dim(0)), heads = uint32_t(k_new.dim(1));
+    if (!kv.ring && kv.len + T > kv.cap) fail("kv_append: global cache full");
+    KvAppendParams p{T, heads, uint32_t(kv.cap), uint32_t(kv.len), kv.ring ? 1u : 0u};
+    pipe("kv_append_rows");
+    bind(0, k_new);
+    bind(1, v_new);
+    bind(2, kv.k);
+    bind(3, kv.v);
+    g_.set_value(4, p);
+    g_.dispatch({1, heads, T}, {128, 1, 1});
+    kv.len += T;
+  }
+
+  void router(const Tensor& x, const MoeWeights& m, int topk, float scale, Tensor& idx, Tensor& w) override {
+    uint32_t D = uint32_t(x.dim(-1));
+    RouterParams p{uint32_t(x.numel() / D), D, uint32_t(m.gate_w.dim(0)), uint32_t(topk), dtc(x.dtype), scale};
+    if (p.E > 128 || topk > 16) fail("router: shape");
+    pipe("router_topk");
+    bind(0, x);
+    bind(1, m.gate_w);
+    bind(2, m.bias);
+    bind(3, idx);
+    bind(4, w);
+    g_.set_value(5, p);
+    g_.dispatch({p.T, 1, 1}, {256, 1, 1});
+  }
+
+  void qmv(const QuantProj& q, const Tensor& x, const Tensor& idx, uint32_t routes, uint32_t x_div, Tensor& out) {
+    QmvParams p{uint32_t(q.n), uint32_t(q.k), routes, x_div, q.mode == QuantMode::NVFP4 ? 0u : 1u};
+    pipe("qmv_experts");
+    bind(0, q.weight);
+    bind(1, q.scales);
+    bind(2, q.global.valid() ? q.global : q.scales);
+    bind(3, x);
+    bind(4, idx);
+    bind(5, out);
+    g_.set_value(6, p);
+    g_.dispatch({cdiv(p.N, 8), routes, 1}, {64, 1, 1});
+  }
+
+  void moe(const Tensor& x, const Tensor& idx, const Tensor& w, const MoeWeights& m, Tensor& out) override {
+    if (x.dtype != DType::BF16) fail("moe: x must be bf16");
+    uint32_t D = uint32_t(x.dim(-1)), T = uint32_t(x.numel() / D), topk = uint32_t(idx.dim(-1));
+    uint32_t routes = T * topk, I = uint32_t(m.gate.n);
+    Tensor gt = scratch("moe-g", DType::BF16, {routes, I});
+    Tensor ut = scratch("moe-u", DType::BF16, {routes, I});
+    Tensor at = scratch("moe-a", DType::BF16, {routes, I});
+    Tensor dt = scratch("moe-d", DType::BF16, {routes, D});
+    qmv(m.gate, x, idx, routes, topk, gt);
+    qmv(m.up, x, idx, routes, topk, ut);
+    uint32_t n = routes * I;
+    pipe("softcap_swiglu");
+    bind(0, gt);
+    bind(1, ut);
+    bind(2, at);
+    g_.set_value(3, n);
+    g_.dispatch({cdiv(n, 256), 1, 1}, {256, 1, 1});
+    qmv(m.down, at, idx, routes, 1, dt);
+    CombineParams cp{T, D, topk};
+    pipe("moe_combine");
+    bind(0, dt);
+    bind(1, w);
+    bind(2, out);
+    g_.set_value(3, cp);
+    g_.dispatch({cdiv(D, 256), T, 1}, {256, 1, 1});
+  }
+
+  void logits(const Tensor& h, const Tensor& head, int64_t vocab, float softcap, Tensor& out) override {
+    uint32_t D = uint32_t(h.dim(-1)), T = uint32_t(h.numel() / D);
+    Tensor hb = scratch("logits-h", DType::F32, {T, D});
+    uint32_t n = T * D;
+    pipe("round_bf_f32");
+    bind(0, h);
+    bind(1, hb);
+    g_.set_value(2, n);
+    g_.dispatch({cdiv(n, 256), 1, 1}, {256, 1, 1});
+    // Only the first `vocab` rows of the head are needed; out row stride = vocab.
+    linear_rows(hb, head, out, T, uint32_t(vocab), D, 0);
+    if (softcap > 0) {
+      SoftcapParams sp{uint32_t(T * vocab), softcap};
+      pipe("softcap_f32");
+      bind(0, out);
+      g_.set_value(1, sp);
+      g_.dispatch({cdiv(sp.n, 256), 1, 1}, {256, 1, 1});
+    }
+  }
+
+ private:
+  Context& g_;
+  bool pending_ = false;
+  std::unordered_map<void*, size_t> sizes_;
+  std::unordered_map<std::string, Buf> scratch_;
+};
+
+}  // namespace
+
+std::unique_ptr<Backend> make_metal_backend() { return std::make_unique<MetalBackend>(); }
+
+}  // namespace ink
