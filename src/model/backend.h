@@ -125,6 +125,34 @@ class Backend {
   // MoE: for each route: g = bf16(x @ Wg^T), u = bf16(x @ Wu^T) (dequantized, fp32 acc);
   // a = bf16(tanh(g/4)*4*sigmoid(g)*tanh(u/25)*25); d = bf16(a @ Wd^T); out = bf16(sum_k f32(d_k) * w_k).
   virtual void moe(const Tensor& x, const Tensor& idx, const Tensor& w, const MoeWeights& m, Tensor& out) = 0;
+  // ---- Fused ops (B). Defaults are the exact primitive sequences model.cpp used before; MetalBackend overrides.
+  // Local-layer attention prep: k/v short convs, l2_clip q (q_scale), l2_clip k, rms_norm v (no gamma, dim 128),
+  // l2_clip r (rel_scale), in that order. kc, vc: bf16 [T, KVH*HD] conv outputs (scratch); k3, v3 outputs.
+  virtual void attn_prep_local(const Tensor& kraw, const Tensor& vraw, const Tensor& k_conv, const Tensor& v_conv,
+                               Tensor& kstate, Tensor& vstate, Tensor* khist, Tensor* vhist, Tensor& q3,
+                               const Tensor& q_scale, Tensor& r3, const Tensor& rel_scale, float qk_clip,
+                               float rel_clip, float eps, Tensor& kc, Tensor& vc, Tensor& k3, Tensor& v3) {
+    short_conv(kraw, k_conv, kstate, kc, khist);
+    short_conv(vraw, v_conv, vstate, vc, vhist);
+    l2_clip(q3, &q_scale, qk_clip, nullptr, q3);
+    Tensor kc3 = kc;
+    kc3.set_shape({k3.dim(0), k3.dim(1), k3.dim(2)});
+    l2_clip(kc3, nullptr, qk_clip, nullptr, k3);
+    rms_norm(vc, nullptr, eps, k3.dim(2), v3);
+    l2_clip(r3, &rel_scale, rel_clip, nullptr, r3);
+  }
+  // attention() then sigmoid_gate(out, gate, out).
+  virtual void attention_gated(const AttnArgs& a, const Tensor& gate, Tensor& out) {
+    attention(a, out);
+    sigmoid_gate(out, gate, out);
+  }
+  // short_conv(x -> tmp bf16) then add(tmp, other, out).
+  virtual void conv_add(const Tensor& x, const Tensor& w, Tensor& state, Tensor* hist, const Tensor& other,
+                        Tensor& tmp, Tensor& out) {
+    short_conv(x, w, state, tmp, hist);
+    add(tmp, other, out);
+  }
+
   // Logits: hb = f32(bf16(h)); z = hb @ f32(head)^T; out = tanh(z/30)*30, first `vocab` columns. h f32 [T,D].
   virtual void logits(const Tensor& h, const Tensor& head, int64_t vocab, float softcap, Tensor& out) = 0;
 };

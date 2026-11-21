@@ -295,22 +295,23 @@ void Model::run_visit(int v, Tensor& x, std::vector<Tensor>& blocks, const Tenso
       hist_views_[i] = row_view(s.hist[i], 0, {T, 3, C});
       hist[i] = &hist_views_[i];
     }
+  Tensor tau = view(tau_, {T});
+  Tensor q3 = view(q_, {T, H, HD});
+  Tensor k3 = view(k_, {T, KVH, HD}), kc3 = view(kc_, {T, KVH, HD});
+  Tensor v3 = view(v_, {T, KVH, HD});
+  Tensor r3 = view(r_, {T, H, cfg_.d_rel});
   if (w.local) {
-    be_.short_conv(kraw, w.k_conv, s.conv[0], kc, hist[0]);
-    be_.short_conv(vraw, w.v_conv, s.conv[1], vc, hist[1]);
+    // fused (B): short convs, l2_clip q/k/r, rms v -- same order and math as the primitive sequence
+    be_.attn_prep_local(kraw, vraw, w.k_conv, w.v_conv, s.conv[0], s.conv[1], hist[0], hist[1], q3, w.q_scale, r3,
+                        w.rel_scale, cfg_.qk_clip, cfg_.rel_clip, cfg_.rms_eps, kc, vc, k3, v3);
   } else {
     be_.dyn_conv(kraw, dk, w.k_static, s.conv[0], kc, hist[0]);
     be_.dyn_conv(vraw, dv, w.v_static, s.conv[1], vc, hist[1]);
+    be_.l2_clip(q3, &w.q_scale, cfg_.qk_clip, &tau, q3);
+    be_.l2_clip(kc3, nullptr, cfg_.qk_clip, nullptr, k3);
+    be_.rms_norm(vc, nullptr, cfg_.rms_eps, HD, v3);
+    be_.l2_clip(r3, &w.rel_scale, cfg_.rel_clip, &tau, r3);
   }
-  Tensor tau = view(tau_, {T});
-  Tensor q3 = view(q_, {T, H, HD});
-  be_.l2_clip(q3, &w.q_scale, cfg_.qk_clip, w.local ? nullptr : &tau, q3);
-  Tensor k3 = view(k_, {T, KVH, HD}), kc3 = view(kc_, {T, KVH, HD});
-  be_.l2_clip(kc3, nullptr, cfg_.qk_clip, nullptr, k3);
-  Tensor v3 = view(v_, {T, KVH, HD});
-  be_.rms_norm(vc, nullptr, cfg_.rms_eps, HD, v3);
-  Tensor r3 = view(r_, {T, H, cfg_.d_rel});
-  be_.l2_clip(r3, &w.rel_scale, cfg_.rel_clip, w.local ? nullptr : &tau, r3);
   dbg("q", q3);
   dbg("k", k3);
   dbg("v", v3);
@@ -326,24 +327,23 @@ void Model::run_visit(int v, Tensor& x, std::vector<Tensor>& blocks, const Tenso
   aa.kv = s.kv;
   aa.window = w.local ? cfg_.window : 0;
   Tensor at = view(attn_, {T, H * HD});
-  be_.attention(aa, at);
+  be_.attention_gated(aa, g, at);  // attention + sigmoid gate (fused on Metal)
   dbg("attn", at);
   be_.kv_append(k3, v3, s.kv);
-  be_.sigmoid_gate(at, g, at);
   Tensor ao = view(ao_, {T, D});
   be_.linear(at, w.o_proj, ao);
   dbg("o", ao);
 
   // ---- residual + MoE ----
   Tensor resb = view(resb_, {T, D}), res = view(res_, {T, D});
-  be_.short_conv(ao, w.attn_sconv, s.conv[2], resb, hist[2]);
   if (boundary) {
+    be_.short_conv(ao, w.attn_sconv, s.conv[2], resb, hist[2]);
     Tensor blk = view(blk_[blocks.size()], {T, D});
     be_.copy(x, blk);
     blocks.push_back(blk);
     be_.cast(resb, res);
   } else {
-    be_.add(resb, x, res);
+    be_.conv_add(ao, w.attn_sconv, s.conv[2], hist[2], x, resb, res);  // conv + residual add (fused on Metal)
   }
   Tensor hid = view(hid_, {1, T, D});
   {
@@ -367,8 +367,7 @@ void Model::run_visit(int v, Tensor& x, std::vector<Tensor>& blocks, const Tenso
   be_.moe(hn, ridx, rw, w.moe, mo);
   dbg("moe", mo);
   Tensor mc = view(mo_, {T, D});
-  be_.short_conv(mo, w.mlp_sconv, s.conv[3], mc, hist[3]);
-  be_.add(res, mc, x);  // new x (bf16)
+  be_.conv_add(mo, w.mlp_sconv, s.conv[3], hist[3], res, mc, x);  // x = res + conv(mo) (bf16; fp32 add commutes)
   dbg("res", res);
   dbg("out", x);
 }

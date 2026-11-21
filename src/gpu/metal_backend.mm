@@ -46,6 +46,14 @@ struct MatvecMultiParams {
   uint32_t row_start[9];
   uint32_t dt_out[8];
 };
+struct PrepParams {
+  uint32_t T, H, KVH;
+  float qk_thr, rel_thr, eps;
+  uint32_t has_hist;
+};
+struct ConvAddParams {
+  uint32_t T, C, has_hist, dt_other, dt_out;
+};
 struct EwParams {
   uint32_t n, dt_a, dt_b, dt_out;
 };
@@ -86,6 +94,9 @@ struct KvAppendParams {
 };
 struct AttnParams {
   uint32_t T, H, KVH, cap, len, ring, window, rel_extent, use_gate;
+};
+struct AgParams {  // kernels/attn_gemm.metal
+  uint32_t T, rows, rows_pad, H, KVH, cap, len, ring, window, rel_extent, j0, n, use_gate, t0;
 };
 struct AttnDecParams {
   uint32_t T, H, KVH, cap, len, ring, window, rel_extent, split_keys, nsplit, causal, first, use_sink, use_gate;
@@ -515,6 +526,10 @@ class MetalBackend final : public Backend {
     }
     AttnParams p{T, H, KVH, uint32_t(a.kv.cap), uint32_t(a.kv.len), a.kv.ring ? 1u : 0u, uint32_t(a.window),
                  uint32_t(a.rel_proj.dim(1)), gate ? 1u : 0u};
+    if (H == 3 * KVH && T >= ag_min_t_ && !getenv("INK_ATTN_SLOW")) {
+      attention_gemm(a, gate, out);
+      return;
+    }
     if (H == 3 * KVH && !getenv("INK_ATTN_SLOW")) {
       pipe("attn_prefill");
       bind(0, a.q);
@@ -544,6 +559,81 @@ class MetalBackend final : public Backend {
     bind(8, out);
     g_.set_value(9, p);
     g_.dispatch({T, H, 1}, {256, 1, 1});
+  }
+
+  // Prefill attention as matrix products (kernels/attn_gemm.metal, owner A; port of saetta's attention_gemm).
+  void attention_gemm(const AttnArgs& a, const Tensor* gate, Tensor& out) {
+    const uint32_t T = uint32_t(a.q.dim(0)), H = uint32_t(a.q.dim(1)), KVH = uint32_t(a.k_new.dim(1));
+    const uint32_t KEYS = 1024, slice = 2048;
+    const uint32_t len = uint32_t(a.kv.len), window = uint32_t(a.window), ext = uint32_t(a.rel_proj.dim(1));
+    const uint32_t rows_pad = cdiv(std::min(T, slice) * 3, 64) * 64;
+    Tensor sh = scratch("ag-sh", DType::F16, {KVH, rows_pad, KEYS});
+    Tensor tmax = scratch("ag-tmax", DType::F32, {KVH, rows_pad, KEYS / 64});
+    Tensor m1 = scratch("ag-m1", DType::F32, {KVH, rows_pad}), m2 = scratch("ag-m2", DType::F32, {KVH, rows_pad});
+    Tensor l1 = scratch("ag-l1", DType::F32, {KVH, rows_pad}), l2 = scratch("ag-l2", DType::F32, {KVH, rows_pad});
+    Tensor o = scratch("ag-o", DType::F32, {KVH, rows_pad, 128});
+    Tensor rpt = scratch("ag-rpt", DType::F32, {ext, 16});
+    const Tensor& kc = a.kv.k.valid() ? a.kv.k : a.k_new;
+    const Tensor& vc = a.kv.v.valid() ? a.kv.v : a.v_new;
+    AgParams p{T, 0, rows_pad, H, KVH, uint32_t(a.kv.cap), len, a.kv.ring ? 1u : 0u, window, ext, 0, 0,
+               gate ? 1u : 0u, 0};
+    pipe("ag_rel_t");
+    bind(0, a.rel_proj);
+    bind(1, rpt);
+    g_.set_value(2, p);
+    g_.dispatch({cdiv(ext, 64), 1, 1}, {64, 16, 1});
+    for (uint32_t t0 = 0; t0 < T; t0 += slice) {
+      const uint32_t ts = std::min(slice, T - t0), rows = ts * 3, row_tiles = cdiv(rows, 64);
+      p.rows = rows;
+      p.t0 = t0;
+      p.j0 = 0;
+      p.n = 0;
+      pipe("ag_init");
+      bind(0, a.sink);
+      bind(1, m1);
+      bind(2, l1);
+      bind(3, o);
+      g_.set_value(4, p);
+      g_.dispatch({1, rows_pad, KVH}, {8, 1, 1});
+      const uint32_t end = len + t0 + ts;
+      uint32_t first = (window && len + t0 + 1 > window) ? len + t0 + 1 - window : 0;
+      first = first / 64 * 64;
+      bool flip = false;  // false: read m1/l1, write m2/l2
+      for (uint32_t j0 = first; j0 < end; j0 += KEYS) {
+        p.j0 = j0;
+        p.n = std::min(KEYS, end - j0);
+        pipe("ag_scores");
+        bind(0, a.q);
+        bind(1, a.k_new);
+        bind(2, kc);
+        bind(3, sh);
+        bind(4, tmax);
+        bind(5, a.r);
+        bind(6, rpt);
+        g_.set_value(7, p);
+        g_.dispatch({cdiv(p.n, 64), row_tiles, KVH}, {128, 1, 1});
+        pipe("ag_pv");
+        bind(0, sh);
+        bind(1, a.v_new);
+        bind(2, vc);
+        bind(3, o);
+        bind(4, tmax);
+        g_.set_value(5, p);
+        bind(6, flip ? m2 : m1);
+        bind(7, flip ? m1 : m2);
+        bind(8, flip ? l2 : l1);
+        bind(9, flip ? l1 : l2);
+        g_.dispatch({2, row_tiles, KVH}, {128, 1, 1});
+        flip = !flip;
+      }
+      pipe("ag_final");
+      bind(0, o);
+      bind(1, flip ? l2 : l1);
+      bind(2, out);
+      bind(3, gate ? *gate : out);
+      g_.set_value(4, p);
+      g_.dispatch({1, rows, KVH}, {128, 1, 1});
+    }
   }
 
   void kv_append(const Tensor& k_new, const Tensor& v_new, KvView& kv) override {
@@ -762,6 +852,7 @@ class MetalBackend final : public Backend {
   bool skinny_ = false;
   uint32_t split_keys_ = 512;
   uint32_t split_local_ = 64;
+  uint32_t ag_min_t_ = getenv("INK_AG_MIN_T") ? uint32_t(atoi(getenv("INK_AG_MIN_T"))) : 64;  // GEMM attention from this T
   std::string cur_;
   std::map<std::string, std::pair<double, long>> prof_;
   std::unordered_map<void*, size_t> sizes_;

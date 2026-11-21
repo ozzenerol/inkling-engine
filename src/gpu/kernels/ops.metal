@@ -341,6 +341,9 @@ kernel void kv_append_rows(device const ushort* k_new [[buffer(0)]], device cons
                            constant KvAppendParams& p [[buffer(4)]], uint3 gid [[thread_position_in_grid]]) {
   uint d = gid.x, h = gid.y, t = gid.z;
   if (d >= 128 || h >= p.heads || t >= p.T) return;
+  // A ring keeps only the last cap positions: rows that a later row of this call overwrites must not be written,
+  // or rows t and t + cap race for the same slot (chunks longer than the ring).
+  if (p.ring && t + p.cap < p.T) return;
   uint pos = p.pos0 + t;
   uint slot = p.ring ? pos % p.cap : pos;
   size_t dst = (size_t(h) * p.cap + slot) * 128 + d;

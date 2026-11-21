@@ -184,6 +184,37 @@ int main(int argc, char** argv) {
     }
     compare("short_conv state", st, 0);
   }
+  for (int64_t T : {1, 4}) {  // fused attn_prep_local (Metal) vs primitive sequence (CPU default)
+    auto kraw = make(DType::BF16, {T, 1024}), vraw = make(DType::BF16, {T, 1024});
+    auto kw = make(DType::BF16, {1024, 4}, 0.3f), vw = make(DType::BF16, {1024, 4}, 0.3f);
+    auto ks = make(DType::F32, {3, 1024}), vs = make(DType::F32, {3, 1024});
+    auto kh = zeros(DType::F32, {T, 3, 1024}), vh = zeros(DType::F32, {T, 3, 1024});
+    auto q = make(DType::BF16, {T, 24, 128}, 4.0f), r = make(DType::BF16, {T, 24, 16}, 4.0f);
+    auto qs = make(DType::BF16, {24, 128}, 0.1f, 1.0f), rs = make(DType::BF16, {24, 16}, 0.1f, 1.0f);
+    auto kc = zeros(DType::BF16, {T, 1024}), vc = zeros(DType::BF16, {T, 1024});
+    auto k3 = zeros(DType::BF16, {T, 8, 128}), v3 = zeros(DType::BF16, {T, 8, 128});
+    CPU->attn_prep_local(kraw.c, vraw.c, kw.c, vw.c, ks.c, vs.c, &kh.c, &vh.c, q.c, qs.c, r.c, rs.c, 22.627417f, 8.0f,
+                         1e-6f, kc.c, vc.c, k3.c, v3.c);
+    MTL->attn_prep_local(kraw.m, vraw.m, kw.m, vw.m, ks.m, vs.m, &kh.m, &vh.m, q.m, qs.m, r.m, rs.m, 22.627417f, 8.0f,
+                         1e-6f, kc.m, vc.m, k3.m, v3.m);
+    std::string tn = " T=" + std::to_string(T);
+    compare(("prep q" + tn).c_str(), q, 0, 0);
+    compare(("prep r" + tn).c_str(), r, 0, 0);
+    compare(("prep k3" + tn).c_str(), k3, 0, 0);
+    compare(("prep v3" + tn).c_str(), v3, 0, 0);
+    compare(("prep kstate" + tn).c_str(), ks, 0);
+    compare(("prep vhist" + tn).c_str(), vh, 0);
+    // conv_add, f32 out (attn residual) and bf16 out (mlp residual)
+    auto x = make(DType::BF16, {T, 2304}), w = make(DType::BF16, {2304, 4}, 0.3f), st = make(DType::F32, {3, 2304});
+    auto oth = make(DType::BF16, {T, 2304}), tmp = zeros(DType::BF16, {T, 2304}), out = zeros(DType::F32, {T, 2304});
+    CPU->conv_add(x.c, w.c, st.c, nullptr, oth.c, tmp.c, out.c);
+    MTL->conv_add(x.m, w.m, st.m, nullptr, oth.m, tmp.m, out.m);
+    compare(("conv_add f32" + tn).c_str(), out, 0);
+    auto othf = make(DType::F32, {T, 2304}), outb = zeros(DType::BF16, {T, 2304});
+    CPU->conv_add(x.c, w.c, st.c, nullptr, othf.c, tmp.c, outb.c);
+    MTL->conv_add(x.m, w.m, st.m, nullptr, othf.m, tmp.m, outb.m);
+    compare(("conv_add bf16" + tn).c_str(), outb, 0, 0);
+  }
   {  // dyn conv
     int64_t C = 1024;
     auto sw = make(DType::BF16, {4, C}, 0.3f);
@@ -245,8 +276,9 @@ int main(int argc, char** argv) {
     AttnArgs am{q.m, kn.m, vn.m, r.m, rp.m, sk.m, KvView{kc.m, vc.m, cap, len, bool(local)}, local ? 1024 : 0};
     CPU->attention(ac, o.c);
     MTL->attention(am, o.m);
+    // T >= 64 runs A's attention GEMM (P stored as IEEE half): allow 1.5% of elements beyond 2 bf16 ulp
     compare(((local ? "attn local T=" : "attn global T=") + std::to_string(T) + " len=" + std::to_string(len)).c_str(),
-            o, 0, 2);
+            o, 0, 2, T >= 64 ? 0.015 : 0.001);
     CPU->kv_append(kn.c, vn.c, ac.kv);
     MTL->kv_append(kn.m, vn.m, am.kv);
     compare("kv_append k", kc, 0, 0);
@@ -256,6 +288,15 @@ int main(int argc, char** argv) {
     }
   }
 
+  {  // kv_append of a chunk longer than the ring (2048 rows into 1536 slots): last rows win, as on the CPU
+    int64_t T = 2048, cap = 1536;
+    auto kn = make(DType::BF16, {T, 8, 128}), vn = make(DType::BF16, {T, 8, 128});
+    auto kc = zeros(DType::BF16, {8, cap, 128}), vc = zeros(DType::BF16, {8, cap, 128});
+    KvView c{kc.c, vc.c, cap, 700, true}, m{kc.m, vc.m, cap, 700, true};
+    CPU->kv_append(kn.c, vn.c, c);
+    MTL->kv_append(kn.m, vn.m, m);
+    compare("kv_append ring T>cap", kc, 0, 0);
+  }
   // Verify (T=4 at len L) must equal decode (T=1 at len L+t) bit for bit, row by row (speculative identity).
   for (int local = 0; local < 2; local++) {
     int64_t cap = local ? 1536 : 8192, L = local ? 3001 : 4093;  // ring wrapped / split boundary crossing
