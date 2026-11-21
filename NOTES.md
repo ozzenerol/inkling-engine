@@ -827,3 +827,36 @@ Decode floor (A, from the safetensors): a token reads 1.96 GB of experts (5.1 MB
 dense (38 MB per visit) + 0.49 GB head = 4.3 GB: 10.7 ms at 400 GB/s vs the 23 ms plain step (~185 GB/s).
 bench_q8's 756 GB/s (batch 9) is above the M3 Max's 400 GB/s: its matvecs are independent (all read x, write own
 y) and the GPU timestamps may miss work; b/work adds a wall clock to settle it before using it as the in-model gap.
+
+## Batch 11 (main a705011, 23:58-00:10) and the decode / prefill accounting (2026-11-22, one run each)
+
+Gates pass. Depth bench 8-bit: gen 42.1 / 40.6 / 36.6 / 32.3 / 27.9 tok/s, read 807 / 800 / 664 / 507 / 381 at
+1.2k / 9.6k / 39k / 79k / 127k (confirms batch 10). Agent read 47.4 s, TTFT 1.21 s, gen 68.5; copy 92.6; qh PASS.
+
+**The "kernels are 3x slower in the model" gap does not exist.** bench_q8 with a wall clock: 288 q8 matvecs
+(1.37 GB) 3.55 ms GPU / 3.92 ms wall = 349 GB/s (batch 9's 1.8 ms was read before INK_RW existed and its GPU
+timestamps are not trustworthy: DEP=1 reports 1.0 ms GPU for 4.6-5.1 ms wall). As a dependent chain 267-296 GB/s.
+
+**Decode step, 8-bit, per kernel** (INK_PROFILE, p2, 63 steps; sums to the 23 ms step):
+weight readers 13.3 ms = q8 dense matvecs 5.45 (352 calls, 15.5 us, 336 GB/s) + MoE 6.6 (gateup 86 us, down 46 us
+per visit: ~280-300 GB/s) + head 1.25. Floor for the 4.3 GB at 349 GB/s: 12.3 ms. So the readers are at the
+hardware. The other 9.7 ms: local attention 1.86 (attn_decode_split_f1 46 us a call even at 32 keys: ~20 us fixed
++ ~13 us per 32-key block; 56 + 15 combine at a full window), residual mix 2.2 (120 calls, 18-19 us), bf16
+multi-matvec 1.09 (24 calls, 45 us), router_select 0.6, and ~4 ms in ~15 kernels of 0.1-0.4 ms each.
+No single fat target is left: a faster plain step is a grind of 0.5-1 ms pieces (MoE bandwidth to the q8 level
+~1 ms, attention fixed cost / rel-bias precompute ~0.7, mix in two wide dispatches ~0.5).
+
+**Small-kernel latency** (src/gpu/bench/bench_tiny.mm, dependent chain of 4000, us per dispatch): null 1.6;
+elementwise over 2304 threads 1.7 (group size does not matter); rms in one group of 256 + barrier 4.0, of 1024
+3.2; the same work in ONE simdgroup (72-element loops per thread) 11.5-15, fused rms+ew+rms in one simdgroup 19.5.
+Rule: latency = the serial loop length per thread (~0.1 us per element), not the dispatch count (a dispatch is
+~1.7 us). Spread over more threads, never fuse by lengthening per-thread loops (explains the chain dead end).
+
+**Prefill at short context is compute bound at the GPU's rate**: profiles at 800 and 2048 tokens fit
+time = 179 ms + 1.055 ms/token per chunk. An 800-token chunk is ~7.8 TFLOP (MoE 4.9, dense 2.9) in 1.02 s.
+The fixed 179 ms per chunk is half expert weight reads (every visit touches all 128 experts: 31 GB, ~90 ms) and
+the rest partly-filled tiles. So short agent turns (~650-700 tok/s) cannot reach the 2048-chunk rate by tuning.
+
+Server (c/work 33f3f4b): the system prompt + tools prefix is pinned during the first prefill (prefix hint from
+rendering the leading system messages alone), so session 2 restores it; stub test added. First SSE chunk was
+already sent before the prefill.
