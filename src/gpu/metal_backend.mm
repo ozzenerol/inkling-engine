@@ -914,9 +914,10 @@ class MetalBackend final : public Backend {
       // D: global attention read straight from device memory, two passes (kernels/multirow_ga.metal). One
       // arithmetic for every T, so verify rows equal decode rows.
       const uint32_t len = uint32_t(a.kv.len), nkeys = len + T;
-      // tokens per row group (3 rows each); INK_GA_TOK=1|2 forces smaller groups (bench: K/V are then re-read)
-      const uint32_t tok = std::min<uint32_t>(ga_tok_, T == 1 ? 1 : T == 2 ? 2 : 4);
-      const uint32_t R = 3 * tok, groups = cdiv(T, tok), sr = 3 * T;
+      // tokens (simdgroups) per threadgroup, all on the same keys; INK_GA_TOK=n caps it (bench: more groups, each
+      // reading K / V again)
+      const uint32_t tok = std::min<uint32_t>(ga_tok_, T == 1 ? 1 : T == 2 ? 2 : T <= 4 ? 4 : T <= 8 ? 8 : 16);
+      const uint32_t groups = cdiv(T, tok), sr = 3 * T;
       GaParams p{T, H, KVH, uint32_t(a.kv.cap), len, uint32_t(a.rel_proj.dim(1)), sr, cdiv(nkeys, 64) * 64,
                  cdiv(nkeys, 64), cdiv(nkeys, 512), ga_thr_, 1u, gate ? 1u : 0u};
       // scratch sizes rounded up (16k keys, 12 rows) so they are regrown, with a sync, only rarely
@@ -925,10 +926,9 @@ class MetalBackend final : public Backend {
       Tensor bmax = scratch("ga-bmax", DType::F32, {KVH * sra, ska / 64});
       Tensor M = scratch("ga-m", DType::F32, {KVH * 3 * 64});
       Tensor part = scratch("ga-part", DType::F32, {KVH * (ska / 512) * sra, 132});
-      const std::string rs = "_r" + std::to_string(R);
       const Tensor& kc = a.kv.k.valid() ? a.kv.k : a.k_new;
       const Tensor& vc = a.kv.v.valid() ? a.kv.v : a.v_new;
-      pipe("ga_scores" + rs);
+      pipe("ga_scores");
       bind(0, a.q);
       bind(1, a.k_new);
       bind(2, a.r);
@@ -937,7 +937,8 @@ class MetalBackend final : public Backend {
       bind(5, S);
       bind(6, bmax);
       g_.set_value(7, p);
-      g_.dispatch({p.nblk, KVH, groups}, {128, 1, 1});
+      g_.set_value(8, tok);
+      g_.dispatch({p.nblk, KVH, groups}, {32 * tok, 1, 1});
       pipe("ga_rowmax");
       bind(0, bmax);
       bind(1, a.sink);
@@ -945,7 +946,7 @@ class MetalBackend final : public Backend {
       g_.set_value(3, p);
       g_.dispatch({sr, KVH, 1}, {32, 1, 1});
       if (!ga_no_pv_) {  // INK_GA_NOPV: timing ablation, results wrong
-        pipe("ga_pv" + rs);
+        pipe("ga_pv");
         bind(0, S);
         bind(1, bmax);
         bind(2, M);
@@ -953,7 +954,8 @@ class MetalBackend final : public Backend {
         bind(4, vc);
         bind(5, part);
         g_.set_value(6, p);
-        g_.dispatch({p.nsplit, KVH, groups}, {128, 1, 1});
+        g_.set_value(7, tok);
+        g_.dispatch({p.nsplit, KVH, groups}, {32 * tok, 1, 1});
       }
       pipe("ga_combine");
       bind(0, part);
@@ -1554,7 +1556,7 @@ class MetalBackend final : public Backend {
   // exp(-x) of the row maximum are dropped and blocks with nothing above it are not read (default: nothing dropped).
   // INK_GA_MIN_LEN=n: only from n keys.
   bool ga_ = getenv("INK_GA") && getenv("INK_GA")[0] == '1';
-  uint32_t ga_tok_ = getenv("INK_GA_TOK") ? uint32_t(atoi(getenv("INK_GA_TOK"))) : 4;
+  uint32_t ga_tok_ = getenv("INK_GA_TOK") ? uint32_t(atoi(getenv("INK_GA_TOK"))) : 16;
   bool ga_no_pv_ = getenv("INK_GA_NOPV") != nullptr;
   float ga_thr_ = getenv("INK_GA_THR") ? float(atof(getenv("INK_GA_THR"))) : 1e30f;
   uint32_t ga_min_len_ = getenv("INK_GA_MIN_LEN") ? uint32_t(atoi(getenv("INK_GA_MIN_LEN"))) : 0;
