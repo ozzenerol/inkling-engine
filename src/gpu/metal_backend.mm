@@ -97,6 +97,10 @@ struct ResParams {
   float eps;
   uint32_t conv_hist, conv_dt_other;
 };
+struct Mix2Params {
+  uint32_t T, D, nb, nq;
+  uint32_t dt[8];
+};
 struct CtrlParams {
   uint32_t T, D, R, m_stride;
 };
@@ -595,6 +599,32 @@ class MetalBackend final : public Backend {
     // kernel reduces in a different order, so a verify row above 4 would not equal the decode row.
     bool wide = p.T <= kMR;
     p.eps = eps;
+    if (wide && mix2_ && nq <= 4) {
+      // two wide dispatches (+ rms_norm for the fused-norm form) instead of one latency-bound threadgroup
+      Mix2Params mp{p.T, D, p.nb, nq, {}};
+      Tensor red = scratch("mix2-red", DType::F32, {int64_t(p.T), 8, 5});
+      for (int pass = 0; pass < 2; pass++) {
+        pipe(pass == 0 ? "mix2_red" : "mix2_out");
+        for (uint32_t i = 0; i < 8; i++) {
+          const Tensor& s = *states[std::min<size_t>(i, states.size() - 1)];
+          bind(i, s);
+          mp.dt[i] = dtc(s.dtype);
+        }
+        if (pass == 0) {
+          bind(8, query);
+          bind(9, red);
+          g_.set_value(10, mp);
+          g_.dispatch({p.nb, p.T, 1}, {1024, 1, 1});
+        } else {
+          bind(8, red);
+          bind(9, out);
+          g_.set_value(10, mp);
+          g_.dispatch({cdiv(D, 256), p.T, 1}, {256, 1, 1});
+        }
+      }
+      if (normed) rms_norm(out, gamma, eps, D, *normed);
+      return;
+    }
     pipe(normed ? "attn_residual_mix_norm_1024" : wide ? "attn_residual_mix_1024" : "attn_residual_mix");
     if (normed) wide = true;
     for (uint32_t i = 0; i < 8; i++) {
@@ -1532,6 +1562,7 @@ class MetalBackend final : public Backend {
   // rows of one expert per MoE prefill tile (bit-identical for any choice)
   uint32_t moe_cur_m_ = 64;
   uint32_t moe_m_ = getenv("INK_MOE_M") ? uint32_t(atoi(getenv("INK_MOE_M"))) : 0u;  // 32, 64 or 0 = by T (default since batch 10)
+  bool mix2_ = getenv("INK_MIX2") != nullptr;  // opt-in until measured
   bool t2_off_ = getenv("INK_NO_T2") != nullptr;  // 2-row matvec kernels (same per-row arithmetic as t1 / t4)
   bool fuse2_ = getenv("INK_NO_FUSE2") == nullptr;  // batch 7: tokens identical, 43.5 vs 42.9 tok/s (8-bit)
   std::string skip_;

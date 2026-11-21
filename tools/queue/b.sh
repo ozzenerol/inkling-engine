@@ -41,3 +41,11 @@ echo "== B bench_q8 wall clock vs GPU timestamps (756 GB/s in batch 9 is above t
 for n in 0 2; do INTERLEAVE=$n $(bin bench_q8) 1; done; INK_SERIAL=1 INTERLEAVE=2 $(bin bench_q8) 1
 echo "== B bench_q8 as a dependent chain (DEP=1: each matvec reads the previous output when sizes fit)"
 DEP=1 $(bin bench_q8) 1; DEP=1 INK_RW=0 $(bin bench_q8) 1
+echo "== B mix in two wide dispatches (INK_MIX2=1): op_diff, 8-bit plain decode off vs on with token cmp, dspark identity, profile"
+INK_MIX2=1 $(bin op_diff) 2>&1 | grep -E "ALL|FAILED|FAIL |mix|attn_residual"
+M8=$HOME/llm/mlx-models/Inkling-2-Mini-MLX-8bit
+for v in "X=1" "INK_MIX2=1"; do
+  echo -n "[8-bit $v] "; env $v INK_MODEL=$M8 $(bin spec_check) plain ref_data/p2.ids 200 4 "$BS/mix_$v.i32" 2>&1 | grep -E "tok/s" | tr '\n' ' '; echo
+done; cmp "$BS/mix_X=1.i32" "$BS/mix_INK_MIX2=1.i32" && echo "mix2 tokens IDENTICAL"
+echo -n "[mix2 dspark identity] "; INK_MIX2=1 tools/spec_check.sh ref_data/p2.ids 200 8 2>&1 | grep -E "IDENT|DIFF"
+INK_MIX2=1 INK_PROFILE=1 INK_NO_DSPARK=1 build/inktest --backend metal --model $M8 --ids ref_data/p2.ids --steps 64 --out $BS/pf 2>&1 | grep -E "mix|rms_norm_rows"
