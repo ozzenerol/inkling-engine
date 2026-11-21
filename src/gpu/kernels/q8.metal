@@ -148,3 +148,90 @@ kernel void dequant_q8_rows(device const uchar* W [[buffer(0)]], device const us
   float sc = bf2f(S[src * ng + k / 64]), bi = bf2f(B[src * ng + k / 64]);
   out[size_t(r) * p.K + k] = f2bf(fma(sc, float(W[size_t(src) * p.K + k]), bi));
 }
+
+// Up to 6 q8 matrices on one input in one dispatch (decode/verify, T <= 4). Per row the arithmetic is that of
+// matvec_q8, so results equal separate q8 matvecs bit for bit. Row starts must be multiples of 4.
+struct Q8MultiParams {
+  uint K, T, count;
+  uint row_start[7];
+  uint dt_out[6];
+};
+template <typename XT>
+kernel void matvec_q8_multi(device const uint4* W0 [[buffer(0)]], device const uint4* W1 [[buffer(1)]],
+                            device const uint4* W2 [[buffer(2)]], device const uint4* W3 [[buffer(3)]],
+                            device const uint4* W4 [[buffer(4)]], device const uint4* W5 [[buffer(5)]],
+                            device const ushort* S0 [[buffer(6)]], device const ushort* S1 [[buffer(7)]],
+                            device const ushort* S2 [[buffer(8)]], device const ushort* S3 [[buffer(9)]],
+                            device const ushort* S4 [[buffer(10)]], device const ushort* S5 [[buffer(11)]],
+                            device const ushort* B0 [[buffer(12)]], device const ushort* B1 [[buffer(13)]],
+                            device const ushort* B2 [[buffer(14)]], device const ushort* B3 [[buffer(15)]],
+                            device const ushort* B4 [[buffer(16)]], device const ushort* B5 [[buffer(17)]],
+                            device void* Y0 [[buffer(18)]], device void* Y1 [[buffer(19)]],
+                            device void* Y2 [[buffer(20)]], device void* Y3 [[buffer(21)]],
+                            device void* Y4 [[buffer(22)]], device void* Y5 [[buffer(23)]],
+                            device const XT* x [[buffer(24)]], constant Q8MultiParams& s [[buffer(25)]],
+                            uint tg [[threadgroup_position_in_grid]], uint simd [[simdgroup_index_in_threadgroup]],
+                            uint lane [[thread_index_in_simdgroup]]) {
+  constexpr uint R = 4;
+  uint grow0 = (tg * 2 + simd) * R;
+  if (grow0 >= s.row_start[s.count]) return;
+  uint mi = 0;
+  while (mi + 1 < s.count && grow0 >= s.row_start[mi + 1]) mi++;
+  device const uint4* Ws[6] = {W0, W1, W2, W3, W4, W5};
+  device const ushort* Ss[6] = {S0, S1, S2, S3, S4, S5};
+  device const ushort* Bs[6] = {B0, B1, B2, B3, B4, B5};
+  device void* Ys[6] = {Y0, Y1, Y2, Y3, Y4, Y5};
+  device const uint4* W = Ws[mi];
+  device const ushort* S = Ss[mi];
+  device const ushort* B = Bs[mi];
+  uint N = s.row_start[mi + 1] - s.row_start[mi];
+  uint row0 = grow0 - s.row_start[mi];
+  uint kc = s.K / 16, ng = s.K / 64;
+  float acc[4][R];
+  for (uint t = 0; t < 4; t++)
+    for (uint r = 0; r < R; r++) acc[t][r] = 0;
+  for (uint c = lane; c < kc; c += 32) {
+    float xv[4][16];
+    float xs[4];
+    for (uint t = 0; t < s.T; t++) {
+      xs[t] = 0;
+      device const XT* xp = x + t * s.K + c * 16;
+      for (uint i = 0; i < 16; i++) {
+        xv[t][i] = float(xp[i]);
+        xs[t] += xv[t][i];
+      }
+    }
+    uint g = c / 4;
+    for (uint r = 0; r < R; r++) {
+      uint row = min(row0 + r, N - 1);
+      uint4 q = W[row * kc + c];
+      float sc = bf2f(S[row * ng + g]), bi = bf2f(B[row * ng + g]);
+      uint qs[4] = {q.x, q.y, q.z, q.w};
+      for (uint t = 0; t < s.T; t++) {
+        float d = 0;
+        for (uint j = 0; j < 4; j++)
+          for (uint i = 0; i < 4; i++) d = fma(xv[t][j * 4 + i], float((qs[j] >> (8 * i)) & 255u), d);
+        acc[t][r] = fma(sc, d, fma(bi, xs[t], acc[t][r]));
+      }
+    }
+  }
+  for (uint t = 0; t < s.T; t++)
+    for (uint r = 0; r < R; r++) {
+      float v = simd_sum(acc[t][r]);
+      uint row = row0 + r;
+      if (lane == 0 && row < N) {
+        if (s.dt_out[mi] == 0) ((device float*)Ys[mi])[t * N + row] = v;
+        else ((device ushort*)Ys[mi])[t * N + row] = f2bf(v);
+      }
+    }
+}
+#define Q8M_INST(NAME, XT)                                                                                     \
+  template [[host_name(NAME)]] kernel void matvec_q8_multi<XT>(                                                \
+      device const uint4*, device const uint4*, device const uint4*, device const uint4*, device const uint4*, \
+      device const uint4*, device const ushort*, device const ushort*, device const ushort*,                    \
+      device const ushort*, device const ushort*, device const ushort*, device const ushort*,                   \
+      device const ushort*, device const ushort*, device const ushort*, device const ushort*,                   \
+      device const ushort*, device void*, device void*, device void*, device void*, device void*, device void*, \
+      device const XT*, constant Q8MultiParams&, uint, uint, uint);
+Q8M_INST("matvec_q8_multi_bf16", bf16_in)
+Q8M_INST("matvec_q8_multi_f32", float)

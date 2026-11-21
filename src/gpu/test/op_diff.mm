@@ -506,6 +506,27 @@ int main(int argc, char** argv) {
       MTL->free(x);
       MTL->free(y);
     }
+    if (getenv("INK_Q8_MULTI")) {  // fused q8 multi == separate q8 matvecs (bit-identical), T = 1 and 3
+      Tensor w2 = MTL->alloc(DType::U32, {N, K / 4}, "q8w2");
+      MTL->write(w2, codes.data() + 97, codes.size() - 97);
+      MTL->bind_affine(w2, wb, ws);  // any scales/biases: only fused == separate matters
+      for (int64_t T : {1, 3}) {
+        std::vector<uint16_t> xv(T * K);
+        for (auto& v : xv) v = f32_to_bf16(nd(rng));
+        Tensor x = MTL->alloc(DType::BF16, {T, K}, "x");
+        MTL->write(x, xv.data(), xv.size() * 2);
+        Tensor a1 = MTL->alloc(DType::BF16, {T, N}, "a1"), a2 = MTL->alloc(DType::F32, {T, N}, "a2");
+        Tensor b1 = MTL->alloc(DType::BF16, {T, N}, "b1"), b2 = MTL->alloc(DType::F32, {T, N}, "b2");
+        MTL->linear_multi(x, {&wc, &w2}, {&a1, &a2});
+        MTL->linear(x, wc, b1);
+        MTL->linear(x, w2, b2);
+        MTL->sync();
+        bool eq = !memcmp(a1.data<uint16_t>(), b1.data<uint16_t>(), T * N * 2) &&
+                  !memcmp(a2.data<float>(), b2.data<float>(), T * N * 4);
+        printf("%-28s %s\n", ("q8 multi == separate T=" + std::to_string(T)).c_str(), eq ? "ok" : "FAIL");
+        if (!eq) fails++;
+      }
+    }
     // embedding rows: bf16(s*q + b)
     std::vector<int32_t> ids = {5, 0, 639, 77};
     Tensor it = MTL->alloc(DType::I32, {4}, "ids"), eo = MTL->alloc(DType::BF16, {4, K}, "emb");
