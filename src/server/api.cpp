@@ -288,12 +288,26 @@ void Api::chat(const http::Request& req, http::Response& res) {
   bool client_gone = false;
   try {
     double last_ka = now_s();
+    std::vector<int32_t> before;
+    if (o_.log) before = cache_.tokens();
     prep = cache_.prepare(prompt, [&](int64_t done, int64_t total) {
       if (stream && o_.keepalive_comments && now_s() - last_ka > 2.0) {
         last_ka = now_s();
         res.write(": prefill " + std::to_string(done) + "/" + std::to_string(total) + "\n\n");
       }
     });
+    if (o_.log && prep.lcp < (int64_t)before.size() && prep.lcp + 1 < n_prompt) {
+      // Where did this prompt leave the cached sequence? Text on both sides of the divergence.
+      auto snip = [&](const std::vector<int32_t>& v, int64_t a, int64_t b) {
+        a = std::max<int64_t>(0, a); b = std::min<int64_t>((int64_t)v.size(), b);
+        std::string s = tok_.decode(std::span<const int32_t>(v.data() + a, b - a));
+        for (auto& c : s) if (c == '\n') c = '|';
+        return s;
+      };
+      std::fprintf(stderr, "[cache] diverged at %lld of cached %zu / prompt %lld\n  before: ...%s\n  cached: %s...\n  prompt: %s...\n",
+                   (long long)prep.lcp, before.size(), (long long)n_prompt, snip(prompt, prep.lcp - 24, prep.lcp).c_str(),
+                   snip(before, prep.lcp, prep.lcp + 24).c_str(), snip(prompt, prep.lcp, prep.lcp + 24).c_str());
+    }
     t_gen0 = now_s();
     eng_.generate(sp, (int)max_tokens, stops_, [&](int32_t tok) {
       if (emitted.empty()) t_first = now_s();

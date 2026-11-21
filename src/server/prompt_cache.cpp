@@ -48,6 +48,7 @@ PromptCache::Prep PromptCache::prepare(const std::vector<int32_t>& prompt,
   const int64_t m = std::min<int64_t>(n, toks_.size());
   while (lcp < m && prompt[lcp] == toks_[lcp]) lcp++;
   // At least one token must be fed to get logits for the next one.
+  r.lcp = lcp;
   const int64_t target = std::min(lcp, n - 1);
   int64_t cur = (int64_t)toks_.size();
   r.how = "hit";

@@ -22,6 +22,7 @@ class PromptCache {
     int64_t prefilled = 0;  // tokens fed now
     double prefill_s = 0;
     std::string how;        // "hit", "rewind", "ckpt", "reset"
+    int64_t lcp = 0;        // common prefix with the cached ids
   };
   // Afterwards the engine has prefilled the whole prompt and holds its last logits.
   Prep prepare(const std::vector<int32_t>& prompt, const std::function<void(int64_t done, int64_t total)>& progress);
@@ -33,6 +34,7 @@ class PromptCache {
   void invalidate();
 
   int64_t size() const { return (int64_t)toks_.size(); }
+  const std::vector<int32_t>& tokens() const { return toks_; }
   int n_ckpts() const { return (int)ck_.size(); }
 
  private:
