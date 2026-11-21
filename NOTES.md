@@ -605,3 +605,19 @@ Also: batch 5's "q8 matvec 795 GB/s" came from zero-filled weights in bench_q8 a
   B: fused decode ops finally wired (FUSE2): tokens identical, 43.5 vs 42.9 tok/s on 8-bit (+1.4%) -> default;
   2-row matvec kernels: T=2 verify 29.2 vs 32.8 ms, 49.4 vs 45.3 tok/s -> kept; INK_BUSY background load: no
   effect at any level (the "GPU performance state" hypothesis for the 3x in-model dense gap is refuted).
+- **Batch 8** (main f5fb5b1, 21:40-22:15): all gates pass. C's depth bench (8-bit server, temp 0.7): gen 38.1 /
+  37.8 / 30.5 / 25.8 / 21.8 tok/s and read 745 / 790 / 657 / 503 / 381 tok/s at 1.2k / 9.6k / 39k / 79k / 127k.
+  [ttft] lines: a turn's time to first token is its prefill (775 new tokens at ~640 tok/s = 1.2 s) plus ~85 ms
+  until the first visible byte (two marker tokens); tokenize / cache / checkpoint are ~1-10 ms.
+  A: 8-bit at 126k context (spec_check, temp 0.7): 21.2 tok/s; plain step 47.1 ms, verify T=2/3/4 52.7 / 67.1 /
+  70.1 ms, drafter 17 ms per round (6-8 ms at short context: its global layer reads the whole context).
+  Prefill attention with P as ONE half tile (INK_AG_HALF=1): long set mean KL 4.33e-3 vs 3.99e-3 hi+lo (median
+  3.49 vs 3.89, max 1.07e-2 vs 5.69e-3), prefill at 64k 467 vs 438 tok/s (+6.6%) -> not worth it, stays off.
+  B: 8-bit prefill 2048 tokens 2.51 s (816 tok/s), 800 tokens 1.27 s (630 tok/s); at T = 2048 moe_gemm_nvfp4
+  54% (~9 TFLOPS), gemm_q8 22% (~10 TFLOPS), attention 8%: both big GEMMs are within 1.3x of the GPU's 13.1
+  TFLOPS, so steady-state prefill is near the hardware. MoE tiles of 128 rows: slower (4.46 vs 3.87 s).
+  B's INTERLEAVE bench (batch 7): q8 matvec x 288 back to back 1.76 ms, with 2 tiny dependent dispatches after
+  each 7.82 ms, with 6 14.13 ms (~10 us per tiny dependent dispatch), which contradicts the small gains of
+  FUSE2 (-320 dispatches, +1.4%) -> B runs a NULL-kernel chain (same dispatches, no work) in batch 9 to settle
+  how much of the 23.6 ms plain step is dispatch latency.
+- **User (22:15): keep going "until this is blazingly fast".**
