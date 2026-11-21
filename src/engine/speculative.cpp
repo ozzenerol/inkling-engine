@@ -11,6 +11,7 @@
 #include <memory>
 
 #include <random>
+#include <array>
 #include <unordered_map>
 
 #include "engine/sampling.h"
@@ -33,7 +34,8 @@ struct Spec {
   long arm_n[9] = {0, 0, 0, 0, 0, 0, 0, 0, 0};
   int since_probe = 0, probe = 0;
   // Prompt-lookup drafts (A): trigram -> position after its latest occurrence in the cached tokens.
-  std::unordered_map<uint64_t, int32_t> tri;
+  std::unordered_map<uint64_t, std::array<int32_t, 4>> tri;
+  int lk_match = 0;
   size_t tri_upto = 0;      // trigrams ending before this index are in the map
   double lk_rate = 0;       // tokens per ms delivered by lookup rounds (EMA)
   long lk_n = 0, lk_rounds = 0, lk_drafted = 0, lk_accepted = 0;
@@ -156,6 +158,9 @@ bool speculative_generate(Engine& e, Model& m, const SamplingParams& p, int max_
   auto tri_key = [](int32_t a, int32_t b2, int32_t c) {
     return (uint64_t(uint32_t(a)) << 40) ^ (uint64_t(uint32_t(b2)) << 20) ^ uint64_t(uint32_t(c));
   };
+  // Up to 4 recent positions per trigram; the candidate whose preceding tokens agree with the current ones for
+  // the longest stretch wins, and a match shorter than 6 tokens proposes nothing (a bare trigram such as ") {\n"
+  // occurs all over a source file: on a copy task it was right only 63% of the time, the drafter 100%).
   auto lookup = [&](int32_t anchor, int kmax, std::vector<int32_t>& out) {
     const auto& tk = m.tokens();
     const size_t n = tk.size();
@@ -164,17 +169,39 @@ bool speculative_generate(Engine& e, Model& m, const SamplingParams& p, int max_
       s.tri_upto = 0;
     }
     for (size_t i = std::max<size_t>(s.tri_upto, 2); i < n; i++)
-      if (tk[i] >= 0 && tk[i - 1] >= 0 && tk[i - 2] >= 0) s.tri[tri_key(tk[i - 2], tk[i - 1], tk[i])] = int32_t(i + 1);
+      if (tk[i] >= 0 && tk[i - 1] >= 0 && tk[i - 2] >= 0) {
+        auto& slot = s.tri[tri_key(tk[i - 2], tk[i - 1], tk[i])];
+        slot[3] = slot[2];
+        slot[2] = slot[1];
+        slot[1] = slot[0];
+        slot[0] = int32_t(i + 1);
+      }
     s.tri_upto = n;
     out.clear();
-    if (n < 2) return;
+    s.lk_match = 0;
+    if (n < 8) return;
     auto it = s.tri.find(tri_key(tk[n - 2], tk[n - 1], anchor));
     if (it == s.tri.end()) return;
-    for (size_t p2 = size_t(it->second); p2 < n && int(out.size()) < kmax; p2++) {
+    size_t best_p = 0;
+    int best_len = 0;
+    for (int32_t cand : it->second) {
+      if (cand <= 0 || size_t(cand) >= n) continue;
+      // tokens before the continuation at cand: tk[cand-1] == anchor, tk[cand-2] == tk[n-1], ...
+      int len = 3;
+      while (len < 32 && size_t(len) <= size_t(cand) - 1 && size_t(len) <= n &&
+             tk[size_t(cand) - 1 - size_t(len)] == tk[n - size_t(len)] && tk[n - size_t(len)] >= 0)
+        len++;
+      if (len > best_len) {
+        best_len = len;
+        best_p = size_t(cand);
+      }
+    }
+    if (best_len < 6) return;
+    s.lk_match = best_len;
+    for (size_t p2 = best_p; p2 < n && int(out.size()) < kmax; p2++) {
       if (tk[p2] < 0) break;
       out.push_back(tk[p2]);
     }
-    // the continuation may run into the pending anchor (a repeat of the last tokens): stop there
   };
   std::vector<int32_t> lk;
   while (true) {
