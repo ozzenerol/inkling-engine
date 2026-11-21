@@ -155,7 +155,9 @@ struct SoftcapParams {
 
 uint32_t cdiv(uint64_t a, uint64_t b) { return uint32_t((a + b - 1) / b); }
 // D: largest T that takes the decode/verify kernels (rows bit-equal to T = 1). Dense ops run passes of 16 rows.
-constexpr uint32_t kMR = 32;
+// The code handles 32 (attention in two row groups, union MoE lists of 32) but that is unmeasured and parked
+// (2026-11-21, priority moved to long context): to go to 32, set this and add 17..32 to the op_diff row lists.
+constexpr uint32_t kMR = 16;
 
 class MetalBackend final : public Backend {
  public:
