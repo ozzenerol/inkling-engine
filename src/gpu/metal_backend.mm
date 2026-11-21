@@ -504,7 +504,7 @@ class MetalBackend final : public Backend {
                           const Tensor& gamma, float eps, Tensor& normed) override {
     uint32_t D = uint32_t(states[0]->dim(-1)), T = uint32_t(states[0]->numel() / D);
     bool nq1 = query.ndim == 1 || query.dim(0) == 1;
-    if (!nq1 || T > 4 || D > 2304 || normed.dtype != DType::BF16 || getenv("INK_NO_FUSE"))
+    if (!nq1 || T > 16 || D > 2304 || normed.dtype != DType::BF16 || getenv("INK_NO_FUSE"))  // D: 16 (was 4)
       return Backend::attn_residual_norm(states, query, mixed, gamma, eps, normed);
     mix(states, query, 1, mixed, &gamma, eps, &normed);
   }
@@ -518,7 +518,9 @@ class MetalBackend final : public Backend {
     p.D = D;
     p.nb = uint32_t(states.size());
     p.nq = nq;
-    bool wide = p.T <= 4;  // decode/verify: one threadgroup per token is latency bound, use 1024 threads
+    // decode/verify: one threadgroup per token is latency bound, use 1024 threads. Up to 16 rows (D): the 256-thread
+    // kernel reduces in a different order, so a verify row above 4 would not equal the decode row.
+    bool wide = p.T <= 16;
     p.eps = eps;
     pipe(normed ? "attn_residual_mix_norm_1024" : wide ? "attn_residual_mix_1024" : "attn_residual_mix");
     if (normed) wide = true;
@@ -545,7 +547,8 @@ class MetalBackend final : public Backend {
   void controller_multi(int n, const Tensor* xs, const Tensor* ms, const Tensor* downs, const Tensor* forgets,
                         const Tensor* gains, Tensor* outs) override {
     uint32_t D = uint32_t(xs[0].dim(-1)), T = uint32_t(xs[0].numel() / D), R = uint32_t(downs[0].dim(0));
-    if (n != 3 || T > 4 || getenv("INK_NO_FUSE")) return Backend::controller_multi(n, xs, ms, downs, forgets, gains, outs);
+    if (n != 3 || T > (mr_ ? 16u : 4u) || getenv("INK_NO_FUSE"))
+      return Backend::controller_multi(n, xs, ms, downs, forgets, gains, outs);
     if (skip("ctrl")) return;
     CtrlParams p{T, D, R, D};
     Tensor pair = scratch("ctrl-pair3", DType::BF16, {3 * T, 2 * D});
@@ -563,7 +566,7 @@ class MetalBackend final : public Backend {
     mp.K = 2 * D;
     mp.T = T;
     mp.count = 3;
-    pipe("matvec_multi_bf16");
+    pipe(T <= 4 ? "matvec_multi_bf16" : T <= 8 ? "mr_matvec_multi_bf16_t8" : "mr_matvec_multi_bf16_t16");  // D
     Tensor hv[3];
     for (uint32_t i = 0; i < 8; i++) {
       uint32_t j = std::min<uint32_t>(i, 2);

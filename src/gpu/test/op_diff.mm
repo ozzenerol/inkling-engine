@@ -214,7 +214,7 @@ int main(int argc, char** argv) {
     MTL->controller(x.m, mm, dn.m, fg.m, gn.m, o.m);
     compare("controller", o, 1e-4);
   }
-  for (int64_t T : {1, 3}) {  // controller_multi / rms_norm_multi (Metal fused) vs CPU loops
+  for (int64_t T : {1, 3, 8, 16}) {  // controller_multi / rms_norm_multi (Metal fused) vs CPU loops
     Pair xs[3], ms[3], dn[3], fg[3], gn[3], os[3];
     for (int i = 0; i < 3; i++) {
       xs[i] = make(DType::F32, {T, D});
