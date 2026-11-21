@@ -16,3 +16,7 @@ INK_Q8_MULTI=1 $(bin op_diff) 2>&1 | grep -E "q8 multi|ALL|FAILED"
 M8=$HOME/llm/mlx-models/Inkling-2-Mini-MLX-8bit
 for v in "X=1" "INK_Q8_MULTI=1"; do echo -n "[$v] "; env $v INK_MODEL=$M8 $(bin spec_check) plain ref_data/p2.ids 200 4 $BS/q8m_$v.i32 2>&1 | grep -oE "decode [0-9.]+ s -> [0-9.]+ tok/s"; done
 cmp "$BS/q8m_X=1.i32" "$BS/q8m_INK_Q8_MULTI=1.i32" && echo "q8 multi tokens IDENTICAL"
+echo "== B bandwidth of the big readers (model-free except bench_moe's two layers)"
+$(bin bench_matvec) 1 | grep GB/s
+$(bin bench_q8) 1; $(bin bench_q8) 4
+for r in 4 2 1; do echo -n "[moe gate/up rows per simdgroup $r] "; INK_MOE_RPS=$r $(bin bench_moe) 1 | tr '\n' ' '; echo; done

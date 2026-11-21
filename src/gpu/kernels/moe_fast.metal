@@ -59,34 +59,12 @@ struct MoeFastParams {
   uint N, K, topk;
 };
 
-// Byte -> (lo nibble, hi nibble) as half2, both * 2^-14 (exact), for the LUT variant.
-inline void build_fp4_lut(threadgroup half2* lut, uint tid, uint nthreads) {
-  for (uint b = tid; b < 256; b += nthreads)
-    lut[b] = half2(as_type<half>(ushort(((b & 8u) << 12) | ((b & 7u) << 9))),
-                   as_type<half>(ushort((((b >> 4) & 8u) << 12) | (((b >> 4) & 7u) << 9))));
-}
-inline float dot_fp4_32_lut(uint4 w, threadgroup const float* x, float s0, float s1, threadgroup const half2* lut) {
-  float a = 0, b = 0;
-  uint ws[4] = {w.x, w.y, w.z, w.w};
-  for (uint j = 0; j < 2; j++)
-    for (uint i = 0; i < 4; i++) {
-      float2 v = float2(lut[(ws[j] >> (8 * i)) & 255u]);
-      a = fma(x[j * 8 + 2 * i], v.x, a);
-      a = fma(x[j * 8 + 2 * i + 1], v.y, a);
-    }
-  for (uint j = 2; j < 4; j++)
-    for (uint i = 0; i < 4; i++) {
-      float2 v = float2(lut[(ws[j] >> (8 * i)) & 255u]);
-      b = fma(x[j * 8 + 2 * i], v.x, b);
-      b = fma(x[j * 8 + 2 * i + 1], v.y, b);
-    }
-  return a * s0 + b * s1;
-}
-
 constant uint GU_SIMDS = 4;  // simdgroups per threadgroup in gate/up (4 rows each)
 
 // MODE 0 = NVFP4, 1 = MXFP8. Grid: (ceil(N / (4*GU_SIMDS)), routes). x bf16 [T, K]; a bf16 [routes, N].
-template <uint MODE, bool LUT = false>
+// RPS rows per simdgroup (32 / RPS lanes per row). RPS = 4 is the default layout; 2 and 1 are measured variants
+// (a different lane layout sums in a different order: decode and verify kernels must use the same one).
+template <uint MODE, uint RPS = 4>
 kernel void moe_gateup(device const uint4* gw [[buffer(0)]], device const uchar* gs [[buffer(1)]],
                        device const float* gg [[buffer(2)]], device const uint4* uw [[buffer(3)]],
                        device const uchar* us [[buffer(4)]], device const float* ug [[buffer(5)]],
@@ -99,12 +77,11 @@ kernel void moe_gateup(device const uint4* gw [[buffer(0)]], device const uchar*
   // grid: x = route (fastest), y = row block: routes that share an expert read the same rows close together
   uint route = tg.x, t = route / p.topk;
   for (uint i = tid; i < p.K; i += 32 * GU_SIMDS) xs[(i / 32) * 33 + i % 32] = bf2f(x[t * p.K + i]);
-  threadgroup half2 lut[256];  // LUT variant only (the declaration was missing: the library did not compile)
-  if (LUT) build_fp4_lut(lut, tid, 32 * GU_SIMDS);
   threadgroup_barrier(mem_flags::mem_threadgroup);
   uint e = uint(idx[route]);
-  uint n = (tg.y * GU_SIMDS + sg) * 4 + lane / 8;
-  uint sub = lane % 8;
+  constexpr uint LPR = 32 / RPS;
+  uint n = (tg.y * GU_SIMDS + sg) * RPS + lane / LPR;
+  uint sub = lane % LPR;
   bool valid = n < p.N;
   n = min(n, p.N - 1);
   size_t row = size_t(e) * p.N + n;
@@ -115,16 +92,11 @@ kernel void moe_gateup(device const uint4* gw [[buffer(0)]], device const uchar*
     device const uint4* ur = uw + row * chunks;
     device const ushort* gsr = (device const ushort*)(gs + row * (p.K / 16));
     device const ushort* usr = (device const ushort*)(us + row * (p.K / 16));
-    for (uint c = sub; c < chunks; c += 8) {
+    for (uint c = sub; c < chunks; c += LPR) {
       uint gsc = gsr[c], usc = usr[c];
       threadgroup const float* xc = xs + c * 33;
-      if (LUT) {
-        g += dot_fp4_32_lut(gr[c], xc, e4m3_scale(gsc & 255u), e4m3_scale(gsc >> 8), lut);
-        u += dot_fp4_32_lut(ur[c], xc, e4m3_scale(usc & 255u), e4m3_scale(usc >> 8), lut);
-      } else {
-        g += dot_fp4_32(gr[c], xc, e4m3_scale(gsc & 255u), e4m3_scale(gsc >> 8));
-        u += dot_fp4_32(ur[c], xc, e4m3_scale(usc & 255u), e4m3_scale(usc >> 8));
-      }
+      g += dot_fp4_32(gr[c], xc, e4m3_scale(gsc & 255u), e4m3_scale(gsc >> 8));
+      u += dot_fp4_32(ur[c], xc, e4m3_scale(usc & 255u), e4m3_scale(usc >> 8));
     }
   } else {
     uint chunks = p.K / 16;
@@ -133,7 +105,7 @@ kernel void moe_gateup(device const uint4* gw [[buffer(0)]], device const uchar*
     device const uchar* gsr = gs + row * (p.K / 32);
     device const uchar* usr = us + row * (p.K / 32);
     // lane takes chunk pairs (one 32-value group = 2 uint4) so the e8m0 scale applies to one partial sum
-    for (uint c2 = sub; c2 < chunks / 2; c2 += 8) {
+    for (uint c2 = sub; c2 < chunks / 2; c2 += LPR) {
       threadgroup const float* xc = xs + c2 * 33;
       float gp = dot_fp8_16(gr[2 * c2], xc) + dot_fp8_16(gr[2 * c2 + 1], xc + 16);
       float up = dot_fp8_16(ur[2 * c2], xc) + dot_fp8_16(ur[2 * c2 + 1], xc + 16);
@@ -141,8 +113,8 @@ kernel void moe_gateup(device const uint4* gw [[buffer(0)]], device const uchar*
       u = fma(up, e8m0_to_f(usr[c2]), u);
     }
   }
-  // reduce over the 8 lanes of this row
-  for (uint off = 4; off > 0; off >>= 1) {
+  // reduce over the LPR lanes of this row
+  for (uint off = LPR / 2; off > 0; off >>= 1) {
     g += simd_shuffle_down(g, off);
     u += simd_shuffle_down(u, off);
   }
@@ -205,14 +177,17 @@ kernel void moe_down(device const uint4* dw [[buffer(0)]], device const uchar* d
   if (lane == 0) out[size_t(t) * p.N + n] = f2bf(s);
 }
 
-template [[host_name("moe_gateup_nvfp4")]] kernel void moe_gateup<0>(
-    device const uint4*, device const uchar*, device const float*, device const uint4*, device const uchar*,
-    device const float*, device const ushort*, device const int*, device ushort*, constant MoeFastParams&, uint2,
-    uint, uint, uint);
-template [[host_name("moe_gateup_mxfp8")]] kernel void moe_gateup<1>(
-    device const uint4*, device const uchar*, device const float*, device const uint4*, device const uchar*,
-    device const float*, device const ushort*, device const int*, device ushort*, constant MoeFastParams&, uint2,
-    uint, uint, uint);
+#define GU_INST(NAME, M, R)                                                                                    \
+  template [[host_name(NAME)]] kernel void moe_gateup<M, R>(                                                   \
+      device const uint4*, device const uchar*, device const float*, device const uint4*, device const uchar*, \
+      device const float*, device const ushort*, device const int*, device ushort*, constant MoeFastParams&,   \
+      uint2, uint, uint, uint);
+GU_INST("moe_gateup_nvfp4", 0, 4)
+GU_INST("moe_gateup_mxfp8", 1, 4)
+GU_INST("moe_gateup_nvfp4_r2", 0, 2)
+GU_INST("moe_gateup_mxfp8_r2", 1, 2)
+GU_INST("moe_gateup_nvfp4_r1", 0, 1)
+GU_INST("moe_gateup_mxfp8_r1", 1, 1)
 template [[host_name("moe_down_nvfp4")]] kernel void moe_down<0>(device const uint4*, device const uchar*,
                                                                   device const float*, device const ushort*,
                                                                   device const int*, device const float*,
