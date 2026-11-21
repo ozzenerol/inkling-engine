@@ -16,6 +16,8 @@
 
 namespace ink {
 
+bool metal_dequant_affine(Backend& be, const Tensor& codes, Tensor& out);  // metal_backend.mm
+
 const int DSpark::kCaptureVisits[DSpark::kCaptures] = {5, 23, 41, 48};
 
 namespace {
@@ -245,10 +247,17 @@ DSpark::DSpark(Backend& be, const std::string& dir, const Tensor& embed, const T
     b2.set_shape({1, 2304});
     m.fold_w = be.alloc(DType::BF16, {m.V, 256}, "dspark.fold_w");
     m.fold_b = be.alloc(DType::BF16, {m.V, 1}, "dspark.fold_b");
-    be.linear(lm_head, wt, m.fold_w);
-    be.linear(lm_head, b2, m.fold_b);
+    Tensor head_bf = lm_head, tmp_head;
+    if (lm_head.dtype == DType::U32) {  // 8-bit build: a temporary bf16 head for the one-time fold
+      tmp_head = be.alloc(DType::BF16, {lm_head.dim(0), lm_head.dim(1) * 4}, "dspark.head_tmp");
+      if (!metal_dequant_affine(be, lm_head, tmp_head)) throw std::runtime_error("dspark: q8 head needs Metal");
+      head_bf = tmp_head;
+    }
+    be.linear(head_bf, wt, m.fold_w);
+    be.linear(head_bf, b2, m.fold_b);
     be.sync();
     be.free(wt);
+    if (tmp_head.valid()) be.free(tmp_head);
   }
   // workspace
   const int64_t B = 8;

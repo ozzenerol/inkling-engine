@@ -60,6 +60,12 @@ struct PrepParams {
 struct ConvAddParams {
   uint32_t T, C, has_hist, dt_other, dt_out;
 };
+struct Q8Params {
+  uint32_t N, K, T, x_stride, y_stride;
+};
+struct DeqParams {
+  uint32_t rows, K, use_ids;
+};
 struct EwParams {
   uint32_t n, dt_a, dt_b, dt_out;
 };
@@ -278,6 +284,19 @@ class MetalBackend final : public Backend {
 
   // ---------------------------------------------------------------- ops
   void embed(const Tensor& ids, const Tensor& table, Tensor& out) override {
+    if (table.dtype == DType::U32) {
+      auto& sb = affine_of(table);
+      DeqParams p{uint32_t(ids.numel()), uint32_t(table.dim(1) * 4), 1};
+      pipe("dequant_q8_rows");
+      bind(0, table);
+      bind(1, sb.first);
+      bind(2, sb.second);
+      bind(3, ids);
+      bind(4, out);
+      g_.set_value(5, p);
+      g_.dispatch({cdiv(p.K, 256), p.rows, 1}, {256, 1, 1});
+      return;
+    }
     EmbedParams p{uint32_t(ids.numel()), uint32_t(table.dim(-1))};
     pipe("embed_rows");
     bind(0, ids);
@@ -300,7 +319,67 @@ class MetalBackend final : public Backend {
     g_.dispatch({p.rows, 1, 1}, {256, 1, 1});
   }
 
+  // ---- MLX affine 8-bit weights (8-bit build): codes U32 [N, K/4], bf16 scales/biases [N, K/64]
+  // opt-in (INK_Q8_KERNELS=1) until validated on the GPU; then default on
+  bool supports_q8() const override { return getenv("INK_Q8_KERNELS") && getenv("INK_Q8_KERNELS")[0] == '1'; }
+  void bind_affine(const Tensor& codes, const Tensor& scales, const Tensor& biases) override {
+    affine_[{codes.buf, codes.offset}] = {scales, biases};
+  }
+  const std::pair<Tensor, Tensor>& affine_of(const Tensor& codes) {
+    auto it = affine_.find({codes.buf, codes.offset});
+    if (it == affine_.end()) fail("U32 weight without bind_affine");
+    return it->second;
+  }
+ public:
+  // Whole matrix to bf16 (bf16(s*q + b)); used once at load where a bf16 copy is needed (DSpark fold).
+  void dequant_affine(const Tensor& codes, Tensor& out) {
+    auto& sb = affine_of(codes);
+    DeqParams p{uint32_t(codes.dim(0)), uint32_t(codes.dim(1) * 4), 0};
+    pipe("dequant_q8_rows");
+    bind(0, codes);
+    bind(1, sb.first);
+    bind(2, sb.second);
+    bind(3, codes);
+    bind(4, out);
+    g_.set_value(5, p);
+    g_.dispatch({cdiv(p.K, 256), p.rows, 1}, {256, 1, 1});
+  }
+  void linear_q8(const Tensor& x, const Tensor& w, Tensor& out, uint32_t T, uint32_t N, uint32_t K) {
+    auto& sb = affine_of(w);
+    if (T <= 16) {
+      for (uint32_t t0 = 0; t0 < T; t0 += 4) {
+        uint32_t tt = std::min<uint32_t>(4, T - t0);
+        std::string nm = std::string("matvec_q8_") + dtn(x.dtype) + "_" + dtn(out.dtype) + (tt == 1 ? "_t1" : "_t4");
+        Q8Params qp{N, K, tt, K, N};
+        pipe(nm);
+        bind(0, w);
+        bind(1, sb.first);
+        bind(2, sb.second);
+        g_.set_buffer(3, bufof(x), x.offset + size_t(t0) * K * dtype_size(x.dtype));
+        g_.set_buffer(4, bufof(out), out.offset + size_t(t0) * N * dtype_size(out.dtype));
+        g_.set_value(5, qp);
+        g_.dispatch({cdiv(N, 8), 1, 1}, {64, 1, 1});
+      }
+      return;
+    }
+    if (x.dtype != DType::BF16) fail("linear_q8: prefill x must be bf16");
+    GemmParams gp{T, N, K, 1, dtc(out.dtype), N};
+    pipe("gemm_q8");
+    bind(0, w);
+    bind(1, sb.first);
+    bind(2, sb.second);
+    bind(3, x);
+    bind(4, out);
+    g_.set_value(5, gp);
+    g_.dispatch({cdiv(N, 64), cdiv(T, 64), 1}, {128, 1, 1});
+  }
+
   void linear(const Tensor& x, const Tensor& w, Tensor& out) override {
+    if (w.dtype == DType::U32) {
+      if (skip("linear")) return;
+      uint32_t K = uint32_t(w.dim(1) * 4), N = uint32_t(w.dim(0));
+      return linear_q8(x, w, out, uint32_t(x.numel() / K), N, K);
+    }
     if (skip("linear")) return;
     if (w.dtype != DType::BF16) fail("linear weight must be bf16");
     uint32_t K = uint32_t(w.dim(1)), N = uint32_t(w.dim(0));
@@ -356,6 +435,11 @@ class MetalBackend final : public Backend {
 
   void linear_multi(const Tensor& x, const std::vector<const Tensor*>& ws, const std::vector<Tensor*>& outs) override {
     if (skip("linear")) return;
+    for (auto* w : ws)
+      if (w->dtype == DType::U32) {  // 8-bit build: separate q8 matvecs (a fused q8 multi is a later step)
+        for (size_t i = 0; i < ws.size(); ++i) linear(x, *ws[i], *outs[i]);
+        return;
+      }
     uint32_t K = uint32_t(ws[0]->dim(1)), T = uint32_t(x.numel() / K);
     bool ok = T <= 4 && ws.size() <= 8 && K % 8 == 0 && !getenv("INK_NO_MULTI");
     for (auto* w : ws) ok = ok && w->dim(1) == K && w->dim(0) % 4 == 0 && w->dtype == DType::BF16;
@@ -957,7 +1041,8 @@ class MetalBackend final : public Backend {
     g_.set_value(2, n);
     g_.dispatch({cdiv(n, 256), 1, 1}, {256, 1, 1});
     // Only the first `vocab` rows of the head are needed; out row stride = vocab.
-    linear_rows(hb, head, out, T, uint32_t(vocab), D, 0);
+    if (head.dtype == DType::U32) linear_q8(hb, head, out, T, uint32_t(vocab), D);
+    else linear_rows(hb, head, out, T, uint32_t(vocab), D, 0);
     if (softcap > 0) {
       SoftcapParams sp{uint32_t(T * vocab), softcap};
       pipe("softcap_f32");
@@ -984,10 +1069,22 @@ class MetalBackend final : public Backend {
   std::map<std::string, std::pair<double, long>> prof_;
   std::unordered_map<void*, size_t> sizes_;
   std::unordered_map<std::string, Buf> scratch_;
+  struct KeyHash {
+    size_t operator()(const std::pair<void*, size_t>& k) const { return std::hash<void*>()(k.first) ^ (k.second * 31); }
+  };
+  std::unordered_map<std::pair<void*, size_t>, std::pair<Tensor, Tensor>, KeyHash> affine_;
 };
 
 }  // namespace
 
 std::unique_ptr<Backend> make_metal_backend() { return std::make_unique<MetalBackend>(); }
+
+// bf16 copy of an affine 8-bit matrix (DSpark's fold needs the dequantized lm_head once). False if not Metal.
+bool metal_dequant_affine(Backend& be, const Tensor& codes, Tensor& out) {
+  auto* m = dynamic_cast<MetalBackend*>(&be);
+  if (!m) return false;
+  m->dequant_affine(codes, out);
+  return true;
+}
 
 }  // namespace ink

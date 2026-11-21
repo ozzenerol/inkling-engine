@@ -131,3 +131,20 @@ kernel void gemm_q8(device const uchar* W [[buffer(0)]], device const ushort* S 
       simdgroup_barrier(mem_flags::mem_threadgroup);
     }
 }
+
+// Dequantize rows (embedding lookup) or a whole matrix: out = bf16(s * q + b) per element (as mx.dequantize).
+struct DeqParams {
+  uint rows, K;  // K = values per row
+  uint use_ids;
+};
+kernel void dequant_q8_rows(device const uchar* W [[buffer(0)]], device const ushort* S [[buffer(1)]],
+                            device const ushort* B [[buffer(2)]], device const int* ids [[buffer(3)]],
+                            device ushort* out [[buffer(4)]], constant DeqParams& p [[buffer(5)]],
+                            uint2 gid [[thread_position_in_grid]]) {
+  uint k = gid.x, r = gid.y;
+  if (k >= p.K || r >= p.rows) return;
+  uint src = p.use_ids ? uint(ids[r]) : r;
+  uint ng = p.K / 64;
+  float sc = bf2f(S[src * ng + k / 64]), bi = bf2f(B[src * ng + k / 64]);
+  out[size_t(r) * p.K + k] = f2bf(fma(sc, float(W[size_t(src) * p.K + k]), bi));
+}
