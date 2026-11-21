@@ -568,3 +568,21 @@ head 0.93 -> 0.48). Check script: tests/ref/check_8bit_layout.py (tensor-by-tens
   B: q8 matvec model-free 795 GB/s of codes at T=1 (dense reads of the 8-bit build: 1.7 ms against 8.1 ms bf16),
   so the 8-bit plain step (23.7 ms) is now almost all MoE + head + small-dispatch latency; q8 linear_multi and
   conv_mix: no gain; MoE gate/up with 2 or 1 rows per simdgroup: slower (249 / 237 vs 262 GB/s).
+
+## D: long-context attention, INK_GA (2026-11-21 late, model-free, one run each; last run overlapped batch 8's start)
+
+- The split kernels (B's and mine) stage every K / V tile in threadgroup memory for 8x8 matrix products: at 128k
+  global they read KV at 137-180 GB/s (T=1 2.98 ms, T=2 3.01, T=4 3.81, T=8 5.23, T=16 11.7 ms per call).
+- **INK_GA=1** (kernels/multirow_ga.metal: ga_scores, ga_rowmax, ga_pv, ga_combine): K then V read once straight
+  from device memory, scalar fma chains, scores kept in a scratch buffer between the two passes. One simdgroup =
+  the 3 rows of one token with its q in registers; 1..16 tokens per threadgroup on the same keys. One arithmetic
+  for every T (verify == decode, op_diff ALL OK with INK_GA=1).
+  Per call, GA vs split: 128k T=1 **1.56** vs 2.98 ms, T=2 **1.82** vs 3.01, T=4 **2.96** vs 3.81, T=8 5.64 vs 5.23,
+  T=16 15.9 vs 11.7 (4 tokens per threadgroup; to redo); 32k T=1 0.40 vs 0.92, T=2 0.50 vs 0.92, T=4 0.78 vs 1.11,
+  T=8 1.48 vs 1.44, T=16 2.87 vs 3.07. T=1 is at bandwidth (0.52 GB in 1.56 ms = 335 GB/s); from 4 rows it is
+  bound by the arithmetic (about 2.2 TFLOPS in scalar code).
+- A first version with all rows of up to 4 tokens in one simdgroup (6 or 12 rows of q in registers) collapsed:
+  128k T=2 3.54 ms, T=4 9.9, T=16 37.8.
+- Skipping V blocks with negligible weight (INK_GA_THR) is implemented but off: A's INK_AG_STATS at 6k shows no
+  64-key block negligible for every row.
+- 8-bit KV: on hold (user's relaxed target). It would halve T=1 but not T=4, which is arithmetic bound.
