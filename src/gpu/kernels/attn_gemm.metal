@@ -16,6 +16,7 @@ struct AgParams {
   uint T, rows, rows_pad, H, KVH;
   uint cap, len, ring, window, rel_extent;
   uint j0, n, use_gate, t0;  // t0: first token of the slice (rows are relative to it)
+  uint use_lo;               // 1: P = hi + lo half tiles (~22 bits); 0: hi only (11 bits, 1.5x faster P V)
 };
 
 constant uint AG_KEYS = 1024, AG_D = 128, AG_G = 3, AG_BK = 32;
@@ -229,7 +230,7 @@ kernel void ag_pv(device const float* sh [[buffer(0)]], device const ushort* v_n
       sum += e.x + e.y + e.z + e.w;
       half4 hi = half4(e);
       pd[i] = hi;
-      pld[i] = half4(e - float4(hi));
+      if (p.use_lo) pld[i] = half4(e - float4(hi));
     }
     if (k0 + vr < p.n) {
       device const uint4* vp = (device const uint4*)(ag_kv(vc, v_new, p, g, p.j0 + k0 + vr) + d0 + vcol);
@@ -253,9 +254,11 @@ kernel void ag_pv(device const float* sh [[buffer(0)]], device const ushort* v_n
       }
       for (uint i = 0; i < 4; i++)
         for (uint j = 0; j < 4; j++) simdgroup_multiply_accumulate(acc[i][j], a8[i], b8[j], acc[i][j]);
-      for (uint i = 0; i < 4; i++) simdgroup_load(a8[i], pl + (sm + 8 * i) * AG_LD + kk, AG_LD);
-      for (uint i = 0; i < 4; i++)
-        for (uint j = 0; j < 4; j++) simdgroup_multiply_accumulate(acc[i][j], a8[i], b8[j], acc[i][j]);
+      if (p.use_lo) {
+        for (uint i = 0; i < 4; i++) simdgroup_load(a8[i], pl + (sm + 8 * i) * AG_LD + kk, AG_LD);
+        for (uint i = 0; i < 4; i++)
+          for (uint j = 0; j < 4; j++) simdgroup_multiply_accumulate(acc[i][j], a8[i], b8[j], acc[i][j]);
+      }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
   }

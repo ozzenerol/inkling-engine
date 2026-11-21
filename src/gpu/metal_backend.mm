@@ -120,7 +120,7 @@ struct ChainParams {  // kernels/chain.metal
   uint32_t nq;
 };
 struct AgParams {  // kernels/attn_gemm.metal
-  uint32_t T, rows, rows_pad, H, KVH, cap, len, ring, window, rel_extent, j0, n, use_gate, t0;
+  uint32_t T, rows, rows_pad, H, KVH, cap, len, ring, window, rel_extent, j0, n, use_gate, t0, use_lo;
 };
 struct AttnDecParams {
   uint32_t T, H, KVH, cap, len, ring, window, rel_extent, split_keys, nsplit, causal, first, use_sink, use_gate;
@@ -1098,7 +1098,7 @@ class MetalBackend final : public Backend {
     const Tensor& kc = a.kv.k.valid() ? a.kv.k : a.k_new;
     const Tensor& vc = a.kv.v.valid() ? a.kv.v : a.v_new;
     AgParams p{T, 0, rows_pad, H, KVH, uint32_t(a.kv.cap), len, a.kv.ring ? 1u : 0u, window, ext, 0, 0,
-               gate ? 1u : 0u, 0};
+               gate ? 1u : 0u, 0, ag_half_ ? 0u : 1u};
     pipe("ag_rel_t");
     bind(0, a.rel_proj);
     bind(1, rpt);
@@ -1491,12 +1491,13 @@ class MetalBackend final : public Backend {
   long moe_calls_[17] = {}, moe_routes_[17] = {}, moe_uniq_[17] = {};
   bool mr_attn_ = !(getenv("INK_MR_ATTN") && getenv("INK_MR_ATTN")[0] == '0');  // D: 5..16-row attention
   bool ag_stats_ = getenv("INK_AG_STATS") != nullptr;
+  bool ag_half_ = getenv("INK_AG_HALF") != nullptr;  // prefill attention with P as one half tile (experiment, A)
   // Chain kernels (A), opt-in with INK_CHAIN=1: measured SLOWER than the separate ops (decode 28.6 vs 36.9 tok/s;
   // chain_front 198 us, chain_mid 117 us per call). One threadgroup of 1024 threads has the throughput of one
   // slice of the GPU, so the router and controller matvecs inside it cost far more than the ~7.5 us per
   // dependent dispatch they save.
   bool chain_ = getenv("INK_CHAIN") != nullptr;
-  uint32_t ag_min_t_ = getenv("INK_AG_MIN_T") ? uint32_t(atoi(getenv("INK_AG_MIN_T"))) : 64;  // GEMM attention from this T
+  uint32_t ag_min_t_ = getenv("INK_AG_MIN_T") ? uint32_t(atoi(getenv("INK_AG_MIN_T"))) : 17;  // GEMM attention from this T (3..16 rows: multi-row split kernels)
   std::string cur_;
   std::map<std::string, std::pair<double, long>> prof_;
   std::unordered_map<void*, size_t> sizes_;

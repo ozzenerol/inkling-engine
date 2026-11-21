@@ -32,7 +32,7 @@ int main(int argc, char** argv) {
   EngineOptions o;
   o.model_dir = std::string(getenv("HOME")) + "/llm/mlx-models/Inkling-2-Mini-MLX-4-8bit";
   if (const char* d = getenv("INK_MODEL")) o.model_dir = d;
-  o.max_context = 65536;
+  o.max_context = std::max<int64_t>(65536, int64_t(ids.size()) + n + 256);  // long prompts (126k) fit too
   o.use_mtp = mtp;
   o.draft_block = block;
   o.prefill_chunk = 512;

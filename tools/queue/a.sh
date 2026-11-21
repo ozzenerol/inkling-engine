@@ -1,19 +1,14 @@
-# A: the target line (60 tok/s at the start, 40 at 128k): generation at long context, free text, temp 0.7,
-# 8-bit build. One process per context (prefill once): drafting defaults; the stats line gives the plain step,
-# draft and verify times per T at that depth. long*.ids = source files as context + an essay question.
+# A (batch 8): end of the context on the 8-bit build, and prefill attention with P as one half tile.
 M8=~/llm/mlx-models/Inkling-2-Mini-MLX-8bit
-for ids in p2 long32k long64k long128k; do
-  echo "-- 8-bit $ids temp 0.7, defaults"
-  INK_MODEL=$M8 INK_SPEC_STATS=1 ./build/src/gpu/spec_check dspark ref_data/$ids.ids 300 8 $OUT/a-$ids-t07.i32 0.7 2>&1 | grep -E "tok/s|dspark:|lookup:|adaptive"
-done
-echo "-- 8-bit long128k temp 0.7, plain"
-INK_AG_STATS=1 INK_MODEL=$M8 ./build/src/gpu/spec_check plain ref_data/long128k.ids 100 8 $OUT/a-long128k-plain.i32 0.7 > $OUT/a-long128k-plain.log 2>&1
-grep -E "tok/s" $OUT/a-long128k-plain.log
-echo "-- attention sparsity at 126k (prefill of the last chunk, global layers; first and last key block)"
-grep "ag stats len 12[0-9]* window 0" $OUT/a-long128k-plain.log | sed 's/ag stats //' | sort | uniq -c | sort -rn | head -12
-# copy-heavy and code prompts: regression check of the drafting defaults (greedy must equal plain)
-for ids in copy p0; do
-  INK_MODEL=$M8 ./build/src/gpu/spec_check plain ref_data/$ids.ids 400 8 $OUT/a-$ids-plain.i32 2>&1 | grep -E "tok/s"
-  INK_MODEL=$M8 ./build/src/gpu/spec_check dspark ref_data/$ids.ids 400 8 $OUT/a-$ids-d.i32 2>&1 | grep -E "tok/s"
-  cmp -s $OUT/a-$ids-plain.i32 $OUT/a-$ids-d.i32 && echo "   $ids token-identical to plain" || echo "   $ids DIFFERS from plain"
-done
+PY=~/llm/inkling-venv/bin/python
+echo "-- 8-bit long128k temp 0.7, defaults (generation at 126k)"
+INK_MODEL=$M8 INK_SPEC_STATS=1 ./build/src/gpu/spec_check dspark ref_data/long128k.ids 300 8 $OUT/a-long128k-t07.i32 0.7 2>&1 | grep -E "tok/s|dspark:|adaptive"
+echo "-- prefill attention: P as hi + lo half tiles (default) vs one half tile (INK_AG_HALF=1): accuracy on the long set"
+L="10 11 12 13 14 15 16 17"
+STEPS=32 ACC_OUT=$OUT/long_hilo tests/ref/acc_check.sh metal $L 2>&1 | grep -E "prefill"
+INK_AG_HALF=1 STEPS=32 ACC_OUT=$OUT/long_half tests/ref/acc_check.sh metal $L 2>&1 | grep -E "prefill"
+INK_AG_MIN_T=1000000 STEPS=32 ACC_OUT=$OUT/long_flash tests/ref/acc_check.sh metal $L >/dev/null 2>&1
+$PY -I tests/ref/acc_summary.py "$L" mlx-bf16=mlx hilo=$OUT/long_hilo half=$OUT/long_half flash=$OUT/long_flash
+echo "-- prefill speed at 64k (8-bit): default vs INK_AG_HALF=1"
+INK_MODEL=$M8 ./build/src/gpu/spec_check plain ref_data/long64k.ids 20 8 $OUT/a-l64-hilo.i32 2>&1 | grep -E "tok/s"
+INK_AG_HALF=1 INK_MODEL=$M8 ./build/src/gpu/spec_check plain ref_data/long64k.ids 20 8 $OUT/a-l64-half.i32 2>&1 | grep -E "tok/s"
