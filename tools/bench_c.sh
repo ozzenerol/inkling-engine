@@ -9,7 +9,7 @@
 # GPU: these load the model, so they run only inside the batch (tools/WORKFLOW.md, tools/queue/c.sh).
 # Env: SIZES (ctxbench, default 1000,8000,16000,32000,64000,104000), CONTEXTS (bench.py, default 40,1k,4k,16k,32k),
 #      TURNS (10), AGENT_BASES ("0 30000"), OUT (bench/), SERVER_ARGS (extra inkling-server flags),
-#      BIN (server binary), SKIP_CTX=1, SKIP_AGENT=1. SERVER_ARGS="--model DIR" for the 8-bit build.
+#      BIN (server binary), SKIP_CTX=1, SKIP_AGENT=1, SKIP_COPY=1. SERVER_ARGS="--model DIR" for the 8-bit build.
 set -u
 here=$(cd "$(dirname "$0")/.." && pwd)
 py=$HOME/llm/inkling-venv/bin/python
@@ -43,6 +43,11 @@ measure() {
 			"$py" -u "$here/tools/agent_bench.py" --url "$url" --label "$label" --turns "$turns" \
 				--base-tokens "$base" --out "$out/agent-$label-$base.json"
 		done
+		if [ -z "${SKIP_COPY:-}" ]; then
+			echo "== agent_bench $label (copy scenario, 6 turns)"
+			"$py" -u "$here/tools/agent_bench.py" --url "$url" --label "$label" --scenario copy --turns 6 \
+				--out "$out/agent-$label-copy.json"
+		fi
 	fi
 }
 

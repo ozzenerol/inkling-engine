@@ -27,9 +27,12 @@ source embedded in the binary, so no Xcode is needed.
 ## Run
 
 ```sh
-build/src/server/inkling-server --port 8091                 # 4/8-bit build
-build/src/server/inkling-server --port 8091 --model ~/llm/mlx-models/Inkling-2-Mini-MLX-8bit
+build/src/server/inkling-server --port 8091                 # 8-bit build (the default model)
+build/src/server/inkling-server --port 8091 --model ~/llm/mlx-models/Inkling-2-Mini-MLX-4-8bit   # lossless 4/8-bit
 ```
+
+Without `--model` the server loads `~/llm/mlx-models/Inkling-2-Mini-MLX-8bit` (and falls back to the 4/8-bit build
+if that directory is missing). `/v1/models` reports the directory in use.
 
 `/v1/chat/completions` with streaming, `tool_calls`, `reasoning_content`, `reasoning_effort`, and a prefix cache
 that survives across turns (an agent turn prefills only the new tokens). qh's `~/.qh/config.json` points at 8091.

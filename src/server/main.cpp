@@ -15,8 +15,10 @@ using namespace ink;
 
 int main(int argc, char** argv) {
   std::signal(SIGPIPE, SIG_IGN);
-  std::string model = std::string(std::getenv("HOME") ? std::getenv("HOME") : "") +
-                      "/llm/mlx-models/Inkling-2-Mini-MLX-4-8bit";
+  // Default model: the 8-bit build; the lossless 4/8-bit build if that one is not on disk. --model overrides.
+  const std::string models = std::string(std::getenv("HOME") ? std::getenv("HOME") : "") + "/llm/mlx-models/";
+  std::string model = models + "Inkling-2-Mini-MLX-8bit";
+  if (!std::ifstream(model + "/tokenizer.json")) model = models + "Inkling-2-Mini-MLX-4-8bit";
   std::string host = "127.0.0.1";
   int port = 8091;
   bool stub = false;
