@@ -129,6 +129,11 @@ struct MrAttnParams {  // kernels/multirow.metal (D)
   uint32_t T, H, KVH, cap, len, ring, window, rel_extent, split_keys, nsplit, causal, first, use_sink, use_gate, prow;
   uint32_t t0, nq;  // query rows [t0, t0 + nq) of the T new tokens
 };
+struct GaParams {  // kernels/multirow_ga.metal (D)
+  uint32_t T, H, KVH, cap, len, rel_extent, sr, sk, nblk, nsplit;
+  float thr;
+  uint32_t use_sink, use_gate;
+};
 struct RouterParams {
   uint32_t T, D, E, topk, dt_x;
   float scale;
@@ -849,6 +854,61 @@ class MetalBackend final : public Backend {
     if (skip("attn")) return; attention_impl(a, nullptr, out); }
   void attention_impl(const AttnArgs& a, const Tensor* gate, Tensor& out) {
     uint32_t T = uint32_t(a.q.dim(0)), H = uint32_t(a.q.dim(1)), KVH = uint32_t(a.k_new.dim(1));
+    if (ga_ && a.window == 0 && !a.kv.ring && T <= kMR && H == 3 * KVH && a.kv.len + T >= ga_min_len_ &&
+        !getenv("INK_ATTN_SLOW")) {
+      // D: global attention read straight from device memory, two passes (kernels/multirow_ga.metal). One
+      // arithmetic for every T, so verify rows equal decode rows.
+      const uint32_t len = uint32_t(a.kv.len), nkeys = len + T;
+      const uint32_t tok = T == 1 ? 1 : T == 2 ? 2 : 4;  // tokens per row group
+      const uint32_t R = 3 * tok, groups = cdiv(T, tok), sr = 3 * T;
+      GaParams p{T, H, KVH, uint32_t(a.kv.cap), len, uint32_t(a.rel_proj.dim(1)), sr, cdiv(nkeys, 64) * 64,
+                 cdiv(nkeys, 64), cdiv(nkeys, 512), ga_thr_, 1u, gate ? 1u : 0u};
+      // scratch sizes rounded up (16k keys, 12 rows) so they are regrown, with a sync, only rarely
+      const uint32_t sra = cdiv(sr, 12) * 12, ska = cdiv(nkeys, 16384) * 16384;
+      Tensor S = scratch("ga-s", DType::F32, {KVH * sra, ska});
+      Tensor bmax = scratch("ga-bmax", DType::F32, {KVH * sra, ska / 64});
+      Tensor M = scratch("ga-m", DType::F32, {KVH * 3 * kMR});
+      Tensor part = scratch("ga-part", DType::F32, {KVH * (ska / 512) * sra, 132});
+      const std::string rs = "_r" + std::to_string(R);
+      const Tensor& kc = a.kv.k.valid() ? a.kv.k : a.k_new;
+      const Tensor& vc = a.kv.v.valid() ? a.kv.v : a.v_new;
+      pipe("ga_scores" + rs);
+      bind(0, a.q);
+      bind(1, a.k_new);
+      bind(2, a.r);
+      bind(3, a.rel_proj);
+      bind(4, kc);
+      bind(5, S);
+      bind(6, bmax);
+      g_.set_value(7, p);
+      g_.dispatch({p.nblk, KVH, groups}, {128, 1, 1});
+      pipe("ga_rowmax");
+      bind(0, bmax);
+      bind(1, a.sink);
+      bind(2, M);
+      g_.set_value(3, p);
+      g_.dispatch({sr, KVH, 1}, {32, 1, 1});
+      if (!ga_no_pv_) {  // INK_GA_NOPV: timing ablation, results wrong
+        pipe("ga_pv" + rs);
+        bind(0, S);
+        bind(1, bmax);
+        bind(2, M);
+        bind(3, a.v_new);
+        bind(4, vc);
+        bind(5, part);
+        g_.set_value(6, p);
+        g_.dispatch({p.nsplit, KVH, groups}, {128, 1, 1});
+      }
+      pipe("ga_combine");
+      bind(0, part);
+      bind(1, M);
+      bind(2, a.sink);
+      bind(3, out);
+      bind(4, gate ? *gate : out);
+      g_.set_value(5, p);
+      g_.dispatch({T, H, 1}, {128, 1, 1});
+      return;
+    }
     if (T <= 4 && !(mr_attn_ && T >= mr_attn_min_) && H == 3 * KVH && !getenv("INK_ATTN_SLOW")) {
       uint32_t len = uint32_t(a.kv.len), window = uint32_t(a.window);
       uint32_t first = (window && len + 1 > window) ? len + 1 - window : 0;
@@ -1426,6 +1486,13 @@ class MetalBackend final : public Backend {
   uint32_t mr_q8_r_ = getenv("INK_MR_Q8_R") ? uint32_t(atoi(getenv("INK_MR_Q8_R"))) : 0;
   bool mr_moe_ = !(getenv("INK_MR_MOE") && getenv("INK_MR_MOE")[0] == '0');
   uint32_t mr_moe_min_ = getenv("INK_MR_MOE_MIN") ? uint32_t(atoi(getenv("INK_MR_MOE_MIN"))) : 3;
+  // D: two-pass global attention without staging. Opt-in (INK_GA=1) until measured. INK_GA_THR=x: weights below
+  // exp(-x) of the row maximum are dropped and blocks with nothing above it are not read (default: nothing dropped).
+  // INK_GA_MIN_LEN=n: only from n keys.
+  bool ga_ = getenv("INK_GA") && getenv("INK_GA")[0] == '1';
+  bool ga_no_pv_ = getenv("INK_GA_NOPV") != nullptr;
+  float ga_thr_ = getenv("INK_GA_THR") ? float(atof(getenv("INK_GA_THR"))) : 1e30f;
+  uint32_t ga_min_len_ = getenv("INK_GA_MIN_LEN") ? uint32_t(atoi(getenv("INK_GA_MIN_LEN"))) : 0;
   bool moe_stats_ = getenv("INK_MOE_STATS") != nullptr;
   long moe_calls_[17] = {}, moe_routes_[17] = {}, moe_uniq_[17] = {};
   bool mr_attn_ = !(getenv("INK_MR_ATTN") && getenv("INK_MR_ATTN")[0] == '0');  // D: 5..16-row attention
