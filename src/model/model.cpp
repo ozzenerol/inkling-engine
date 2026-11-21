@@ -358,7 +358,7 @@ void Model::run_visit(int v, Tensor& x, std::vector<Tensor>& blocks, const Chain
   // Chain kernels (A): one dispatch for the front (mix, controllers, norms) and one for the middle (conv, mix,
   // controller, norm, router). Decode and verify only; the debug hook needs the separate intermediates.
   const bool chain = be_.has_chain(T) && !on_debug && !no_chain_;
-  const bool chain_front = chain && w.local && L > 0;
+  const bool chain_front = chain && L > 0;
   ChainCtrl ctrl_w[4];
   if (cm)
     for (int i = 0; i < 4; ++i) ctrl_w[i] = ChainCtrl{w.ctrl_down[i], w.ctrl_forget[i], w.ctrl_gain[i]};
@@ -380,14 +380,18 @@ void Model::run_visit(int v, Tensor& x, std::vector<Tensor>& blocks, const Chain
     }
     fa.x = x;
     for (auto& b : blocks) fa.blocks.push_back(&b);
+    fa.nq = nq;
     fa.query = w.attn_query;
-    fa.gamma = w.in_norm;
+    fa.gamma = w.local ? w.in_norm : w.q_norm;
+    fa.gamma_k = w.k_norm;
+    fa.gamma_v = w.v_norm;
     fa.msg = cm;
     fa.ctrl = cm ? ctrl_w : nullptr;
     fa.eps = cfg_.rms_eps;
     fa.xq = view(partsb_[0], {T, D});
-    fa.xk = cm ? view(partsb_[1], {T, D}) : fa.xq;
-    fa.xv = cm ? view(partsb_[2], {T, D}) : fa.xq;
+    const bool three = cm || nq == 3;
+    fa.xk = three ? view(partsb_[1], {T, D}) : fa.xq;
+    fa.xv = three ? view(partsb_[2], {T, D}) : fa.xq;
     be_.chain_front(fa);
     xq = fa.xq;
     xk = fa.xk;
@@ -586,7 +590,7 @@ void Model::run_visit(int v, Tensor& x, std::vector<Tensor>& blocks, const Chain
   Tensor mc = view(mo_, {T, D});
   // x = res + conv(mo). With chains the next local visit's front kernel does it (same pass, same block list).
   const int Ln = v + 1 < cfg_.num_visits() ? cfg_.visits[v + 1] : -1;
-  if (chain && Ln > 0 && Ln != cfg_.core_start && lw_[Ln].local) {
+  if (chain && Ln > 0 && Ln != cfg_.core_start) {
     pending_.on = true;
     pending_.res = res;
     pending_.conv = ChainConv{mo, w.mlp_sconv, &s.conv[3], nullptr};

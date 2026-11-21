@@ -111,6 +111,7 @@ struct AttnParams {
 struct ChainParams {  // kernels/chain.metal
   uint32_t T, D, nb, has_conv, boundary, has_hist, has_msg, topk, E, R;
   float eps, route_scale;
+  uint32_t nq;
 };
 struct AgParams {  // kernels/attn_gemm.metal
   uint32_t T, rows, rows_pad, H, KVH, cap, len, ring, window, rel_extent, j0, n, use_gate, t0;
@@ -795,7 +796,7 @@ class MetalBackend final : public Backend {
     if (a.blocks.size() > 4 || D > 2304) fail("chain_front: unsupported shape");
     ChainParams p{T, D, uint32_t(a.blocks.size()), a.has_conv ? 1u : 0u, 0u,
                   (a.has_conv && a.conv.hist) ? 1u : 0u, a.msg ? 1u : 0u, 0u, 0u,
-                  a.msg ? uint32_t(a.ctrl[0].down.dim(0)) : 64u, a.eps, 0.0f};
+                  a.msg ? uint32_t(a.ctrl[0].down.dim(0)) : 64u, a.eps, 0.0f, uint32_t(a.nq)};
     pipe("chain_front");
     const Tensor& dummy = a.x;
     bind(0, a.has_conv ? a.conv.in : dummy);
@@ -819,6 +820,8 @@ class MetalBackend final : public Backend {
       bind(20 + 3 * c, a.msg ? a.ctrl[c].gain : dummy);
     }
     g_.set_value(27, p);
+    bind(28, a.nq == 3 ? a.gamma_k : a.gamma);
+    bind(29, a.nq == 3 ? a.gamma_v : a.gamma);
     g_.dispatch({1, 1, 1}, {1024, 1, 1});
   }
   void chain_mid(const ChainMidArgs& a) override {
@@ -829,7 +832,7 @@ class MetalBackend final : public Backend {
     if (st.size() > 4 || D > 2304 || E != 128 || a.topk > 8 || a.moe->gate_w.dtype != DType::BF16)
       fail("chain_mid: unsupported shape");
     ChainParams p{T, D, uint32_t(st.size()), 0u, a.boundary ? 1u : 0u, a.conv.hist ? 1u : 0u, a.msg ? 1u : 0u,
-                  uint32_t(a.topk), E, a.msg ? uint32_t(a.ctrl->down.dim(0)) : 64u, a.eps, a.route_scale};
+                  uint32_t(a.topk), E, a.msg ? uint32_t(a.ctrl->down.dim(0)) : 64u, a.eps, a.route_scale, 1u};
     pipe("chain_mid");
     const Tensor& dummy = a.x;
     bind(0, a.conv.in);

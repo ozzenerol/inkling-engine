@@ -4,8 +4,8 @@
 // them). Rows are processed one after the other inside the threadgroup, so a verify row is computed exactly as
 // the decode row would be. All per-token vectors live in threadgroup memory.
 //
-//   chain_front  [x = bf16(res + conv(moe out)) of the previous visit] -> attention-residual mix (attn query)
-//                -> [loop passes: 3 message controllers] -> input norm -> xq (xk, xv)
+//   chain_front  [x = bf16(res + conv(moe out)) of the previous visit] -> attention-residual mix (1 query on
+//                local layers, 3 on global) -> [loop passes: 3 message controllers] -> input norm(s) -> xq, xk, xv
 //   chain_mid    res = conv(o_proj out) (+ x) -> [block copy] -> mix (mlp query) -> [mlp message controller]
 //                -> post norm -> hn -> router scores, top-k and weights
 // Math and rounding points follow backend.h (same as the separate ops; fp32 sums differ in order only).
@@ -15,6 +15,7 @@ struct ChainParams {
   uint has_conv, boundary, has_hist, has_msg;
   uint topk, E, R;
   float eps, route_scale;
+  uint nq;                             // chain_front: 1 = local (one query), 3 = global (q, k, v queries)
 };
 
 constant uint CH_NT = 1024, CH_MAXD = 2304;
@@ -198,10 +199,12 @@ kernel void chain_front(device const ushort* mo [[buffer(0)]], device const usho
                         device const ushort* forget1 [[buffer(22)]], device const ushort* gain1 [[buffer(23)]],
                         device const ushort* down2 [[buffer(24)]], device const ushort* forget2 [[buffer(25)]],
                         device const ushort* gain2 [[buffer(26)]], constant ChainParams& p [[buffer(27)]],
+                        device const ushort* gamma1 [[buffer(28)]], device const ushort* gamma2 [[buffer(29)]],
                         uint tid [[thread_index_in_threadgroup]], uint sg [[simdgroup_index_in_threadgroup]],
                         uint lane [[thread_index_in_simdgroup]]) {
   threadgroup float va[CH_MAXD];
   threadgroup float vb[CH_MAXD];
+  threadgroup float vc[CH_MAXD];
   threadgroup float scratch[16 * 32];
   threadgroup float h[64];
   const uint D = p.D;
@@ -216,22 +219,35 @@ kernel void chain_front(device const ushort* mo [[buffer(0)]], device const usho
       }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    ch_mix(b0, b1, b2, b3, p.nb, va, query, vb, t, D, tid, sg, lane, scratch);  // vb = mixed
-    if (!p.has_msg) {
-      ch_norm(vb, gamma, xq, p.eps, false, t, D, tid, sg, lane, scratch);
-      continue;
-    }
+    // Local layers: one mix (one query), then with messages three controllers on it. Global layers: three
+    // queries, so a mix per output, each with its own norm weight. vb = mix, va = x until the last mix (nq == 1
+    // frees it after the first mix; nq == 3 keeps x in va and puts controller outputs in vc).
     float coef[6];
-    ch_msg_coef(bank0, bank1, mq, 0, 3, coef, t, D, tid, sg, lane, scratch);
+    if (p.has_msg) ch_msg_coef(bank0, bank1, mq, 0, 3, coef, t, D, tid, sg, lane, scratch);
+    device ushort* outs[3] = {xq, xk, xv};
+    device const ushort* gammas[3] = {gamma, gamma1, gamma2};
+    device const ushort* downs[3] = {down0, down1, down2};
+    device const ushort* forgets[3] = {forget0, forget1, forget2};
+    device const ushort* gains[3] = {gain0, gain1, gain2};
+    uint nout = (p.has_msg || p.nq == 3) ? 3 : 1;
     float ssx = 0;
-    for (uint i = tid; i < D; i += CH_NT) ssx = fma(vb[i], vb[i], ssx);
-    ch_sum(&ssx, 1, scratch, sg, lane);
-    ch_ctrl(vb, ssx, bank0, bank1, coef[0], coef[1], down0, forget0, gain0, va, h, t, D, p.R, tid, sg, lane, scratch);
-    ch_norm(va, gamma, xq, p.eps, false, t, D, tid, sg, lane, scratch);
-    ch_ctrl(vb, ssx, bank0, bank1, coef[2], coef[3], down1, forget1, gain1, va, h, t, D, p.R, tid, sg, lane, scratch);
-    ch_norm(va, gamma, xk, p.eps, false, t, D, tid, sg, lane, scratch);
-    ch_ctrl(vb, ssx, bank0, bank1, coef[4], coef[5], down2, forget2, gain2, va, h, t, D, p.R, tid, sg, lane, scratch);
-    ch_norm(va, gamma, xv, p.eps, false, t, D, tid, sg, lane, scratch);
+    for (uint c = 0; c < nout; c++) {
+      if (c == 0 || p.nq == 3) {
+        ch_mix(b0, b1, b2, b3, p.nb, va, query + (p.nq == 3 ? c * D : 0), vb, t, D, tid, sg, lane, scratch);
+        if (p.has_msg) {
+          ssx = 0;
+          for (uint i = tid; i < D; i += CH_NT) ssx = fma(vb[i], vb[i], ssx);
+          ch_sum(&ssx, 1, scratch, sg, lane);
+        }
+      }
+      if (!p.has_msg) {
+        ch_norm(vb, gammas[c], outs[c], p.eps, false, t, D, tid, sg, lane, scratch);
+      } else {
+        ch_ctrl(vb, ssx, bank0, bank1, coef[2 * c], coef[2 * c + 1], downs[c], forgets[c], gains[c], vc, h, t, D, p.R,
+                tid, sg, lane, scratch);
+        ch_norm(vc, gammas[c], outs[c], p.eps, false, t, D, tid, sg, lane, scratch);
+      }
+    }
   }
 }
 

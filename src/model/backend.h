@@ -72,17 +72,19 @@ struct ChainMsg {           // loop messages of one visit, never materialized: m
 struct ChainCtrl {
   Tensor down, forget, gain;
 };
-struct ChainFrontArgs {     // local layer, L > 0
+struct ChainFrontArgs {     // any layer with L > 0
   bool has_conv = false;    // first finish the previous visit: x = bf16(res + conv(moe out))
   ChainConv conv;
   Tensor res;               // f32 [T,D] (has_conv)
   Tensor x;                 // bf16 [T,D]: written when has_conv, read otherwise
   std::vector<const Tensor*> blocks;  // bf16 [T,D] each, at most 4
-  Tensor query, gamma;      // attention_input query f32 [D], input_layernorm
+  int nq = 1;               // 1: local (one query, one norm); 3: global (q, k, v queries and norms)
+  Tensor query, gamma;      // attention_input query f32 [nq,D]; input_layernorm (local) or q_input_layernorm
+  Tensor gamma_k, gamma_v;  // global: k_ / v_input_layernorm
   const ChainMsg* msg = nullptr;      // loop passes: controllers attn, k, v (slots 0..2)
   const ChainCtrl* ctrl = nullptr;    // [3]
   float eps = 1e-6f;
-  Tensor xq, xk, xv;        // bf16 [T,D]; xk, xv only with msg
+  Tensor xq, xk, xv;        // bf16 [T,D]; xk, xv only with msg or nq == 3
 };
 struct ChainMidArgs {       // after o_proj, any layer
   ChainConv conv;           // o_proj out + attn_sconv
