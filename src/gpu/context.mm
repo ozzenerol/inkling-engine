@@ -56,6 +56,9 @@ struct Context::Impl {
   std::thread warm_thread;
   int since_commit = 0;
   int commit_every = 128;
+  bool null_mode = false;  // INK_NULL=1 (timing experiment: results are garbage)
+  id<MTLComputePipelineState> null_pipe = nil;
+  id<MTLBuffer> null_buf = nil;
   bool concurrent = false;
   bool untracked = false;
   bool smart = true;  // concurrent encoder + barriers only on buffer hazards (INK_SERIAL=1: serial encoder)
@@ -98,6 +101,7 @@ Context::Context() : impl_(new Impl) {
     if (const char* ce = getenv("INK_COMMIT_EVERY")) impl_->commit_every = atoi(ce);
     if (const char* ws = getenv("INK_WARM_SECS")) impl_->warm_secs = atof(ws);
     impl_->concurrent = getenv("INK_CONCURRENT") != nullptr;
+    impl_->null_mode = getenv("INK_NULL") != nullptr;
     impl_->smart = getenv("INK_SERIAL") == nullptr && !impl_->concurrent;
     g_barrier_report.b = &impl_->barriers;
     g_barrier_report.d = &impl_->dispatches;
@@ -350,7 +354,17 @@ void Context::dispatch(Dim3 g, Dim3 t) {
     impl_->cur.clear();
     impl_->dispatches++;
   }
-  [impl_->enc dispatchThreadgroups:MTLSizeMake(g.x, g.y, g.z) threadsPerThreadgroup:MTLSizeMake(t.x, t.y, t.z)];
+  if (impl_->null_mode) {
+    if (!impl_->null_pipe) {
+      impl_->null_pipe = (__bridge id<MTLComputePipelineState>)pipeline("null_tick");
+      impl_->null_buf = [impl_->device newBufferWithLength:16 options:MTLResourceStorageModeShared];
+    }
+    [impl_->enc setComputePipelineState:impl_->null_pipe];
+    [impl_->enc setBuffer:impl_->null_buf offset:0 atIndex:30];
+    [impl_->enc dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
+  } else {
+    [impl_->enc dispatchThreadgroups:MTLSizeMake(g.x, g.y, g.z) threadsPerThreadgroup:MTLSizeMake(t.x, t.y, t.z)];
+  }
   if (impl_->concurrent) [impl_->enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
   // Submit in pieces so the GPU starts while the CPU is still encoding the rest of a forward. One serial queue
   // keeps the order; wait() on the last buffer covers the earlier ones.
