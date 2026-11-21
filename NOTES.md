@@ -860,3 +860,10 @@ the rest partly-filled tiles. So short agent turns (~650-700 tok/s) cannot reach
 Server (c/work 33f3f4b): the system prompt + tools prefix is pinned during the first prefill (prefix hint from
 rendering the leading system messages alone), so session 2 restores it; stub test added. First SSE chunk was
 already sent before the prefill.
+
+## Batch 12 (main 0cf4a96, 00:14-00:29, one run)
+
+Gates pass. Depth bench as batches 10-11 (127k: 27.7 gen, 383 read). **Prefix pin works on the real engine**: the
+copy session (second session, same system prompt + tools) starts with `cache: ckpt`, 2043 of 2643 tokens cached,
+TTFT 1.00 s (batch 10-11: full prefill, 3.35 s). Its sum of TTFT 5.6 s vs 7.9. The read session wrote 3639 tokens
+this run (2010 before: sampled output, 12 turns' worth of text), so its 83 s total is not comparable.
