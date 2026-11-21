@@ -523,6 +523,32 @@ int main(int argc, char** argv) {
       MTL->free(x);
       MTL->free(y);
     }
+    // D: a T-row q8 linear must equal T one-row q8 linears bit for bit (5..16 rows: one-pass kernel)
+    for (int64_t T : {4, 5, 8, 11, 16}) {
+      size_t bad = 0;
+      for (int f32x = 0; f32x < 2; f32x++)
+        for (int f32y = 0; f32y < 2; f32y++) {
+          const DType xd = f32x ? DType::F32 : DType::BF16, yd = f32y ? DType::F32 : DType::BF16;
+          auto xq = make(xd, {T, K});
+          Tensor yT = MTL->alloc(yd, {T, N}, "q8yT"), y1 = MTL->alloc(yd, {1, N}, "q8y1");
+          MTL->linear(xq.m, wc, yT);
+          for (int64_t t = 0; t < T; t++) {
+            Tensor xt = xq.m;
+            xt.set_shape({1, K});
+            xt.offset += size_t(t) * K * dtype_size(xd);
+            MTL->linear(xt, wc, y1);
+            MTL->sync();
+            const size_t rb = size_t(N) * dtype_size(yd);
+            bad += memcmp(y1.data<char>(), yT.data<char>() + t * rb, rb) != 0;
+          }
+          MTL->free(yT);
+          MTL->free(y1);
+        }
+      char nm[64];
+      snprintf(nm, sizeof nm, "q8 linear rows==T1 T=%lld", (long long)T);
+      printf("%-28s %s  rows differing: %zu\n", nm, bad ? "FAIL" : "ok  ", bad);
+      if (bad) fails++;
+    }
     if (getenv("INK_Q8_MULTI")) {  // fused q8 multi == separate q8 matvecs (bit-identical), T = 1 and 3
       Tensor w2 = MTL->alloc(DType::U32, {N, K / 4}, "q8w2");
       MTL->write(w2, codes.data() + 97, codes.size() - 97);

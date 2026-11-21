@@ -4,7 +4,8 @@
 # 4-8bit build and for the 8-bit build, plus the copy-heavy agent scenario; then qh end-to-end x1 on the
 # server's default model (8-bit).
 # FULL=1 (on request, ~15 min): ctxbench 1.2k..127.5k, agent_bench base 0 and 30000, qh end-to-end x2.
-# MLX=1 (on request, ~20 min more): the same agent_bench against MLX-VLM for a same-day baseline.
+# MLX=1 (on request, ~5 min): MLX-VLM baseline for the copy scenario if none is stored; MLX=all re-measures
+# all of MLX's agent sessions (~20 min with FULL).
 # Results: $OUT (default bench/queue-c), then the tables from tools/bench_report.py.
 set -u
 here=$(cd "$(dirname "$0")/../.." && pwd)
@@ -41,7 +42,10 @@ for _ in $(seq 1 120); do curl -s -m 2 http://127.0.0.1:8091/v1/models >/dev/nul
 kill $pid 2>/dev/null; wait $pid 2>/dev/null
 grep -E "diverged|no checkpoint|restore of|WARNING|rror" "$OUT"/inkling*serve*.log | cut -c1-160 | sed 's/^/cache: /'
 if [ -n "${MLX:-}" ]; then
-	bases=0; [ -n "${FULL:-}" ] && bases="0 30000"
-	SKIP_CTX=1 AGENT_BASES="$bases" "$here/tools/bench_c.sh" mlx
+	# MLX=1: only what has no stored baseline in tests/server/baseline (the copy scenario, ~5 min).
+	# MLX=all: also the read sessions again (base 0, and 30000 with FULL: ~4 + ~12 min).
+	bases=none
+	if [ "$MLX" = all ]; then bases=0; [ -n "${FULL:-}" ] && bases="0 30000"; fi
+	[ -e "$OUT/agent-mlx-copy.json" ] && [ "$MLX" != all ] || SKIP_CTX=1 AGENT_BASES="$bases" "$here/tools/bench_c.sh" mlx
 fi
 "$here/tools/bench_c.sh" report
