@@ -639,3 +639,46 @@ Also: batch 5's "q8 matvec 795 GB/s" came from zero-filled weights in bench_q8 a
 - Skipping V blocks with negligible weight (INK_GA_THR) is implemented but off: A's INK_AG_STATS at 6k shows no
   64-key block negligible for every row.
 - 8-bit KV: on hold (user's relaxed target). It would halve T=1 but not T=4, which is arithmetic bound.
+
+## B: state at end of 2026-11-21 (b/work)
+
+**Default on (measured in a batch):** runtime-compiled Metal library with all pipelines built at start; weights
+pread into resident buffers + residency set; bf16 matvec (1, 2, 4 rows), prefill GEMM (11.5 TFLOPS); fast MoE
+decode kernels with the vector NVFP4 decode (131.6 us per call); MoE prefill (GPU route sort + grouped dequant GEMM,
+64-row tiles); split-K decode attention with fixed position-aligned splits (verify rows == decode rows); fused
+decode ops attn_prep_local / attention_gated / conv_add (really wired only since batch 7: 43.5 vs 42.9 tok/s,
+tokens identical), mix + norm, batched controllers; prefill controller GEMM (p3 3.96 -> 3.72 s); parallel prefill
+short conv; q8 kernels for the 8-bit build (43-45 tok/s vs 36.7 converted); 2-row matvecs for T = 2 verifies
+(32.8 -> 29.2 ms); concurrent encoder with own hazard barriers; DSpark drafter (greedy + sampled drafts).
+
+**Opt-in, measured, no gain (leave off or delete):** INK_CONV_MIX (36.5 vs 36.4), INK_Q8_MULTI (42.2 vs 42.1),
+INK_MOE_RPS=2/1 (slower: 249 / 237 vs 262 GB/s), INK_SKINNY / INK_MV_T8 (D owns multi-row now), INK_ROUTER_FUSED.
+Removed after measuring: MoE GEMM v2, FP4 byte LUT, 128-row MoE tiles, INK_BUSY (no effect at any load).
+
+**Opt-in, unmeasured until batch 9's b.log:** INK_MOE_M=32 / 0 (32-row MoE prefill tiles; expect ~20% less MoE
+work at ~800 new tokens; must be byte-identical), INK_RW=1 (read / write hazard sets from pipeline reflection),
+INK_NULL=1 (timing only: every dispatch replaced by a one-thread kernel), INK_WARM_SECS (GPU keep-warm, default 0,
+never measured: needs a tool with an idle gap before a request).
+
+**Open questions**
+1. What holds the plain step (23.6 ms on the 8-bit build: MoE 7.5, dense 6.2, small 4.7, attention 3.0, mix 2.5,
+   controllers 2.5, router 2.0, logits 1.5 by INK_SKIP)? The same 1.37 GB of q8 codes takes 1.8 ms model-free, and
+   7.8 / 14.1 ms with 2 / 6 tiny dependent dispatches after each matvec, yet removing ~500 dispatches from the
+   step gained <= 1.4%. Suspect: my hazard tracker treats common READS as hazards and a barrier is global, so the
+   step is fully serialized (1200 barriers per 1560 dispatches). INK_NULL (bare chain) and INK_RW decide it.
+2. 32-row MoE tile verdict (800-token turns run at 630 tok/s against 816 at 2048).
+3. bench_q8 reports 750 GB/s with random codes: above the 366 GB/s we took as the machine's limit, which was a
+   compute limit of the bf16 kernel. The real memory ceiling is unmeasured.
+
+**Next 3 steps**
+1. Read bench/batch-9/b.log. If INK_NULL shows a chain of ~8-10 ms and INK_RW is token-identical with fewer
+   barriers and faster: make INK_RW the default; then look for the remaining false dependencies (scratch buffers
+   shared between ops: moe-a, attn-part, ctrl-pair are reused every visit and serialize visits).
+2. If INK_NULL is ~1-2 ms: the time is in the kernels. Compare per-kernel us in the model with the model-free
+   benches (matvec_q8 15 us per call in the profile vs 6 us in the bench) and test pipeline-switch order and
+   threadgroup-memory setup as causes.
+3. Apply the batch 9 verdict on INK_MOE_M (default 0 if 800 tokens gains and 2048 does not lose), then delete the
+   opt-in paths listed above as "no gain" so the backend has one path per op.
+
+Corrections on record: see "B: correction (fused decode ops were not wired)" above; my NOTES numbers from before
+batch 7 for those three fusions were for the unfused paths.
