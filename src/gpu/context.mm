@@ -14,6 +14,7 @@
 #include <mutex>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 
 namespace ink::gpu {
 
@@ -21,6 +22,14 @@ namespace ink::gpu {
   fprintf(stderr, "gpu: %s\n", msg.c_str());
   abort();
 }
+
+static struct BarrierReport {
+  long* b = nullptr;
+  long* d = nullptr;
+  ~BarrierReport() {
+    if (b && getenv("INK_GPU_TIME")) fprintf(stderr, "hazard barriers: %ld of %ld dispatches\n", *b, *d);
+  }
+} g_barrier_report;
 
 struct Context::Impl {
   id<MTLDevice> device;
@@ -35,6 +44,13 @@ struct Context::Impl {
   std::vector<id<MTLCommandBuffer>> pending;  // committed early, not yet waited
   int since_commit = 0;
   int commit_every = 128;
+  bool concurrent = false;
+  bool untracked = false;
+  bool smart = true;  // concurrent encoder + barriers only on buffer hazards (INK_SERIAL=1: serial encoder)
+  std::unordered_set<void*> readonly;      // weights: never written by kernels
+  std::unordered_set<void*> touched;       // buffers bound by dispatches since the last barrier
+  std::vector<void*> cur;                  // buffers bound for the next dispatch
+  long barriers = 0, dispatches = 0;
   std::unordered_map<void*, std::pair<std::string, size_t>> live;  // mtl ptr -> tag, size
   bool residency_dirty = false;
 };
@@ -68,6 +84,11 @@ Context::Context() : impl_(new Impl) {
     std::string all;
     for (auto& [name, src] : embedded_kernels()) all += "// ---- " + name + "\n" + src + "\n";
     if (const char* ce = getenv("INK_COMMIT_EVERY")) impl_->commit_every = atoi(ce);
+    impl_->concurrent = getenv("INK_CONCURRENT") != nullptr;
+    impl_->smart = getenv("INK_SERIAL") == nullptr && !impl_->concurrent;
+    g_barrier_report.b = &impl_->barriers;
+    g_barrier_report.d = &impl_->dispatches;
+    impl_->untracked = getenv("INK_UNTRACKED") != nullptr;
     if (!all.empty()) compile("ink", all);
   }
 }
@@ -117,7 +138,8 @@ Buf Context::alloc(size_t bytes, const char* tag, bool resident) {
   if (bytes == 0) bytes = 16;
   id<MTLBuffer> b = [impl_->device newBufferWithLength:bytes
                                                options:MTLResourceStorageModeShared |
-                                                       MTLResourceHazardTrackingModeTracked];
+                                                       (impl_->untracked ? MTLResourceHazardTrackingModeUntracked
+                                                                         : MTLResourceHazardTrackingModeTracked)];
   if (!b) die("alloc " + std::to_string(bytes) + " bytes for " + tag);
   b.label = [NSString stringWithUTF8String:tag];
   if (resident && impl_->residency) {
@@ -145,6 +167,7 @@ void Context::release(Buf& b) {
       impl_->residency_dirty = true;
     }
   }
+  impl_->readonly.erase(b.mtl);
   auto it = impl_->live.find(b.mtl);
   if (it != impl_->live.end()) {
     impl_->by_tag[it->second.first] -= it->second.second;
@@ -192,6 +215,7 @@ static void pread_all(const std::string& path, size_t offset, size_t bytes, char
 
 Buf Context::load_file(const std::string& path, size_t offset, size_t bytes, const char* tag) {
   Buf b = alloc(bytes, tag, true);
+  impl_->readonly.insert(b.mtl);
   pread_all(path, offset, bytes, (char*)b.host);
   return b;
 }
@@ -199,7 +223,10 @@ Buf Context::load_file(const std::string& path, size_t offset, size_t bytes, con
 std::vector<Buf> Context::load_files(const std::vector<FileRange>& reqs) {
   std::vector<Buf> out;
   out.reserve(reqs.size());
-  for (auto& r : reqs) out.push_back(alloc(r.bytes, r.tag.c_str(), true));
+  for (auto& r : reqs) {
+    out.push_back(alloc(r.bytes, r.tag.c_str(), true));
+    impl_->readonly.insert(out.back().mtl);
+  }
   // Small tensors: one thread per file range from a shared queue; big ones are split inside pread_all.
   std::atomic<size_t> next{0};
   auto worker = [&] {
@@ -238,7 +265,10 @@ void Context::ensure_encoder() {
     }
     impl_->cmd = [impl_->queue commandBufferWithUnretainedReferences];
   }
-  impl_->enc = [impl_->cmd computeCommandEncoderWithDispatchType:MTLDispatchTypeSerial];
+  impl_->enc = [impl_->cmd computeCommandEncoderWithDispatchType:((impl_->concurrent || impl_->smart)
+                                                                                     ? MTLDispatchTypeConcurrent
+                                                                                     : MTLDispatchTypeSerial)];
+  impl_->touched.clear();  // a new encoder starts after the previous one (tracked resources across encoders)
 }
 
 void Context::end_encoder() {
@@ -256,6 +286,7 @@ void Context::set_pipeline(Pipeline p) {
 void Context::set_buffer(uint32_t index, Buf b, size_t offset) {
   ensure_encoder();
   [impl_->enc setBuffer:(__bridge id<MTLBuffer>)b.mtl offset:offset atIndex:index];
+  if (impl_->smart && !impl_->readonly.count(b.mtl)) impl_->cur.push_back(b.mtl);
 }
 
 void Context::set_bytes(uint32_t index, const void* data, size_t n) {
@@ -270,7 +301,25 @@ void Context::set_threadgroup_memory(uint32_t index, size_t bytes) {
 
 void Context::dispatch(Dim3 g, Dim3 t) {
   ensure_encoder();
+  if (impl_->smart) {
+    // Conservative: any non-weight buffer bound here that a dispatch since the last barrier also bound is a hazard.
+    bool hazard = false;
+    for (void* b : impl_->cur)
+      if (impl_->touched.count(b)) {
+        hazard = true;
+        break;
+      }
+    if (hazard) {
+      [impl_->enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+      impl_->touched.clear();
+      impl_->barriers++;
+    }
+    for (void* b : impl_->cur) impl_->touched.insert(b);
+    impl_->cur.clear();
+    impl_->dispatches++;
+  }
   [impl_->enc dispatchThreadgroups:MTLSizeMake(g.x, g.y, g.z) threadsPerThreadgroup:MTLSizeMake(t.x, t.y, t.z)];
+  if (impl_->concurrent) [impl_->enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
   // Submit in pieces so the GPU starts while the CPU is still encoding the rest of a forward. One serial queue
   // keeps the order; wait() on the last buffer covers the earlier ones.
   if (++impl_->since_commit >= impl_->commit_every && impl_->commit_every > 0) {

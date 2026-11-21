@@ -94,7 +94,8 @@ struct ResParams {
   uint T, D, nb, nq;
   uint dt[8];
 };
-kernel void attn_residual_mix(device const void* s0 [[buffer(0)]], device const void* s1 [[buffer(1)]],
+template <uint NT>
+kernel void attn_residual_mix_t(device const void* s0 [[buffer(0)]], device const void* s1 [[buffer(1)]],
                               device const void* s2 [[buffer(2)]], device const void* s3 [[buffer(3)]],
                               device const void* s4 [[buffer(4)]], device const void* s5 [[buffer(5)]],
                               device const void* s6 [[buffer(6)]], device const void* s7 [[buffer(7)]],
@@ -103,7 +104,7 @@ kernel void attn_residual_mix(device const void* s0 [[buffer(0)]], device const 
                               uint tid [[thread_position_in_threadgroup]], uint lane [[thread_index_in_simdgroup]],
                               uint sg [[simdgroup_index_in_threadgroup]]) {
   // Single pass: each thread accumulates sum(x_b^2) and x_b . q for all b, q; one batched reduction.
-  threadgroup float red[RT / 32][8 * 5];
+  threadgroup float red[NT / 32][8 * 5];  // NT threads
   threadgroup float inv[8];
   threadgroup float wts[8][4];
   device const void* st[8] = {s0, s1, s2, s3, s4, s5, s6, s7};
@@ -111,7 +112,7 @@ kernel void attn_residual_mix(device const void* s0 [[buffer(0)]], device const 
   float acc[8][5];  // [b][0] = sum of squares, [b][1 + q] = raw dot with query q (nq <= 4)
   for (uint b = 0; b < 8; b++)
     for (uint j = 0; j < 5; j++) acc[b][j] = 0;
-  for (uint i = tid; i < p.D; i += RT) {
+  for (uint i = tid; i < p.D; i += NT) {
     float qv[4];
     for (uint q = 0; q < p.nq; q++) qv[q] = query[q * p.D + i];
     for (uint b = 0; b < p.nb; b++) {
@@ -128,7 +129,7 @@ kernel void attn_residual_mix(device const void* s0 [[buffer(0)]], device const 
   threadgroup_barrier(mem_flags::mem_threadgroup);
   if (tid < p.nb * 5) {
     float v = 0;
-    for (uint i = 0; i < RT / 32; i++) v += red[i][tid];
+    for (uint i = 0; i < NT / 32; i++) v += red[i][tid];
     red[0][tid] = v;
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -151,7 +152,7 @@ kernel void attn_residual_mix(device const void* s0 [[buffer(0)]], device const 
     for (uint b = 0; b < p.nb; b++) wts[b][tid] /= s;
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
-  for (uint i = tid; i < p.D; i += RT) {
+  for (uint i = tid; i < p.D; i += NT) {
     float k[8];
     for (uint b = 0; b < p.nb; b++) k[b] = ldv(st[b], p.dt[b], base + i) * inv[b];
     for (uint q = 0; q < p.nq; q++) {
@@ -161,6 +162,15 @@ kernel void attn_residual_mix(device const void* s0 [[buffer(0)]], device const 
     }
   }
 }
+
+template [[host_name("attn_residual_mix")]] kernel void attn_residual_mix_t<256>(
+    device const void*, device const void*, device const void*, device const void*, device const void*,
+    device const void*, device const void*, device const void*, device const float*, device float*,
+    constant ResParams&, uint, uint, uint, uint);
+template [[host_name("attn_residual_mix_1024")]] kernel void attn_residual_mix_t<1024>(
+    device const void*, device const void*, device const void*, device const void*, device const void*,
+    device const void*, device const void*, device const void*, device const float*, device float*,
+    constant ResParams&, uint, uint, uint, uint);
 
 // ---------------------------------------------------------------- message controller
 // pair = bf16([rms(x), rms(m)]); h = bf16(pair @ down^T) (rank R); f = tanh(h @ forget^T); g = tanh(h @ gain^T)
@@ -629,4 +639,50 @@ kernel void ctrl_out(device const float* x [[buffer(0)]], device const float* m 
   g = precise::tanh(g);
   float xv = x[t * p.D + i];
   out[t * p.D + i] = (1 - f) * xv + g * m[t * p.m_stride + i];
+}
+
+// Fused router for decode/verify: one threadgroup of 1024 per token. Logits per expert with exactly the arithmetic
+// of matvec_bf16 (lane-strided uint4 chunks, fma in order, simd_sum), then sigmoid + rank top-k as router_select.
+kernel void router_fused(device const void* x [[buffer(0)]], device const uint4* gw [[buffer(1)]],
+                         device const float* bias [[buffer(2)]], device int* idx [[buffer(3)]],
+                         device float* wout [[buffer(4)]], constant RouterParams& p [[buffer(5)]],
+                         uint t [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
+                         uint lane [[thread_index_in_simdgroup]], uint sg [[simdgroup_index_in_threadgroup]]) {
+  threadgroup float sc[128], key[128];
+  threadgroup int sel[16];
+  uint kv = p.D / 8;
+  for (uint e = sg; e < p.E; e += 32) {
+    float a = 0;
+    for (uint k8 = lane; k8 < kv; k8 += 32) {
+      float xv[8], w[8];
+      for (uint i = 0; i < 8; i++) xv[i] = ldv(x, p.dt_x, t * p.D + k8 * 8 + i);
+      unpack_bf8(gw[e * kv + k8], w);
+      for (uint i = 0; i < 8; i++) a = fma(w[i], xv[i], a);
+    }
+    a = simd_sum(a);
+    if (lane == 0) {
+      float s = 1.0f / (1.0f + exp(-a));
+      sc[e] = s;
+      key[e] = s + bias[e];
+    }
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (tid < p.E) {
+    float v = key[tid];
+    uint rank = 0;
+    for (uint j = 0; j < p.E; j++) {
+      float u = key[j];
+      rank += (u > v || (u == v && j < tid)) ? 1u : 0u;
+    }
+    if (rank < p.topk) sel[rank] = int(tid);
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (tid == 0) {
+    float sum = 0;
+    for (uint k = 0; k < p.topk; k++) sum += sc[sel[k]];
+    for (uint k = 0; k < p.topk; k++) {
+      idx[t * p.topk + k] = sel[k];
+      wout[t * p.topk + k] = sc[sel[k]] / (sum + 1e-20f) * p.scale;
+    }
+  }
 }

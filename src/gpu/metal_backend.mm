@@ -1,5 +1,6 @@
 // MetalBackend: ink::Backend on the GPU. Owner: B. Ops only encode into the current command buffer; sync()
 // commits and waits. Rounding points follow src/model/backend.h.
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -119,6 +120,9 @@ class MetalBackend final : public Backend {
  public:
   MetalBackend() : g_(Context::get()) {
     profile_ = getenv("INK_PROFILE") != nullptr;
+    gpu_time_ = getenv("INK_GPU_TIME") != nullptr;
+    if (const char* sk = getenv("INK_SKIP")) skip_ = std::string(",") + sk + ",";
+    last_sync_ = std::chrono::steady_clock::now();
     skinny_ = getenv("INK_SKINNY") != nullptr;  // off until it beats 2-4 passes of the 4-row matvec
     if (const char* sk = getenv("INK_SPLIT_KEYS")) split_keys_ = uint32_t(atoi(sk));
     if (const char* sk = getenv("INK_SPLIT_LOCAL")) split_local_ = uint32_t(atoi(sk));
@@ -126,6 +130,9 @@ class MetalBackend final : public Backend {
   ~MetalBackend() override {
     sync();
     prof_report();
+    if (gpu_time_ && acc_n_)
+      fprintf(stderr, "gpu time: %ld syncs, per sync: wall %.2f ms (since previous sync), GPU span %.2f ms, CPU wait %.2f ms\n",
+              acc_n_, acc_wall_ / acc_n_, acc_gpu_ / acc_n_, acc_wait_ / acc_n_);
     for (auto& [k, b] : scratch_) g_.release(b);
   }
   const char* name() const override { return "metal"; }
@@ -164,7 +171,19 @@ class MetalBackend final : public Backend {
   }
   void sync() override {
     if (profile_) prof_flush();
+    auto w0 = std::chrono::steady_clock::now();
     g_.commit_and_wait();
+    if (gpu_time_) {
+      double wait_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - w0).count();
+      double wall = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - last_sync_).count();
+      if (wall < 1000) {
+        acc_gpu_ += g_.last_gpu_ms();
+        acc_wall_ += wall;
+        acc_wait_ += wait_ms;
+        acc_n_++;
+      }
+      last_sync_ = std::chrono::steady_clock::now();
+    }
     pending_ = false;
   }
   void copy(const Tensor& src, Tensor& dst, size_t src_off, size_t dst_off, size_t bytes) override {
@@ -192,6 +211,8 @@ class MetalBackend final : public Backend {
 
   // ---------------------------------------------------------------- helpers
   void bind(uint32_t i, const Tensor& t) { g_.set_buffer(i, bufof(t), t.offset); }
+  // INK_SKIP=a,b,..: timing ablation only (results are wrong): ops of these classes encode nothing.
+  bool skip(const char* cls) const { return !skip_.empty() && skip_.find(std::string(",") + cls + ",") != std::string::npos; }
   void pipe(const std::string& name) {
     if (profile_) prof_flush();
     g_.set_pipeline(g_.pipeline(name));
@@ -248,6 +269,7 @@ class MetalBackend final : public Backend {
   }
 
   void rms_norm(const Tensor& x, const Tensor* gamma, float eps, int64_t dim, Tensor& out) override {
+    if (skip("small")) return;
     bool hg = gamma && gamma->valid();
     RmsParams p{uint32_t(x.numel() / dim), uint32_t(dim), eps, hg ? 1u : 0u, dtc(x.dtype), dtc(out.dtype)};
     if (hg && gamma->dtype != DType::BF16) fail("rms_norm gamma must be bf16");
@@ -260,6 +282,7 @@ class MetalBackend final : public Backend {
   }
 
   void linear(const Tensor& x, const Tensor& w, Tensor& out) override {
+    if (skip("linear")) return;
     if (w.dtype != DType::BF16) fail("linear weight must be bf16");
     uint32_t K = uint32_t(w.dim(1)), N = uint32_t(w.dim(0));
     uint32_t T = uint32_t(x.numel() / K);
@@ -313,6 +336,7 @@ class MetalBackend final : public Backend {
   }
 
   void linear_multi(const Tensor& x, const std::vector<const Tensor*>& ws, const std::vector<Tensor*>& outs) override {
+    if (skip("linear")) return;
     uint32_t K = uint32_t(ws[0]->dim(1)), T = uint32_t(x.numel() / K);
     bool ok = T <= 4 && ws.size() <= 8 && K % 8 == 0 && !getenv("INK_NO_MULTI");
     for (auto* w : ws) ok = ok && w->dim(1) == K && w->dim(0) % 4 == 0 && w->dtype == DType::BF16;
@@ -340,6 +364,7 @@ class MetalBackend final : public Backend {
   }
 
   void mix(const std::vector<const Tensor*>& states, const Tensor& query, uint32_t nq, Tensor& out) {
+    if (skip("mix")) return;
     if (states.size() > 8 || states.empty()) fail("attn_residual: 1..8 states");
     uint32_t D = uint32_t(states[0]->dim(-1));
     ResParams p{};
@@ -347,7 +372,8 @@ class MetalBackend final : public Backend {
     p.D = D;
     p.nb = uint32_t(states.size());
     p.nq = nq;
-    pipe("attn_residual_mix");
+    bool wide = p.T <= 4;  // decode/verify: one threadgroup per token is latency bound, use 1024 threads
+    pipe(wide ? "attn_residual_mix_1024" : "attn_residual_mix");
     for (uint32_t i = 0; i < 8; i++) {
       const Tensor& s = *states[std::min<size_t>(i, states.size() - 1)];
       bind(i, s);
@@ -356,7 +382,7 @@ class MetalBackend final : public Backend {
     bind(8, query);
     bind(9, out);
     g_.set_value(10, p);
-    g_.dispatch({p.T, 1, 1}, {256, 1, 1});
+    g_.dispatch({p.T, 1, 1}, {wide ? 1024u : 256u, 1, 1});
   }
   void attn_residual(const std::vector<const Tensor*>& states, const Tensor& query, Tensor& out) override {
     uint32_t nq = query.ndim == 1 ? 1 : uint32_t(query.dim(0));
@@ -368,6 +394,7 @@ class MetalBackend final : public Backend {
 
   void controller(const Tensor& x, const Tensor& m, const Tensor& down, const Tensor& forget, const Tensor& gain,
                   Tensor& out) override {
+    if (skip("ctrl")) return;
     uint32_t D = uint32_t(x.dim(-1)), T = uint32_t(x.numel() / D), R = uint32_t(down.dim(0));
     CtrlParams p{T, D, R, D};
     Tensor pair = scratch("ctrl-pair", DType::BF16, {T, 2 * D});
@@ -391,6 +418,7 @@ class MetalBackend final : public Backend {
   }
 
   void short_conv(const Tensor& x, const Tensor& w, Tensor& state, Tensor& out, Tensor* hist) override {
+    if (skip("small")) return;
     uint32_t C = uint32_t(x.dim(-1));
     bool hh = hist && hist->valid();
     ConvParams p{uint32_t(x.numel() / C), C, 0, hh ? 1u : 0u};
@@ -421,6 +449,7 @@ class MetalBackend final : public Backend {
   }
 
   void l2_clip(const Tensor& x, const Tensor* scale, float thr, const Tensor* tau, Tensor& out) override {
+    if (skip("small")) return;
     uint32_t d = uint32_t(x.dim(-1)), H = uint32_t(x.dim(-2));
     if (d > 128) fail("l2_clip: d > 128");
     bool hs = scale && scale->valid(), ht = tau && tau->valid();
@@ -435,6 +464,7 @@ class MetalBackend final : public Backend {
   }
 
   void ew(const char* k, const Tensor& a, const Tensor* b, Tensor& out) {
+    if (skip("small")) return;
     EwParams p{uint32_t(out.numel()), dtc(a.dtype), b ? dtc(b->dtype) : 0u, dtc(out.dtype)};
     pipe(k);
     bind(0, a);
@@ -447,7 +477,8 @@ class MetalBackend final : public Backend {
   void add(const Tensor& a, const Tensor& b, Tensor& out) override { ew("ew_add", a, &b, out); }
   void cast(const Tensor& a, Tensor& out) override { ew("ew_cast", a, nullptr, out); }
 
-  void attention(const AttnArgs& a, Tensor& out) override { attention_impl(a, nullptr, out); }
+  void attention(const AttnArgs& a, Tensor& out) override {
+    if (skip("attn")) return; attention_impl(a, nullptr, out); }
   void attention_impl(const AttnArgs& a, const Tensor* gate, Tensor& out) {
     uint32_t T = uint32_t(a.q.dim(0)), H = uint32_t(a.q.dim(1)), KVH = uint32_t(a.k_new.dim(1));
     if (T <= 4 && H == 3 * KVH && !getenv("INK_ATTN_SLOW")) {
@@ -516,6 +547,7 @@ class MetalBackend final : public Backend {
   }
 
   void kv_append(const Tensor& k_new, const Tensor& v_new, KvView& kv) override {
+    if (skip("small")) return;
     uint32_t T = uint32_t(k_new.dim(0)), heads = uint32_t(k_new.dim(1));
     if (!kv.ring && kv.len + T > kv.cap) fail("kv_append: global cache full");
     KvAppendParams p{T, heads, uint32_t(kv.cap), uint32_t(kv.len), kv.ring ? 1u : 0u};
@@ -530,11 +562,34 @@ class MetalBackend final : public Backend {
   }
 
   void router(const Tensor& x, const MoeWeights& m, int topk, float scale, Tensor& idx, Tensor& w) override {
+    if (skip("router")) return;
     uint32_t D = uint32_t(x.dim(-1)), T = uint32_t(x.numel() / D), E = uint32_t(m.gate_w.dim(0));
     RouterParams p{T, D, E, uint32_t(topk), dtc(x.dtype), scale};
     if (E > 128 || topk > 16) fail("router: shape");
+    if (T <= 16 && D % 8 == 0 && getenv("INK_ROUTER_FUSED")) {
+      pipe("router_fused");
+      bind(0, x);
+      bind(1, m.gate_w);
+      bind(2, m.bias);
+      bind(3, idx);
+      bind(4, w);
+      g_.set_value(5, p);
+      g_.dispatch({T, 1, 1}, {1024, 1, 1});
+      return;
+    }
     Tensor lg = scratch("router-logit", DType::F32, {T, E});
-    linear(x, m.gate_w, lg);  // f32(x) @ f32(gate_w)^T, fp32 out
+    if (T <= 4 && x.dtype == DType::BF16 && D % 8 == 0) {
+      // small N: one row per simdgroup for more threadgroups (same per-row arithmetic as linear)
+      MatvecShape ms{E, D, T, D, E};
+      pipe(T == 1 ? "matvec_bf16_bf16_f32_t1_r1_s4" : "matvec_bf16_bf16_f32_t4_r1_s4");
+      bind(0, m.gate_w);
+      bind(1, x);
+      bind(2, lg);
+      g_.set_value(3, ms);
+      g_.dispatch({cdiv(E, 4), 1, 1}, {128, 1, 1});
+    } else {
+      linear(x, m.gate_w, lg);  // f32(x) @ f32(gate_w)^T, fp32 out
+    }
     pipe("router_select");
     bind(0, lg);
     bind(1, m.bias);
@@ -558,6 +613,7 @@ class MetalBackend final : public Backend {
   }
 
   void moe(const Tensor& x, const Tensor& idx, const Tensor& w, const MoeWeights& m, Tensor& out) override {
+    if (skip("moe")) return;
     if (x.dtype != DType::BF16) fail("moe: x must be bf16");
     uint32_t D = uint32_t(x.dim(-1)), T = uint32_t(x.numel() / D), topk = uint32_t(idx.dim(-1));
     uint32_t routes = T * topk, I = uint32_t(m.gate.n);
@@ -674,6 +730,7 @@ class MetalBackend final : public Backend {
   }
 
   void logits(const Tensor& h, const Tensor& head, int64_t vocab, float softcap, Tensor& out) override {
+    if (skip("logits")) return;
     uint32_t D = uint32_t(h.dim(-1)), T = uint32_t(h.numel() / D);
     Tensor hb = scratch("logits-h", DType::F32, {T, D});
     uint32_t n = T * D;
@@ -697,6 +754,11 @@ class MetalBackend final : public Backend {
   Context& g_;
   bool pending_ = false;
   bool profile_ = false;
+  bool gpu_time_ = false;
+  std::string skip_;
+  std::chrono::steady_clock::time_point last_sync_;
+  double acc_gpu_ = 0, acc_wall_ = 0, acc_wait_ = 0;
+  long acc_n_ = 0;
   bool skinny_ = false;
   uint32_t split_keys_ = 512;
   uint32_t split_local_ = 64;
