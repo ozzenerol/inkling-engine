@@ -37,3 +37,5 @@ for m in $HOME/llm/mlx-models/Inkling-2-Mini-MLX-8bit $HOME/llm/mlx-models/Inkli
 done; cmp "$BS/rw_$(basename $m)_X=1.i32" "$BS/rw_$(basename $m)_INK_RW=0.i32" && echo "rw tokens IDENTICAL"; done
 echo -n "[rw dspark identity] "; tools/spec_check.sh ref_data/p2.ids 200 8 2>&1 | grep -E "IDENT|DIFF"
 echo -n "[rw prefill p3 8-bit] "; build/inktest --backend metal --model $M8 --ids ref_data/p3.ids --steps 1 --ctx 8192 --chunk 2048 --out $BS/m0 2>&1 | grep prefill
+echo "== B bench_q8 wall clock vs GPU timestamps (756 GB/s in batch 9 is above the M3 Max's 400 GB/s)"
+for n in 0 2; do INTERLEAVE=$n $(bin bench_q8) 1; done; INK_SERIAL=1 INTERLEAVE=2 $(bin bench_q8) 1
