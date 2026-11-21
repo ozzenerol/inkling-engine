@@ -48,7 +48,7 @@ class Model {
   void forward(const int32_t* ids, int64_t T, bool all_logits = false, bool keep_hist = false);
   // After a keep_hist forward of T rows: keep only the first n_keep rows (conv states + KV lengths).
   void rollback(int64_t n_keep);
-  static constexpr int64_t kMaxHist = 16;
+  static constexpr int64_t kMaxHist = 32;  // rows of a verify (conv history per row)
   int64_t hist_rows() const { return hist_rows_; }  // rows of the last keep_hist forward still rewindable
   // Test hook: run one visit on an empty cache with given inputs (x, blocks, loop bank), x_out = output.
   void debug_visit(int v, const Tensor& x_in, const std::vector<const Tensor*>& blocks_in,

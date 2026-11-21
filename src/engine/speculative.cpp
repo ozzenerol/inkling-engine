@@ -29,7 +29,7 @@ struct Spec {
   double draft_ms = 0, verify_ms = 0;
   // Adaptive draft length (A): running estimates, kept across requests.
   double acc[8] = {0.7, 0.7, 0.7, 0.7, 0.7, 0.7, 0.7, 0.7};  // P(draft j accepted | drafts before it accepted)
-  double t_plain = 0, t_draft = 0, t_verify[17] = {};  // ms, 0 = not measured yet
+  double t_plain = 0, t_draft = 0, t_verify[33] = {};  // ms, 0 = not measured yet
   long plain_steps = 0;
   double arm_rate[9] = {0, 0, 0, 0, 0, 0, 0, 0, 0};  // tokens per ms delivered by draft count k (EMA)
   long arm_n[9] = {0, 0, 0, 0, 0, 0, 0, 0, 0};
@@ -222,7 +222,7 @@ bool speculative_generate(Engine& e, Model& m, const SamplingParams& p, int max_
         s.lk_skip--;
       } else {
         // Up to 15 drafts (a 16-row forward: 8 rows cost 73 ms against 30 for one); INK_LOOKUP_MAX lowers it.
-        static const int lk_max = getenv("INK_LOOKUP_MAX") ? std::max(1, std::min(15, atoi(getenv("INK_LOOKUP_MAX")))) : 15;
+        static const int lk_max = getenv("INK_LOOKUP_MAX") ? std::max(1, std::min(31, atoi(getenv("INK_LOOKUP_MAX")))) : 15;
         lookup(b, std::min({s.lk_k, lk_max, max_tokens - emitted}), lk);
         double best = 0;
         for (int j = 0; j <= count_max; j++) best = std::max(best, s.arm_rate[j]);
@@ -349,7 +349,7 @@ bool speculative_generate(Engine& e, Model& m, const SamplingParams& p, int max_
       s.lk_accepted += a;
       ema(s.lk_rate, (a + 1) / std::chrono::duration<double, std::milli>(c2 - c0).count(), 0.2);
       s.lk_n++;
-      s.lk_k = a == k ? std::min(15, 2 * s.lk_k + 1) : std::max(3, (a + s.lk_k) / 2);
+      s.lk_k = a == k ? std::min(31, 2 * s.lk_k + 1) : std::max(3, (a + s.lk_k) / 2);
     } else {
       s.rounds++;
       s.drafted += k;
