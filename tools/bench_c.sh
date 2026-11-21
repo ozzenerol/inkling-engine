@@ -35,7 +35,9 @@ measure() {
 	for _ in $(seq 1 180); do
 		code=$(curl -s -m 900 -o /dev/null -w '%{http_code}' "$url/v1/chat/completions" -H 'Content-Type: application/json' \
 			-d '{"messages":[{"role":"user","content":"Say hi."}],"max_tokens":32,"chat_template_kwargs":{"reasoning_effort":"none"}}')
-		[ "$code" = 200 ] && break
+		# only "still loading" (503) or "not listening yet" (000) is worth waiting for; MLX answers 422 to this
+		# request (it wants a model field), which is as good as a warm-up for our purpose
+		[ "$code" = 503 ] || [ "$code" = 000 ] || break
 		sleep 5
 	done
 	if [ -n "${DEPTH:-}" ]; then
