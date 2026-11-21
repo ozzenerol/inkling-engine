@@ -13,19 +13,24 @@ void PromptCache::drop_above(int64_t len) {
   }
 }
 
-void PromptCache::take_ckpt() {
+void PromptCache::take_ckpt(bool pin) {
   int64_t len = (int64_t)toks_.size();
+  if (max_ckpts_ <= 0) return;
+  if (pin)
+    for (auto& x : ck_) x.pinned = false;  // one pinned checkpoint at a time
   for (auto& x : ck_)
-    if (x.c.len == len) { x.used = ++clock_; return; }
-  while ((int)ck_.size() >= max_ckpts_ && !ck_.empty()) {
-    auto lru = std::min_element(ck_.begin(), ck_.end(), [](const Entry& a, const Entry& b) { return a.used < b.used; });
+    if (x.c.len == len) { x.used = ++clock_; x.pinned |= pin; return; }
+  while ((int)ck_.size() >= max_ckpts_) {
+    auto lru = ck_.end();
+    for (auto it = ck_.begin(); it != ck_.end(); ++it)
+      if (!it->pinned && (lru == ck_.end() || it->used < lru->used)) lru = it;
+    if (lru == ck_.end()) return;
     e_.drop(lru->c);
     ck_.erase(lru);
   }
-  if (max_ckpts_ <= 0) return;
   Ckpt c = e_.checkpoint();
   if (c.id < 0) return;
-  ck_.push_back({c, ++clock_});
+  ck_.push_back({c, ++clock_, pin});
 }
 
 void PromptCache::invalidate() {
@@ -49,6 +54,7 @@ PromptCache::Prep PromptCache::prepare(const std::vector<int32_t>& prompt,
   while (lcp < m && prompt[lcp] == toks_[lcp]) lcp++;
   // At least one token must be fed to get logits for the next one.
   r.lcp = lcp;
+  const bool diverged = lcp < (int64_t)toks_.size() && lcp < n;
   const int64_t target = std::min(lcp, n - 1);
   int64_t cur = (int64_t)toks_.size();
   r.how = "hit";
@@ -92,12 +98,27 @@ PromptCache::Prep PromptCache::prepare(const std::vector<int32_t>& prompt,
   }
   if (cur == 0 && r.how == "hit") r.how = "cold";
   r.reused = cur;
-  std::span<const int32_t> rest(prompt.data() + cur, prompt.size() - cur);
-  r.prefilled = (int64_t)rest.size();
+  r.prefilled = n - cur;
   auto t0 = std::chrono::steady_clock::now();
-  e_.prefill(rest, [&](int64_t done) {
-    if (progress) progress(cur + done, n);
-  });
+  auto feed = [&](int64_t upto) {
+    const int64_t from = cur;
+    e_.prefill(std::span<const int32_t>(prompt.data() + from, upto - from), [&](int64_t done) {
+      if (progress) progress(from + done, n);
+    });
+    cur = upto;
+  };
+  // Shared prefix of a missed prompt: stop there once to checkpoint it.
+  // (diverged: the cache went on differently after the common prefix, and the prompt goes on too.)
+  if (shared_prefix_min_ > 0 && target >= shared_prefix_min_ && diverged && max_ckpts_ > 1) {
+    if (cur < target) feed(target);
+    toks_.assign(prompt.begin(), prompt.begin() + target);
+    // Pin it unless a shorter pinned prefix (the system prompt + tools) already covers this conversation:
+    // a divergence deeper in (an edited or regenerated turn) must not take the pin away from it.
+    bool have_pin = false;
+    for (auto& x : ck_) have_pin |= x.pinned && x.c.len <= target;
+    take_ckpt(!have_pin);
+  }
+  feed(n);
   r.prefill_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
   toks_ = prompt;
   take_ckpt();

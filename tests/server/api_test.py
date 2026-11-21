@@ -147,6 +147,22 @@ try:
     u = s6["usage"]
     check(u["prompt_tokens"] - u["prompt_tokens_details"]["cached_tokens"] <= 1, "same prompt again: full reuse")
 
+    # new session with the same system prompt + tools: the shared prefix was checkpointed at the first miss
+    sysmsg = {"role": "system", "content": "You are a coding agent. " + "Rule: be careful. " * 120}
+    post("/v1/chat/completions", {"messages": [sysmsg, {"role": "user", "content": "first session"}], "tools": TOOLS})
+    post("/v1/chat/completions", {"messages": [sysmsg, {"role": "user", "content": "second session"}], "tools": TOOLS})
+    for k in range(4):  # a long third session must not evict the pinned prefix checkpoint
+        m3 = [sysmsg, {"role": "user", "content": "third session"}]
+        for j in range(k):
+            m3 += [{"role": "assistant", "content": f"a{j}"}, {"role": "user", "content": f"more {j} " + "pad " * 300}]
+        st, r = post("/v1/chat/completions", {"messages": m3, "tools": TOOLS})
+    st, r = post("/v1/chat/completions", {"messages": [sysmsg, {"role": "user", "content": "fourth session"}],
+                                          "tools": TOOLS})
+    u = r["usage"]
+    check(r["timings"]["cache"] == "ckpt" and u["prompt_tokens_details"]["cached_tokens"] > 500 and
+          u["prompt_tokens"] - u["prompt_tokens_details"]["cached_tokens"] < 30,
+          f"new session restores the shared system-prompt prefix ({r['timings']['cache']}, {u})")
+
     # effort handling
     st, t1 = post("/tokenize", {"messages": [{"role": "user", "content": "x"}], "reasoning_effort": "none"})
     st, t2 = post("/tokenize", {"messages": [{"role": "user", "content": "x"}]})

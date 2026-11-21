@@ -1,0 +1,105 @@
+{
+ "label": "mlx",
+ "url": "http://127.0.0.1:8091",
+ "date": "Sat Nov 21 19:24:31 2026",
+ "turns": [
+  {
+   "ttft": 59.00257141700058,
+   "wall": 60.46204229199975,
+   "prompt_tokens": 30666,
+   "cached_tokens": 0,
+   "completion_tokens": 56,
+   "finish": "tool_calls",
+   "tool_calls": 1
+  },
+  {
+   "ttft": 60.89061574999869,
+   "wall": 62.43726733299991,
+   "prompt_tokens": 31496,
+   "cached_tokens": 0,
+   "completion_tokens": 61,
+   "finish": "tool_calls",
+   "tool_calls": 1
+  },
+  {
+   "ttft": 62.787100292000105,
+   "wall": 78.98727508299999,
+   "prompt_tokens": 32331,
+   "cached_tokens": 0,
+   "completion_tokens": 461,
+   "finish": "tool_calls",
+   "tool_calls": 1
+  },
+  {
+   "ttft": 65.56499954100036,
+   "wall": 68.31446695799968,
+   "prompt_tokens": 33566,
+   "cached_tokens": 0,
+   "completion_tokens": 97,
+   "finish": "tool_calls",
+   "tool_calls": 1
+  },
+  {
+   "ttft": 67.9154350000008,
+   "wall": 75.50513275000048,
+   "prompt_tokens": 34437,
+   "cached_tokens": 0,
+   "completion_tokens": 225,
+   "finish": "tool_calls",
+   "tool_calls": 1
+  },
+  {
+   "ttft": 70.04773958400074,
+   "wall": 74.89269925000008,
+   "prompt_tokens": 35436,
+   "cached_tokens": 0,
+   "completion_tokens": 155,
+   "finish": "tool_calls",
+   "tool_calls": 1
+  },
+  {
+   "ttft": 73.39999216700016,
+   "wall": 77.8025809589999,
+   "prompt_tokens": 36365,
+   "cached_tokens": 0,
+   "completion_tokens": 155,
+   "finish": "tool_calls",
+   "tool_calls": 1
+  },
+  {
+   "ttft": 74.90165279199937,
+   "wall": 78.92083925000043,
+   "prompt_tokens": 37294,
+   "cached_tokens": 0,
+   "completion_tokens": 155,
+   "finish": "tool_calls",
+   "tool_calls": 1
+  },
+  {
+   "ttft": 77.59318450000137,
+   "wall": 82.18388050000067,
+   "prompt_tokens": 38223,
+   "cached_tokens": 0,
+   "completion_tokens": 155,
+   "finish": "tool_calls",
+   "tool_calls": 1
+  },
+  {
+   "ttft": 79.38509591700131,
+   "wall": 83.24591487500038,
+   "prompt_tokens": 39152,
+   "cached_tokens": 0,
+   "completion_tokens": 155,
+   "finish": "tool_calls",
+   "tool_calls": 1
+  }
+ ],
+ "total_wall": 742.7566540839998,
+ "base_tokens": 30000,
+ "tool_tokens": 800,
+ "max_tokens": 512,
+ "temperature": 0.0,
+ "ttft_median_after_1": 70.04773958400074,
+ "ttft_sum": 691.4883869600035,
+ "completion_tokens": 1675
+}

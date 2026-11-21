@@ -16,6 +16,10 @@ namespace ink {
 class PromptCache {
  public:
   PromptCache(EngineIface& e, int max_ckpts = 4) : e_(e), max_ckpts_(max_ckpts) {}
+  // When a prompt misses the cache but shares at least this many leading tokens with the cached sequence
+  // (a new agent session: same system prompt and tools), checkpoint at that shared prefix on the way, so
+  // the next new session restores it instead of prefilling it again. 0 turns it off.
+  void set_shared_prefix_min(int64_t n) { shared_prefix_min_ = n; }
 
   struct Prep {
     int64_t reused = 0;     // prompt tokens taken from the cache
@@ -38,15 +42,17 @@ class PromptCache {
   int n_ckpts() const { return (int)ck_.size(); }
 
  private:
-  void take_ckpt();
+  void take_ckpt(bool pin = false);
   void drop_above(int64_t len);
 
   EngineIface& e_;
   int max_ckpts_;
+  int64_t shared_prefix_min_ = 256;
   std::vector<int32_t> toks_;
   struct Entry {
     Ckpt c;
     uint64_t used;
+    bool pinned = false;  // the shared-prefix checkpoint: not evicted by turn checkpoints
   };
   std::vector<Entry> ck_;
   uint64_t clock_ = 0;

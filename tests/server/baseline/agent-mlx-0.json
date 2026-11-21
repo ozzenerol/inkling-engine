@@ -1,0 +1,105 @@
+{
+ "label": "mlx",
+ "url": "http://127.0.0.1:8091",
+ "date": "Sat Nov 21 19:12:08 2026",
+ "turns": [
+  {
+   "ttft": 4.118270916000256,
+   "wall": 5.002927874998932,
+   "prompt_tokens": 2117,
+   "cached_tokens": 0,
+   "completion_tokens": 46,
+   "finish": "tool_calls",
+   "tool_calls": 1
+  },
+  {
+   "ttft": 4.604622625000047,
+   "wall": 16.874578000000838,
+   "prompt_tokens": 2937,
+   "cached_tokens": 0,
+   "completion_tokens": 512,
+   "finish": "length",
+   "tool_calls": 0
+  },
+  {
+   "ttft": 6.927529208998749,
+   "wall": 22.57870529199863,
+   "prompt_tokens": 4241,
+   "cached_tokens": 0,
+   "completion_tokens": 512,
+   "finish": "length",
+   "tool_calls": 0
+  },
+  {
+   "ttft": 8.961297165998985,
+   "wall": 21.839905082999394,
+   "prompt_tokens": 5545,
+   "cached_tokens": 0,
+   "completion_tokens": 512,
+   "finish": "length",
+   "tool_calls": 0
+  },
+  {
+   "ttft": 11.196539582999321,
+   "wall": 23.517610082999454,
+   "prompt_tokens": 6849,
+   "cached_tokens": 0,
+   "completion_tokens": 512,
+   "finish": "length",
+   "tool_calls": 0
+  },
+  {
+   "ttft": 13.521779167000204,
+   "wall": 24.359256249999817,
+   "prompt_tokens": 8153,
+   "cached_tokens": 0,
+   "completion_tokens": 512,
+   "finish": "length",
+   "tool_calls": 0
+  },
+  {
+   "ttft": 15.698559374999604,
+   "wall": 26.48579129099926,
+   "prompt_tokens": 9457,
+   "cached_tokens": 0,
+   "completion_tokens": 512,
+   "finish": "length",
+   "tool_calls": 0
+  },
+  {
+   "ttft": 18.207378625000274,
+   "wall": 29.20425804200022,
+   "prompt_tokens": 10761,
+   "cached_tokens": 0,
+   "completion_tokens": 512,
+   "finish": "length",
+   "tool_calls": 0
+  },
+  {
+   "ttft": 21.62017595799989,
+   "wall": 32.60429391700018,
+   "prompt_tokens": 12065,
+   "cached_tokens": 0,
+   "completion_tokens": 512,
+   "finish": "length",
+   "tool_calls": 0
+  },
+  {
+   "ttft": 23.742884916999174,
+   "wall": 39.00453362500048,
+   "prompt_tokens": 13369,
+   "cached_tokens": 0,
+   "completion_tokens": 512,
+   "finish": "length",
+   "tool_calls": 0
+  }
+ ],
+ "total_wall": 241.47380320799857,
+ "base_tokens": 0,
+ "tool_tokens": 800,
+ "max_tokens": 512,
+ "temperature": 0.0,
+ "ttft_median_after_1": 13.521779167000204,
+ "ttft_sum": 128.5990375409965,
+ "completion_tokens": 4654
+}
