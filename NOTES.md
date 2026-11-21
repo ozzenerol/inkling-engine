@@ -21,6 +21,7 @@ LOCK C MLX-VLM baseline (serve_inkling.sh :8091, qh e2e + ctxbench) 17:43 / UNLO
 LOCK C inkling-server real engine (:8091, smoke + qh e2e + ctxbench) 17:56 / UNLOCK C 18:08 (queue: A, then B)
 UNLOCK B 18:41 (was: LOCK B kernel benches + DSpark spec_check + acc_check 18:11 / UNLOCK C
 LOCK A CPU p3 run + fp32 MLX reference dump 18:08 / UNLOCK A 18:10 (B next)
+LOCK B fused-op checks (cpu cmp, acc_check, spec_check) 18:47
 
 ## Module layout and file ownership
 
