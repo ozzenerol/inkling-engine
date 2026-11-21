@@ -152,6 +152,7 @@ struct MrAttnParams {
   uint split_keys, nsplit;
   uint causal, first, use_sink, use_gate;  // as AttnDecParams
   uint prow;                               // partial rows per (kvh, split) (>= 3T)
+  uint t0, nq;                             // this dispatch does the query rows of tokens [t0, t0 + nq) (nq <= 16)
 };
 
 // ABL (bench only, results wrong): 1 = no relative bias, 2 = no P V product, 4 = no exp.
@@ -172,11 +173,11 @@ kernel void mr_attn_split(device const ushort* q [[buffer(0)]], device const ush
   threadgroup bfloat* Qst = TG + KVN;
   const uint kvh = tg.x, split = tg.y;
   const uint G = p.H / p.KVH;
-  const uint R = G * p.T;
+  const uint R = G * p.nq;
   const uint f = sg / 2, par = sg % 2;
   for (uint i = tid; i < QN; i += NTH) {
     uint rr = i / 128, d = i % 128;
-    uint rc = min(rr, R - 1), t = rc / G, h = kvh * G + rc % G;
+    uint rc = min(rr, R - 1), t = p.t0 + rc / G, h = kvh * G + rc % G;
     Qst[i] = as_type<bfloat>(q[(t * p.H + h) * 128 + d]);
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -190,7 +191,7 @@ kernel void mr_attn_split(device const ushort* q [[buffer(0)]], device const ush
   float rrv[16];
   uint qpos;
   {
-    uint rc = min(rr, R - 1), t = rc / G, h = kvh * G + rc % G;
+    uint rc = min(rr, R - 1), t = p.t0 + rc / G, h = kvh * G + rc % G;
     qpos = p.len + t;
     for (uint d = 0; d < 16; d++) rrv[d] = p.rel_extent ? bf2f(r[(t * p.H + h) * 16 + d]) : 0.0f;
   }
@@ -309,7 +310,7 @@ kernel void mr_attn_split(device const ushort* q [[buffer(0)]], device const ush
     float M = max(m, m1);
     float c0 = m == -INFINITY ? 0.0f : exp(m - M);
     float c1 = m1 == -INFINITY ? 0.0f : exp(m1 - M);
-    device float* dst = part + (size_t(kvh * p.nsplit + split) * p.prow + rr) * 132;
+    device float* dst = part + (size_t(kvh * p.nsplit + split) * p.prow + p.t0 * G + rr) * 132;
     dst[0] = M;
     dst[1] = l * c0 + l1 * c1;
     for (uint j = 0; j < 16; j++) {
@@ -368,11 +369,12 @@ kernel void mr_attn_combine(device const float* part [[buffer(0)]], device const
 // Per (route, output row) the arithmetic is the one of moe_gateup / moe_down (moe_fast.metal, B): same lane ->
 // chunk mapping, same fma order inside a chunk, same lane reduction, same scale / round / activation; so every row
 // equals the T = 1 result bit for bit. Steps:
-//   mr_moe_group   idx [routes] -> ulist: per used expert (in expert order) {expert, count, routes[16]}; uhdr[0] = n
+//   mr_moe_group   idx [routes] -> ulist: per used expert (in expert order) {expert, count, routes[32]}; uhdr[0] = n
 //   mr_moe_gateup  a[route, n]  = bf16(act(bf16(g), bf16(u)))          grid (slot, N / 16)
 //   mr_moe_down    dd[route, n] = bf16(down[e] a[route])               grid (slot, N / 32)
 //   mr_moe_wsum    out[t, n]    = bf16(sum_k dd[t*8+k, n] * w[t, k])   (k in order 0..7)
-constant uint MRU = 18;  // ints per ulist slot
+constant uint MRL = 32;       // routes per expert in the list (= max rows: an expert is used once per row)
+constant uint MRU = 2 + MRL;  // ints per ulist slot
 constant uint MRP = 4;   // rows of one expert handled per pass over its weights
 
 struct MrGroupParams {
@@ -382,10 +384,10 @@ kernel void mr_moe_group(device const int* idx [[buffer(0)]], device int* ulist 
                          device int* uhdr [[buffer(2)]], constant MrGroupParams& p [[buffer(3)]],
                          uint e [[thread_index_in_threadgroup]]) {
   threadgroup uint present[128];
-  int rts[16];
+  int rts[MRL];
   uint cnt = 0;
   for (uint i = 0; i < p.routes; i++)
-    if (uint(idx[i]) == e && cnt < 16) rts[cnt++] = int(i);
+    if (uint(idx[i]) == e && cnt < MRL) rts[cnt++] = int(i);
   present[e] = cnt ? 1u : 0u;
   threadgroup_barrier(mem_flags::mem_threadgroup);
   uint slot = 0, total = 0;

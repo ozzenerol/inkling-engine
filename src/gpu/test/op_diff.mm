@@ -126,7 +126,7 @@ int main(int argc, char** argv) {
     compare(("linear f32 T=" + std::to_string(T)).c_str(), of);
   }
   // D: a T-row linear / linear_multi must equal T one-row linears bit for bit (verify rows == decode rows).
-  for (int64_t T : {4, 5, 8, 11, 16}) {
+  for (int64_t T : {4, 5, 8, 11, 16, 17, 24, 32}) {
     size_t bad = 0;
     for (int f32x = 0; f32x < 2; f32x++)
       for (int f32y = 0; f32y < 2; f32y++) {
@@ -173,7 +173,7 @@ int main(int argc, char** argv) {
     CPU->copy(o1.c, c.c);
     compare("copy", c, 0, 0);
   }
-  for (int64_t T : {3, 5, 8, 11, 16}) {  // attn residual (T > 4: D, same kernels as decode up to 16 rows)
+  for (int64_t T : {3, 5, 8, 11, 16, 20, 32}) {  // attn residual (T > 4: D, same kernels as decode up to 16 rows)
     auto s0 = make(DType::BF16, {T, D}, 2.0f), s1 = make(DType::F32, {T, D}, 1.0f), s2 = make(DType::F32, {T, D}, 5.0f);
     auto q = make(DType::F32, {3, D}, 0.05f);
     auto o = zeros(DType::F32, {3, T, D});
@@ -242,7 +242,7 @@ int main(int argc, char** argv) {
     // neighbours (sum order), every output of that token moves by ~1e-3. Bound, not bit-exactness.
     compare("controller", o, 2e-2);
   }
-  for (int64_t T : {1, 3, 8, 16}) {  // controller_multi / rms_norm_multi (Metal fused) vs CPU loops
+  for (int64_t T : {1, 3, 8, 16, 32}) {  // controller_multi / rms_norm_multi (Metal fused) vs CPU loops
     Pair xs[3], ms[3], dn[3], fg[3], gn[3], os[3];
     for (int i = 0; i < 3; i++) {
       xs[i] = make(DType::F32, {T, D});
@@ -415,7 +415,7 @@ int main(int argc, char** argv) {
   }
   // Verify (T=4 at len L) must equal decode (T=1 at len L+t) bit for bit, row by row (speculative identity).
   // T = 5..16 go through the multi-row kernel (D, kernels/multirow.metal).
-  for (int TV : {4, 5, 8, 11, 16})
+  for (int TV : {4, 5, 8, 11, 16, 17, 24, 32})
   for (int local = 0; local < 2; local++) {
     int64_t cap = local ? 1536 : 8192, L = local ? 3001 : 4093;  // ring wrapped / split boundary crossing
     auto q = make(DType::BF16, {TV, 24, 128}, 0.5f), r = make(DType::BF16, {TV, 24, 16}, 1.0f),
@@ -507,7 +507,7 @@ int main(int argc, char** argv) {
       MTL->free(y);
     }
     // D: a T-row q8 linear must equal T one-row q8 linears bit for bit (5..16 rows: one-pass kernel)
-    for (int64_t T : {4, 5, 8, 11, 16}) {
+    for (int64_t T : {4, 5, 8, 11, 16, 17, 24, 32}) {
       size_t bad = 0;
       for (int f32x = 0; f32x < 2; f32x++)
         for (int f32y = 0; f32y < 2; f32y++) {
@@ -621,7 +621,7 @@ int main(int argc, char** argv) {
     }
     // D: a T-row MoE must equal T one-row MoEs bit for bit. Rows 0..5 are the same vector (one expert shared by
     // 6 rows: more than one pass of the union kernel), the rest random.
-    for (int64_t T : {4, 5, 8, 16}) {
+    for (int64_t T : {4, 5, 8, 16, 24, 32}) {
       auto x = make(DType::BF16, {T, D}, 1.0f);
       MTL->sync();
       for (int64_t t = 1; t < std::min<int64_t>(T, 6); t++)
