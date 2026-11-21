@@ -185,10 +185,13 @@ bool speculative_generate(Engine& e, Model& m, const SamplingParams& p, int max_
       if (s.lk_skip > 0) {
         s.lk_skip--;
       } else {
-        lookup(b, std::min({s.lk_k, 15, max_tokens - emitted}), lk);
+        // Blocks above 3 drafts need forwards of more than 4 rows, which are slow until D's multi-row work lands
+        // (measured T = 5: 118 ms against 53 ms for T = 4), so the default cap is 3; INK_LOOKUP_MAX raises it.
+        static const int lk_max = getenv("INK_LOOKUP_MAX") ? std::max(1, std::min(15, atoi(getenv("INK_LOOKUP_MAX")))) : 3;
+        lookup(b, std::min({s.lk_k, lk_max, max_tokens - emitted}), lk);
         double best = 0;
         for (int j = 0; j <= count_max; j++) best = std::max(best, s.arm_rate[j]);
-        if (lk.size() >= 2) {
+        if (!lk.empty()) {
           if (s.lk_n < 3 || s.lk_rate >= 0.9 * best) use_lookup = true;
           else s.lk_skip = 24;  // not paying on this text: look again later
         }
