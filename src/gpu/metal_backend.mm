@@ -325,8 +325,8 @@ class MetalBackend final : public Backend {
   }
 
   // ---- MLX affine 8-bit weights (8-bit build): codes U32 [N, K/4], bf16 scales/biases [N, K/64]
-  // opt-in (INK_Q8_KERNELS=1) until validated on the GPU; then default on
-  bool supports_q8() const override { return getenv("INK_Q8_KERNELS") && getenv("INK_Q8_KERNELS")[0] == '1'; }
+  // default on (batch 1: 43-45 tok/s vs 36.7 converted, greedy 63/64 x3); INK_Q8_KERNELS=0 disables
+  bool supports_q8() const override { return !getenv("INK_Q8_KERNELS") || getenv("INK_Q8_KERNELS")[0] != '0'; }
   void bind_affine(const Tensor& codes, const Tensor& scales, const Tensor& biases) override {
     affine_[{codes.buf, codes.offset}] = {scales, biases};
   }
