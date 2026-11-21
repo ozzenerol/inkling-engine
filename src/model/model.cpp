@@ -213,7 +213,14 @@ void Model::load(const std::string&) {
           qp.weight = be_.load_weight(st_.at(q + "weight"));
           qp.scales = be_.load_weight(st_.at(q + "scales"));
         }
-        if (eg) qp.global = be_.load_weight(*eg);
+        if (eg) {
+          // This layout stores MLX's kernel factor 2688 * weight_scale_2; ours is weight_scale_2 (the division
+          // gives back the 4-8bit build's values bit for bit: tests/ref/check_8bit_layout.py).
+          auto v = raw(*eg);
+          float* f = reinterpret_cast<float*>(v.data());
+          for (int64_t x = 0; x < eg->shape[0]; ++x) f[x] = f[x] / 2688.0f;
+          qp.global = own(DType::F32, {eg->shape[0]}, v.data(), v.size());
+        }
       } else {
         const std::string q = m + "switch_mlp." + pn[i] + ".";
         qp.weight = be_.load_weight(st_.at(q + "weight"));
