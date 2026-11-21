@@ -392,9 +392,9 @@ int main(int argc, char** argv) {
     AttnArgs am{q.m, kn.m, vn.m, r.m, rp.m, sk.m, KvView{kc.m, vc.m, cap, len, bool(local)}, local ? 1024 : 0};
     CPU->attention(ac, o.c);
     MTL->attention(am, o.m);
-    // T >= 64 runs A's attention GEMM (P stored as IEEE half): allow 1.5% of elements beyond 2 bf16 ulp
+    // T >= 17 runs the attention GEMM: allow 1.5% of elements beyond 2 bf16 ulp
     compare(((local ? "attn local T=" : "attn global T=") + std::to_string(T) + " len=" + std::to_string(len)).c_str(),
-            o, 0, 2, T >= 64 ? 0.015 : 0.001);
+            o, 0, 2, T >= 17 ? 0.015 : 0.001);
     CPU->kv_append(kn.c, vn.c, ac.kv);
     MTL->kv_append(kn.m, vn.m, am.kv);
     compare("kv_append k", kc, 0, 0);

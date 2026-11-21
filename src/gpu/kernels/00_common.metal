@@ -73,10 +73,3 @@ kernel void warm_tick(device uint* x [[buffer(0)]], uint i [[thread_position_in_
   if (i == 0) x[0] += 1;
 }
 
-// Background load for the GPU performance-state experiment (INK_BUSY=groups): each thread spins on float math.
-kernel void busy_spin(device float* x [[buffer(0)]], constant uint& iters [[buffer(1)]],
-                      uint i [[thread_position_in_grid]]) {
-  float a = float(i) * 1e-3f;
-  for (uint k = 0; k < iters; k++) a = fma(a, 1.0000001f, 1e-7f);
-  x[i & 1023u] = a;
-}
