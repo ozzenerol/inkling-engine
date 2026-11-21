@@ -14,6 +14,7 @@
 #include <stdexcept>
 
 #include "model/backend.h"
+#include "engine/sampling.h"
 #include "engine/speculative.h"
 #include "model/model.h"
 
@@ -168,67 +169,15 @@ void Engine::prefill(std::span<const int32_t> tokens, std::function<void(int64_t
 
 const std::vector<float>& Engine::last_logits() const { return model_->logits(); }
 
-// Samples from softmax(logits / temperature) over the FULL vocabulary (no hidden truncation), with optional
-// min_p (relative to the top probability), top_k and top_p filters. One vectorized exp pass, no full sort:
-// about 0.15 ms per call for 200k tokens, so it stays small next to a 10-30 ms decode step.
+// Greedy: first argmax. Otherwise an exact sample of the filtered target distribution (engine/sampling.h).
 static int32_t sample_with_state(EngineState& st, const SamplingParams& p, const float* logits, int64_t V) {
-  float mx = 0;
-  vDSP_maxv(logits, 1, &mx, vDSP_Length(V));
-  if (p.temperature <= 0.0f) {
-    for (int64_t i = 0; i < V; ++i)
-      if (logits[i] == mx) return int32_t(i);  // first maximum, as std::max_element
-    return 0;
-  }
+  if (p.temperature <= 0.0f) return argmax_first(logits, V);
   if (st.seeded != p.seed) {
     st.rng.seed(p.seed ? p.seed : std::random_device{}());
     st.seeded = p.seed;
   }
-  auto& pr = st.probs;
-  pr.resize(static_cast<size_t>(V));
-  const float inv_t = 1.0f / p.temperature, shift = -mx * inv_t;
-  vDSP_vsmsa(logits, 1, &inv_t, &shift, pr.data(), 1, vDSP_Length(V));  // (l - max) / T  <= 0
-  const int n = int(V);
-  vvexpf(pr.data(), pr.data(), &n);  // top token has pr = 1
-  double z = 0;
-  for (int64_t i = 0; i < V; ++i) z += pr[i];
-  std::uniform_real_distribution<double> uni(0.0, 1.0);
-  const bool filtered = p.min_p > 0.0f || (p.top_k > 0 && p.top_k < V) || p.top_p < 1.0f;
-  if (!filtered) {
-    double r = uni(st.rng) * z;
-    int64_t last = 0;
-    for (int64_t i = 0; i < V; ++i) {
-      if (pr[i] <= 0.0f) continue;
-      last = i;
-      r -= pr[i];
-      if (r <= 0) return int32_t(i);
-    }
-    return int32_t(last);
-  }
-  // Candidates: everything above min_p * top (or above 1e-9 * top when only top_k / top_p apply; the mass left
-  // out is below 2e-4 in the worst case and only matters for top_p > 0.9998, where all candidates are kept).
-  const float thr = p.min_p > 0.0f ? p.min_p : 1e-9f;
-  auto& cand = st.cand;
-  cand.clear();
-  for (int64_t i = 0; i < V; ++i)
-    if (pr[i] >= thr) cand.push_back(int32_t(i));
-  std::sort(cand.begin(), cand.end(), [&](int32_t a, int32_t b) { return pr[a] > pr[b] || (pr[a] == pr[b] && a < b); });
-  size_t keep = cand.size();
-  if (p.top_k > 0 && size_t(p.top_k) < keep) keep = size_t(p.top_k);
-  if (p.top_p < 1.0f) {
-    double c = 0;
-    for (size_t i = 0; i < keep; ++i) {
-      c += pr[cand[i]] / z;
-      if (c >= p.top_p) { keep = i + 1; break; }
-    }
-  }
-  double tot = 0;
-  for (size_t i = 0; i < keep; ++i) tot += pr[cand[i]];
-  double r = uni(st.rng) * tot;
-  for (size_t i = 0; i < keep; ++i) {
-    r -= pr[cand[i]];
-    if (r <= 0) return cand[i];
-  }
-  return cand[keep - 1];
+  target_probs(p, logits, V, st.probs);
+  return sample_from(st.probs, std::uniform_real_distribution<double>(0.0, 1.0)(st.rng));
 }
 
 int32_t Engine::sample(const SamplingParams& p, const float* logits, int64_t V) {
