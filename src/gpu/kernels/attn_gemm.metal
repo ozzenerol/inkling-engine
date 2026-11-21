@@ -67,7 +67,7 @@ kernel void ag_init(device const ushort* sink [[buffer(0)]], device float* m [[b
 }
 
 kernel void ag_scores(device const ushort* q [[buffer(0)]], device const ushort* k_new [[buffer(1)]],
-                      device const ushort* kc [[buffer(2)]], device half* sh [[buffer(3)]],
+                      device const ushort* kc [[buffer(2)]], device float* sh [[buffer(3)]],
                       device float* tmax [[buffer(4)]], device const ushort* rq [[buffer(5)]],
                       device const float* rpt [[buffer(6)]], constant AgParams& p [[buffer(7)]],
                       uint3 tg [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
@@ -162,26 +162,26 @@ kernel void ag_scores(device const ushort* q [[buffer(0)]], device const ushort*
     mx = max(mx, simd_shuffle_xor(mx, 2));
     ulong row = ulong(g) * p.rows_pad + r;
     if (tid % 4 == 0) tmax[row * AG_TILES + tg.x] = mx;
-    device half4* out = (device half4*)(sh + row * AG_KEYS + k0 + cc);
+    device float4* out = (device float4*)(sh + row * AG_KEYS + k0 + cc);
     for (uint j = 0; j < 16; j += 4) {
-      half4 v;
-      for (uint i = 0; i < 4; i++) v[i] = sc[j + i] == -INFINITY ? half(0) : half(exp(sc[j + i] - mx));
+      float4 v;
+      for (uint i = 0; i < 4; i++) v[i] = sc[j + i] == -INFINITY ? 0.0f : exp(sc[j + i] - mx);
       out[j / 4] = v;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
   }
 }
 
-kernel void ag_pv(device const half* sh [[buffer(0)]], device const ushort* v_new [[buffer(1)]],
+kernel void ag_pv(device const float* sh [[buffer(0)]], device const ushort* v_new [[buffer(1)]],
                   device const ushort* vc [[buffer(2)]], device float* o [[buffer(3)]],
                   device const float* tmax [[buffer(4)]], constant AgParams& p [[buffer(5)]],
                   device const float* m_in [[buffer(6)]], device float* m_out [[buffer(7)]],
                   device const float* l_in [[buffer(8)]], device float* l_out [[buffer(9)]],
                   uint3 tg [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
                   uint simd [[simdgroup_index_in_threadgroup]]) {
-  threadgroup float c[64 * 64];
-  threadgroup half* pt = (threadgroup half*)c;
-  threadgroup half* vt = pt + 64 * AG_LD;
+  threadgroup float c[64 * AG_LD + 32 * AG_VLD];  // P tile + V tile (fp32); the first 64 x 64 again for the store
+  threadgroup float* pt = c;
+  threadgroup float* vt = pt + 64 * AG_LD;
   uint g = tg.z, r0 = tg.y * 64, d0 = tg.x * 64;
   if (r0 >= p.rows) return;
   int2 tk = ag_tile_keys(p, r0);
@@ -203,10 +203,10 @@ kernel void ag_pv(device const half* sh [[buffer(0)]], device const ushort* v_ne
   float m_new = max(m_old, mx);
   float a = exp(m_old - m_new);
 
-  device const half* pp = sh + row * AG_KEYS + pc;
-  threadgroup half4* pd = (threadgroup half4*)(pt + pr * AG_LD + pc);
+  device const float* pp = sh + row * AG_KEYS + pc;
+  threadgroup float4* pd = (threadgroup float4*)(pt + pr * AG_LD + pc);
   uint vr = tid / 4, vcol = (tid % 4) * 16;
-  threadgroup half4* vd = (threadgroup half4*)(vt + vr * AG_VLD + vcol);
+  threadgroup float4* vd = (threadgroup float4*)(vt + vr * AG_VLD + vcol);
 
   uint sm = (simd / 2) * 32, sn = (simd % 2) * 32;
   simdgroup_float8x8 acc[4][4];
@@ -217,9 +217,9 @@ kernel void ag_pv(device const half* sh [[buffer(0)]], device const ushort* v_ne
     float tm = tmax[row * AG_TILES + k0 / 64];
     float off = tm == -INFINITY ? 0.0f : exp(tm - m_new);  // one exp per 32 keys instead of one per score
     for (uint i = 0; i < 4; i++) {
-      float4 e = float4(((device const half4*)(pp + k0))[i]) * off;
+      float4 e = ((device const float4*)(pp + k0))[i] * off;
       sum += e.x + e.y + e.z + e.w;
-      pd[i] = half4(e);
+      pd[i] = e;
     }
     bool v_ok = k0 + vr < p.n;
     if (v_ok) {
@@ -227,17 +227,17 @@ kernel void ag_pv(device const half* sh [[buffer(0)]], device const ushort* v_ne
       for (uint i = 0; i < 2; i++) {
         float f[8];
         unpack_bf8(vp[i], f);
-        vd[2 * i] = half4(float4(f[0], f[1], f[2], f[3]));
-        vd[2 * i + 1] = half4(float4(f[4], f[5], f[6], f[7]));
+        vd[2 * i] = float4(f[0], f[1], f[2], f[3]);
+        vd[2 * i + 1] = float4(f[4], f[5], f[6], f[7]);
       }
     } else {
-      for (uint i = 0; i < 4; i++) vd[i] = half4(0);
+      for (uint i = 0; i < 4; i++) vd[i] = float4(0);
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 #pragma clang loop unroll(full)
     for (uint kk = 0; kk < AG_BK; kk += 8) {
-      simdgroup_half8x8 a8[4];
-      simdgroup_half8x8 b8[4];
+      simdgroup_float8x8 a8[4];
+      simdgroup_float8x8 b8[4];
       for (uint i = 0; i < 4; i++) {
         simdgroup_load(a8[i], pt + (sm + 8 * i) * AG_LD + kk, AG_LD);
         simdgroup_load(b8[i], vt + kk * AG_VLD + sn + 8 * i, AG_VLD);

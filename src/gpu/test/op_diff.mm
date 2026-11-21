@@ -154,6 +154,19 @@ int main(int argc, char** argv) {
     CPU->loop_messages({&s1.c, &s2.c}, q4.c, o4.c);
     MTL->loop_messages({&s1.m, &s2.m}, q4.m, o4.m);
     compare("loop_messages nq=4", o4, 1e-5);
+    // fused mix + norm (Metal) vs attn_residual + rms_norm (Metal primitives): must be bit-identical
+    auto q1 = make(DType::F32, {D}, 0.05f);
+    auto gam = make(DType::BF16, {D}, 0.2f, 1.0f);
+    Tensor mx1 = MTL->alloc(DType::F32, {1, T, D}, "m1"), mx2 = MTL->alloc(DType::F32, {1, T, D}, "m2");
+    Tensor n1 = MTL->alloc(DType::BF16, {T, D}, "n1"), n2 = MTL->alloc(DType::BF16, {T, D}, "n2");
+    MTL->attn_residual_norm({&s0.m, &s1.m, &s2.m}, q1.m, mx1, gam.m, 1e-6f, n1);
+    MTL->attn_residual({&s0.m, &s1.m, &s2.m}, q1.m, mx2);
+    MTL->rms_norm(mx2, &gam.m, 1e-6f, D, n2);
+    MTL->sync();
+    bool same = memcmp(n1.data<uint16_t>(), n2.data<uint16_t>(), size_t(T * D * 2)) == 0 &&
+                memcmp(mx1.data<float>(), mx2.data<float>(), size_t(T * D * 4)) == 0;
+    printf("%-28s %s\n", "mix+norm fused == separate", same ? "ok" : "FAIL");
+    if (!same) fails++;
   }
   {  // controller
     int64_t T = 2;

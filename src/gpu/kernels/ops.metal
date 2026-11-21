@@ -93,20 +93,24 @@ kernel void linear_generic(device const ushort* w [[buffer(0)]], device const vo
 struct ResParams {
   uint T, D, nb, nq;
   uint dt[8];
+  float eps;  // fused norm (attn_residual_norm)
 };
-template <uint NT>
+template <uint NT, bool NORM>
 kernel void attn_residual_mix_t(device const void* s0 [[buffer(0)]], device const void* s1 [[buffer(1)]],
                               device const void* s2 [[buffer(2)]], device const void* s3 [[buffer(3)]],
                               device const void* s4 [[buffer(4)]], device const void* s5 [[buffer(5)]],
                               device const void* s6 [[buffer(6)]], device const void* s7 [[buffer(7)]],
                               device const float* query [[buffer(8)]], device float* out [[buffer(9)]],
-                              constant ResParams& p [[buffer(10)]], uint t [[threadgroup_position_in_grid]],
+                              constant ResParams& p [[buffer(10)]], device const ushort* gamma [[buffer(11)]],
+                              device ushort* normed [[buffer(12)]], uint t [[threadgroup_position_in_grid]],
                               uint tid [[thread_position_in_threadgroup]], uint lane [[thread_index_in_simdgroup]],
                               uint sg [[simdgroup_index_in_threadgroup]]) {
   // Single pass: each thread accumulates sum(x_b^2) and x_b . q for all b, q; one batched reduction.
   threadgroup float red[NT / 32][8 * 5];  // NT threads
   threadgroup float inv[8];
   threadgroup float wts[8][4];
+  threadgroup float mixed_tg[NORM ? 2304 : 1];
+  threadgroup float nred[8];
   device const void* st[8] = {s0, s1, s2, s3, s4, s5, s6, s7};
   uint base = t * p.D;
   float acc[8][5];  // [b][0] = sum of squares, [b][1 + q] = raw dot with query q (nq <= 4)
@@ -159,18 +163,36 @@ kernel void attn_residual_mix_t(device const void* s0 [[buffer(0)]], device cons
       float o = 0;
       for (uint b = 0; b < p.nb; b++) o += wts[b][q] * k[b];
       out[(q * p.T + t) * p.D + i] = o;
+      if (NORM) mixed_tg[i] = o;  // nq == 1
     }
+  }
+  if (NORM) {
+    // rms_norm_rows on the mix output, with its 256-thread reduction grouping (bit-identical to the separate op)
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float ss = 0;
+    if (tid < 256)
+      for (uint i = tid; i < p.D; i += 256) {
+        float v = mixed_tg[i];
+        ss += v * v;
+      }
+    ss = simd_sum(ss);
+    if (lane == 0 && sg < 8) nred[sg] = ss;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float r = 0;
+    for (uint i = 0; i < 8; i++) r += nred[i];
+    float inv = metal::precise::rsqrt(r / float(p.D) + p.eps);
+    for (uint i = tid; i < p.D; i += NT) normed[t * p.D + i] = f2bf(mixed_tg[i] * inv * bf2f(gamma[i]));
   }
 }
 
-template [[host_name("attn_residual_mix")]] kernel void attn_residual_mix_t<256>(
-    device const void*, device const void*, device const void*, device const void*, device const void*,
-    device const void*, device const void*, device const void*, device const float*, device float*,
-    constant ResParams&, uint, uint, uint, uint);
-template [[host_name("attn_residual_mix_1024")]] kernel void attn_residual_mix_t<1024>(
-    device const void*, device const void*, device const void*, device const void*, device const void*,
-    device const void*, device const void*, device const void*, device const float*, device float*,
-    constant ResParams&, uint, uint, uint, uint);
+#define ARM_INST(NAME, NT, NORM)                                                                             \
+  template [[host_name(NAME)]] kernel void attn_residual_mix_t<NT, NORM>(                                    \
+      device const void*, device const void*, device const void*, device const void*, device const void*,     \
+      device const void*, device const void*, device const void*, device const float*, device float*,         \
+      constant ResParams&, device const ushort*, device ushort*, uint, uint, uint, uint);
+ARM_INST("attn_residual_mix", 256, false)
+ARM_INST("attn_residual_mix_1024", 1024, false)
+ARM_INST("attn_residual_mix_norm_1024", 1024, true)
 
 // ---------------------------------------------------------------- message controller
 // pair = bf16([rms(x), rms(m)]); h = bf16(pair @ down^T) (rank R); f = tanh(h @ forget^T); g = tanh(h @ gain^T)

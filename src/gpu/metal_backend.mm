@@ -77,6 +77,7 @@ struct LinParams {
 struct ResParams {
   uint32_t T, D, nb, nq;
   uint32_t dt[8];
+  float eps;
 };
 struct CtrlParams {
   uint32_t T, D, R, m_stride;
@@ -374,7 +375,16 @@ class MetalBackend final : public Backend {
     g_.dispatch({cdiv(p.row_start[p.count], 8), 1, 1}, {64, 1, 1});
   }
 
-  void mix(const std::vector<const Tensor*>& states, const Tensor& query, uint32_t nq, Tensor& out) {
+  void attn_residual_norm(const std::vector<const Tensor*>& states, const Tensor& query, Tensor& mixed,
+                          const Tensor& gamma, float eps, Tensor& normed) override {
+    uint32_t D = uint32_t(states[0]->dim(-1)), T = uint32_t(states[0]->numel() / D);
+    bool nq1 = query.ndim == 1 || query.dim(0) == 1;
+    if (!nq1 || T > 4 || D > 2304 || normed.dtype != DType::BF16 || getenv("INK_NO_FUSE"))
+      return Backend::attn_residual_norm(states, query, mixed, gamma, eps, normed);
+    mix(states, query, 1, mixed, &gamma, eps, &normed);
+  }
+  void mix(const std::vector<const Tensor*>& states, const Tensor& query, uint32_t nq, Tensor& out,
+           const Tensor* gamma = nullptr, float eps = 0, Tensor* normed = nullptr) {
     if (skip("mix")) return;
     if (states.size() > 8 || states.empty()) fail("attn_residual: 1..8 states");
     uint32_t D = uint32_t(states[0]->dim(-1));
@@ -384,7 +394,9 @@ class MetalBackend final : public Backend {
     p.nb = uint32_t(states.size());
     p.nq = nq;
     bool wide = p.T <= 4;  // decode/verify: one threadgroup per token is latency bound, use 1024 threads
-    pipe(wide ? "attn_residual_mix_1024" : "attn_residual_mix");
+    p.eps = eps;
+    pipe(normed ? "attn_residual_mix_norm_1024" : wide ? "attn_residual_mix_1024" : "attn_residual_mix");
+    if (normed) wide = true;
     for (uint32_t i = 0; i < 8; i++) {
       const Tensor& s = *states[std::min<size_t>(i, states.size() - 1)];
       bind(i, s);
@@ -393,6 +405,8 @@ class MetalBackend final : public Backend {
     bind(8, query);
     bind(9, out);
     g_.set_value(10, p);
+    bind(11, gamma ? *gamma : query);
+    bind(12, normed ? *normed : out);
     g_.dispatch({p.T, 1, 1}, {wide ? 1024u : 256u, 1, 1});
   }
   void attn_residual(const std::vector<const Tensor*>& states, const Tensor& query, Tensor& out) override {
@@ -567,7 +581,7 @@ class MetalBackend final : public Backend {
     const uint32_t KEYS = 1024, slice = 2048;
     const uint32_t len = uint32_t(a.kv.len), window = uint32_t(a.window), ext = uint32_t(a.rel_proj.dim(1));
     const uint32_t rows_pad = cdiv(std::min(T, slice) * 3, 64) * 64;
-    Tensor sh = scratch("ag-sh", DType::F16, {KVH, rows_pad, KEYS});
+    Tensor sh = scratch("ag-sh", DType::F32, {KVH, rows_pad, KEYS});
     Tensor tmax = scratch("ag-tmax", DType::F32, {KVH, rows_pad, KEYS / 64});
     Tensor m1 = scratch("ag-m1", DType::F32, {KVH, rows_pad}), m2 = scratch("ag-m2", DType::F32, {KVH, rows_pad});
     Tensor l1 = scratch("ag-l1", DType::F32, {KVH, rows_pad}), l2 = scratch("ag-l2", DType::F32, {KVH, rows_pad});
