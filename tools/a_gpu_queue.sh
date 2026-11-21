@@ -41,7 +41,7 @@ long)
   L="10 11 12 13 14 15 16 17"
   STEPS=32 ACC_OUT=$S/long_gemm tests/ref/acc_check.sh metal $L 2>&1 | grep -E "prefill"
   INK_AG_MIN_T=1000000 STEPS=32 ACC_OUT=$S/long_flash tests/ref/acc_check.sh metal $L >/dev/null 2>&1
-  MODEL=$M8 STEPS=32 ACC_OUT=$S/long_q8 tests/ref/acc_check.sh metal $L >/dev/null 2>&1
+  INK_Q8_KERNELS=1 MODEL=$M8 STEPS=32 ACC_OUT=$S/long_q8 tests/ref/acc_check.sh metal $L >/dev/null 2>&1
   $PY -I tests/ref/acc_summary.py "$L" mlx-bf16=mlx gemm=$S/long_gemm flash=$S/long_flash 8bit=$S/long_q8
   ;;
 esac

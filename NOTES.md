@@ -17,7 +17,7 @@ Format: `LOCK <agent> <what> <start time>` / `UNLOCK <agent> <time>`.
 
 **One line, always current. Replace it (do not append). Message the next holder when you release.**
 
-HOLDER: C (full bench, from 18:52, 60-90 min) -> NEXT: A (8-bit validation) -> then B
+No lock line any more: the GPU is used only by the test batch the integrator (A) runs on merged main. See tools/WORKFLOW.md.
 
 Kernel micro-benches on synthetic buffers (op_diff, bench_*) do not need the lock but skew a running benchmark:
 do not run them while C is benchmarking.
@@ -424,3 +424,32 @@ head 0.93 -> 0.48). Check script: tests/ref/check_8bit_layout.py (tensor-by-tens
 - **8-bit build**: loader + check script done (see "A: 8-bit build"); CPU p0 greedy 16/16 vs the lossless
   reference. B wired q8 kernels behind INK_Q8_KERNELS=1 (MLX qmv semantics s*sum(x q) + b*sum(x), not
   bf16-rounded weights), to be validated.
+
+## A: GPU session results (2026-11-21, 19:25-19:45, one run each)
+
+- **Chain kernels: slower, now opt-in (INK_CHAIN=1).** Decode 28.6 vs 36.9 tok/s; chain_front 198 us and chain_mid
+  117 us per call (stage timing: conv 8, mix 12, controller ~140, router ~40 us). One 1024-thread threadgroup has
+  the throughput of one slice of the GPU; a scalar device load costs ~0.25 us of latency. Matvecs must stay
+  multi-threadgroup. Lesson for fusion: fuse only ops whose per-thread work is a handful of loads.
+- **DSpark at temperature 0.7 (p2, 300 tokens)**: plain 36.0 tok/s; fixed block 4 + compare 43.4; fixed + real
+  speculative sampling 40.3 (accepted 1.31 vs 1.47 per round: q at the target's temperature is flatter than p, so
+  1 - TV(p, q) < p(greedy draft)); bandit over draft counts + compare 42.8 = default. Costs: plain 27.8 ms, verify
+  T=2/3/4 33.9/41.5/47.5 ms, draft 8.0 ms. Greedy: token streams identical, 39.5 vs 36.6 tok/s.
+  To do for speculative sampling: a sharper proposal (draft temperature below the target's), tuned online.
+- **8-bit build on Metal** (acc_check p0-p2, 64 steps): load-time conversion 36.7 tok/s, greedy 62/64, 63/64,
+  63/64, KL vs fp32 1.4e-3 / 4.9e-3 / 1.5e-3; B's q8 kernels (INK_Q8_KERNELS=1) **42.7 tok/s plain**, greedy
+  63/64 x3 (near-ties and after-stop), KL vs fp32 1.4e-3 / 6.0e-3 / 2.2e-3.
+- **Long-prompt accuracy set** (8 prompts of 573..6224 tokens cut from source files + a question, 32 forced steps,
+  mean KL vs the fp32-activation MLX reference; `tests/ref/acc_summary.py`):
+
+  | | MLX-bf16 | ours, GEMM attention | ours, flash attention | 8-bit build (q8 kernels) |
+  |---|---|---|---|---|
+  | mean | 3.04e-3 | 3.99e-3 | 3.60e-3 | 3.19e-3 |
+  | median | 2.68e-3 | 3.89e-3 | 3.90e-3 | 2.96e-3 |
+  | max | 6.43e-3 | 5.69e-3 | 5.08e-3 | 5.79e-3 |
+  | argmax = fp32 argmax | 253/256 | 249/256 | 252/256 | 254/256 |
+
+  Per prompt each implementation is above the others on some prompts and below on others (factor 2 both ways),
+  so all four are in one accuracy class; GEMM vs flash attention shows no systematic difference (same median),
+  and the 8-bit build is not measurably worse than the lossless one on this set. Prefill of the 6224-token prompt:
+  8.5 s (731 tok/s).
