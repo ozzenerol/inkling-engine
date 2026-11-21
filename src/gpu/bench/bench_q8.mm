@@ -1,5 +1,6 @@
 // Bandwidth of the q8 affine matvec through MetalBackend::linear on decode shapes (model-free). Owner: B.
 #include <algorithm>
+#include <chrono>
 #include <cstdio>
 #include <random>
 #include <vector>
@@ -43,8 +44,9 @@ int main(int argc, char** argv) {
   if (indep)
     for (int i = 0; i < 2048; i++)
       pool.push_back({be->alloc(DType::BF16, {1, 2304}, "pa"), be->alloc(DType::BF16, {1, 2304}, "pb")});
-  std::vector<double> t;
+  std::vector<double> t, tw;
   for (int r = 0; r < 8; r++) {
+    auto w0 = std::chrono::steady_clock::now();
     for (auto& m : ms) {
       be->linear(m.w.dim(1) * 4 == 2304 ? x23 : x30, m.w, m.y);
       // INTERLEAVE=n: n tiny dependent dispatches after each matvec, as in a decode step (tests whether the gaps
@@ -60,8 +62,12 @@ int main(int argc, char** argv) {
     }
     be->sync();
     t.push_back(gpu::Context::get().last_gpu_ms());
+    tw.push_back(std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - w0).count());
   }
   std::sort(t.begin(), t.end());
+  std::sort(tw.begin(), tw.end());
   printf("q8 matvec T=%lld interleave %d%s: %zu matrices, %.2f GB, median %.3f ms -> %.0f GB/s\n", (long long)T, interleave, indep ? " (independent)" : "", ms.size(),
          bytes / 1e9, t[4], bytes / 1e9 / (t[4] / 1e3));
+  // wall clock (encode + submit + wait): a GPU time above the memory bandwidth means the GPU timestamps miss work
+  printf("  wall median %.3f ms -> %.0f GB/s\n", tw[4], bytes / 1e9 / (tw[4] / 1e3));
 }
