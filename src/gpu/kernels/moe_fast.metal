@@ -209,10 +209,6 @@ template [[host_name("moe_gateup_nvfp4")]] kernel void moe_gateup<0>(
     device const uint4*, device const uchar*, device const float*, device const uint4*, device const uchar*,
     device const float*, device const ushort*, device const int*, device ushort*, constant MoeFastParams&, uint2,
     uint, uint, uint);
-template [[host_name("moe_gateup_nvfp4_lut")]] kernel void moe_gateup<0, true>(
-    device const uint4*, device const uchar*, device const float*, device const uint4*, device const uchar*,
-    device const float*, device const ushort*, device const int*, device ushort*, constant MoeFastParams&, uint2,
-    uint, uint, uint);
 template [[host_name("moe_gateup_mxfp8")]] kernel void moe_gateup<1>(
     device const uint4*, device const uchar*, device const float*, device const uint4*, device const uchar*,
     device const float*, device const ushort*, device const int*, device ushort*, constant MoeFastParams&, uint2,
