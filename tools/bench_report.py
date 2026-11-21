@@ -9,6 +9,45 @@ import subprocess
 import sys
 
 d = sys.argv[1] if len(sys.argv) > 1 else os.path.join(os.path.dirname(__file__), "..", "bench")
+# ---- depth_bench: read speed and gen tok/s at each context depth, against the user's gen target
+mlx_ctx = []
+f = os.path.join(d, "ctx-mlx.jsonl")
+if os.path.exists(f):
+    mlx_ctx = [json.loads(l) for l in open(f) if l.strip()]
+
+
+def mlx_at(pt):
+    """MLX's cold ctxbench row at about this many prompt tokens (within 15%)."""
+    best = min(mlx_ctx, key=lambda r: abs((r.get("prompt_tokens") or 0) - pt), default=None)
+    return best if best and abs(best["prompt_tokens"] - pt) < 0.15 * pt else None
+
+
+for f in sorted(glob.glob(os.path.join(d, "depth-*.jsonl"))):
+    rows = [json.loads(l) for l in open(f) if l.strip()]
+    label = os.path.basename(f)[6:-6]
+    print(f"Target benchmark, {label}: read speed and gen tok/s by context depth (one growing session, essay "
+          "prompt, temp 0.7, 400 tokens, one run)\n")
+    print("| context | new tokens read | read tok/s | TTFT s | gen tok/s | gen target | meets | MLX gen | vs MLX |")
+    print("|---|---|---|---|---|---|---|---|---|")
+    for r in rows:
+        if "error" in r:
+            print(f"| {r['depth'] / 1000:.1f}k | - | - | - | failed: {r['error'][:60]} | - | - | - | - |")
+            continue
+        m = mlx_at(r["prompt_tokens"])
+        g = r.get("gen_tps")
+        # User's target: gen >= 40 tok/s at the start, >= 20-30 at 127.5k (linear in prompt tokens between).
+        f = min(1.0, max(0.0, (r["prompt_tokens"] - 1200) / (127500 - 1200)))
+        lo, hi = 40 - 20 * f, 40 - 10 * f
+        tgt = f"{hi:.0f}" if round(hi) == round(lo) else f"{lo:.0f}-{hi:.0f}"
+        meets = "-" if g is None else ("yes" if g >= hi else ("in range" if g >= lo else "no"))
+        mark = "*" if m and m.get("source") == "BRIEF" else ""
+        ratio = f"{g / m['gen_tps']:.2f}x" if g and m else "-"
+        print(f"| {r['prompt_tokens'] / 1000:.1f}k | {r['new_tokens']} | {r['prefill_tps']} | {r['ttft_s']} | "
+              f"{g if g is not None else '-'} | {tgt} | {meets} | {str(m['gen_tps']) + mark if m else '-'} | {ratio} |")
+    print("\nread tok/s = new prompt tokens / time to first token (all-in). Gen target: >= 40 tok/s at the start, "
+          ">= 20-30 at 127.5k.")
+    print("MLX gen: its ctxbench run at that prompt size (cold prompt, same essay task); \\* = from BRIEF.md.\n")
+
 runs = {}
 for f in sorted(glob.glob(os.path.join(d, "ctx-*.jsonl"))):
     label = os.path.basename(f)[4:-6]

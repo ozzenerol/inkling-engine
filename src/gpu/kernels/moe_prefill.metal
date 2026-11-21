@@ -50,10 +50,13 @@ struct MoeGemmParams {
   uint scatter_out;   // 1: out row = perm[i]; 0: out row = i
 };
 
-constant uint MG_M = 64, MG_N = 64, MG_K = 32;
+constant uint MG_N = 64, MG_K = 32;
 
-// Grid: (N / 64, max_tiles). Threadgroup 128 (4 simdgroups, 32x32 each).
-template <uint MODE>
+// Grid: (N / 64, max_tiles). Threadgroup of MG_M * 2 threads: MG_M / 32 * 2 simdgroups, 32x32 each.
+// MG_M = rows of one expert per tile (64 or 32). A tile is computed whole, so an expert with r rows costs
+// ceil(r / MG_M) tiles: at 800 new tokens (about 50 rows per expert) 32-row tiles waste less. 128-row tiles were
+// slower on both builds (batch 8). Per element the accumulation order is the same, so results are bit-identical.
+template <uint MODE, uint MG_M = 64>
 kernel void moe_gemm(device const uint4* w [[buffer(0)]], device const uchar* sc [[buffer(1)]],
                      device const float* gs [[buffer(2)]], device const ushort* a [[buffer(3)]],
                      device const int* perm [[buffer(4)]], device const int* offsets [[buffer(5)]],
@@ -84,7 +87,7 @@ kernel void moe_gemm(device const uint4* w [[buffer(0)]], device const uchar* sc
   const uint rowbytes_q = MODE == 0 ? p.K / 2 : p.K;  // packed bytes per weight row
   for (uint k0 = 0; k0 < p.K; k0 += MG_K) {
     // A: 64 rows x 32 bf16 = 256 uint4, 2 per thread
-    for (uint i = tid; i < MG_M * MG_K / 8; i += 128) {
+    for (uint i = tid; i < MG_M * MG_K / 8; i += MG_M * 2) {
       uint r = i / 4, c8 = (i % 4) * 8;
       int src = arow[r];
       uint4 v = uint4(0);
@@ -93,22 +96,22 @@ kernel void moe_gemm(device const uint4* w [[buffer(0)]], device const uchar* sc
     }
     // B: 64 weight rows x 32 values, dequantized. NVFP4: one uint4 + 2 scales per row; MXFP8: 2 uint4 + 1 scale.
     if (MODE == 0) {
-      if (tid < MG_N) {
-        uint n = n0 + tid;
+      for (uint bt = tid; bt < MG_N; bt += MG_M * 2) {
+        uint n = n0 + bt;
         size_t row = size_t(e) * p.N + min(n, p.N - 1);
         uint4 q = w[(row * rowbytes_q + k0 / 2) / 16];
         ushort s2 = *(device const ushort*)(sc + row * (p.K / 16) + k0 / 16);
         float s0 = e4m3_to_f(s2 & 255u), s1 = e4m3_to_f(s2 >> 8);
         uint ws[4] = {q.x, q.y, q.z, q.w};
-        threadgroup bfloat* dst = Bs + tid * LDS;
+        threadgroup bfloat* dst = Bs + bt * LDS;
         for (uint j = 0; j < 4; j++) {
           float s = j < 2 ? s0 : s1;
           for (uint i = 0; i < 8; i++) dst[j * 8 + i] = bfloat(fp4h((ws[j] >> (4 * i)) & 15u) * 16384.0f * s);
         }
       }
     } else {
-      if (tid < 2 * MG_N) {
-        uint rr = tid / 2, half_ = tid % 2;
+      for (uint bt = tid; bt < 2 * MG_N; bt += MG_M * 2) {
+        uint rr = bt / 2, half_ = bt % 2;
         uint n = n0 + rr;
         size_t row = size_t(e) * p.N + min(n, p.N - 1);
         uint4 q = w[(row * rowbytes_q + k0 + half_ * 16) / 16];
@@ -130,7 +133,7 @@ kernel void moe_gemm(device const uint4* w [[buffer(0)]], device const uchar* sc
     threadgroup_barrier(mem_flags::mem_threadgroup);
   }
   float gscale = MODE == 0 ? gs[e] : 1.0f;
-  threadgroup float Cs[4][64];
+  threadgroup float Cs[MG_M / 16][64];
   for (uint i = 0; i < 4; i++)
     for (uint j = 0; j < 4; j++) {
       simdgroup_store(acc[i][j], Cs[sg], 8);
@@ -147,11 +150,13 @@ kernel void moe_gemm(device const uint4* w [[buffer(0)]], device const uchar* sc
     }
 }
 
-#define MG_INST(M, NAME)                                                                                       \
-  template [[host_name(NAME)]] kernel void moe_gemm<M>(                                                       \
+#define MG_INST(M, NAME, ROWS)                                                                                 \
+  template [[host_name(NAME)]] kernel void moe_gemm<M, ROWS>(                                                       \
       device const uint4*, device const uchar*, device const float*, device const ushort*, device const int*, \
       device const int*, device const uint2*, device const uint*, device ushort*, constant MoeGemmParams&,    \
       uint2, uint, uint, uint);
-MG_INST(0, "moe_gemm_nvfp4")
-MG_INST(1, "moe_gemm_mxfp8")
+MG_INST(0, "moe_gemm_nvfp4", 64)
+MG_INST(0, "moe_gemm_nvfp4_m32", 32)
+MG_INST(1, "moe_gemm_mxfp8", 64)
+MG_INST(1, "moe_gemm_mxfp8_m32", 32)
 

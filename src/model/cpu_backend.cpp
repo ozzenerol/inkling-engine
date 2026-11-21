@@ -148,6 +148,44 @@ inline float gscale(const QuantProj& p, int64_t e) {
   return p.mode == QuantMode::NVFP4 ? p.global.data<float>()[e] : 1.0f;
 }
 
+// INK_KV_Q8SIM (accuracy experiment, A): what an 8-bit global KV cache would hold. Each key / value vector of a
+// kv head is quantized in groups of 64: "1" = affine (scale = (max - min) / 255, bias = min, codes 0..255),
+// "sym" = symmetric (scale = maxabs / 127, codes -127..127, no bias). The dequantized value is rounded back to
+// bf16 here (the storage of this backend), which adds a little noise the real fp32 dequant would not have.
+inline int kv_q8sim_mode() {
+  static const int m = [] {
+    const char* e = std::getenv("INK_KV_Q8SIM");
+    return !e ? 0 : (std::string(e) == "sym" ? 2 : 1);
+  }();
+  return m;
+}
+inline void kv_q8sim(uint16_t* p, int64_t n) {  // n values, groups of 64
+  const int mode = kv_q8sim_mode();
+  for (int64_t g0 = 0; g0 < n; g0 += 64) {
+    float lo = INFINITY, hi = -INFINITY;
+    for (int j = 0; j < 64; ++j) {
+      float v = bf16_to_f32(p[g0 + j]);
+      lo = std::min(lo, v);
+      hi = std::max(hi, v);
+    }
+    if (mode == 2) {
+      float sc = round_bf16(std::max(std::fabs(lo), std::fabs(hi)) / 127.0f);
+      for (int j = 0; j < 64; ++j) {
+        float v = bf16_to_f32(p[g0 + j]);
+        float q = sc > 0 ? std::max(-127.0f, std::min(127.0f, std::round(v / sc))) : 0.0f;
+        p[g0 + j] = f32_to_bf16(q * sc);
+      }
+    } else {
+      float sc = round_bf16((hi - lo) / 255.0f), bias = round_bf16(lo);
+      for (int j = 0; j < 64; ++j) {
+        float v = bf16_to_f32(p[g0 + j]);
+        float q = sc > 0 ? std::max(0.0f, std::min(255.0f, std::round((v - bias) / sc))) : 0.0f;
+        p[g0 + j] = f32_to_bf16(q * sc + bias);
+      }
+    }
+  }
+}
+
 class CpuBackend final : public Backend {
  public:
   ~CpuBackend() override {
@@ -408,6 +446,12 @@ class CpuBackend final : public Backend {
   void attention(const AttnArgs& A, Tensor& out) override {
     const int64_t H = 24, KVH = 8, HD = 128, DR = 16, EXT = 1024;
     const int64_t T = A.q.numel() / (H * HD);
+    // 8-bit KV simulation: the new rows' keys and values are quantized before anything reads them (their own
+    // attention included), as the real kernels would; kv_append then stores these values.
+    if (kv_q8sim_mode() && A.window == 0) {
+      kv_q8sim(A.k_new.data<uint16_t>(), A.k_new.numel());
+      kv_q8sim(A.v_new.data<uint16_t>(), A.v_new.numel());
+    }
     const int64_t past = A.kv.len;
     const float scale = 1.0f / std::sqrt(float(HD));
     parallel_for(T * H, [&](int64_t b, int64_t e) {

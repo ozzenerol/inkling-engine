@@ -72,3 +72,10 @@ inline void stv(device void* p, uint dt, uint i, float v) {
 kernel void warm_tick(device uint* x [[buffer(0)]], uint i [[thread_position_in_grid]]) {
   if (i == 0) x[0] += 1;
 }
+
+
+// INK_NULL=1: every dispatch is replaced by this (one thread, private buffer) with the same barriers and commits,
+// to time the bare dispatch chain of a forward.
+kernel void null_tick(device uint* x [[buffer(30)]], uint i [[thread_position_in_grid]]) {
+  if (i == 0) x[0] += 1;
+}

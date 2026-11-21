@@ -120,7 +120,7 @@ struct ChainParams {  // kernels/chain.metal
   uint32_t nq;
 };
 struct AgParams {  // kernels/attn_gemm.metal
-  uint32_t T, rows, rows_pad, H, KVH, cap, len, ring, window, rel_extent, j0, n, use_gate, t0;
+  uint32_t T, rows, rows_pad, H, KVH, cap, len, ring, window, rel_extent, j0, n, use_gate, t0, use_lo;
 };
 struct AttnDecParams {
   uint32_t T, H, KVH, cap, len, ring, window, rel_extent, split_keys, nsplit, causal, first, use_sink, use_gate;
@@ -396,7 +396,7 @@ class MetalBackend final : public Backend {
     if (T <= 16) {
       for (uint32_t t0 = 0; t0 < T; t0 += 4) {
         uint32_t tt = std::min<uint32_t>(4, T - t0);
-        std::string nm = std::string("matvec_q8_") + dtn(x.dtype) + "_" + dtn(out.dtype) + (tt == 1 ? "_t1" : "_t4");
+        std::string nm = std::string("matvec_q8_") + dtn(x.dtype) + "_" + dtn(out.dtype) + (tt == 1 ? "_t1" : (tt == 2 && !t2_off_) ? "_t2" : "_t4");
         Q8Params qp{N, K, tt, K, N};
         pipe(nm);
         bind(0, w);
@@ -478,7 +478,7 @@ class MetalBackend final : public Backend {
     if (K % 8 == 0 && T <= 16) {
       for (uint32_t t0 = 0; t0 < T; t0 += 4) {
         uint32_t tt = std::min<uint32_t>(4, T - t0);
-        std::string nm = std::string("matvec_bf16_") + dtn(x.dtype) + "_" + dtn(out.dtype) + (tt == 1 ? "_t1" : "_t4") +
+        std::string nm = std::string("matvec_bf16_") + dtn(x.dtype) + "_" + dtn(out.dtype) + (tt == 1 ? "_t1" : (tt == 2 && !t2_off_) ? "_t2" : "_t4") +
                          "_r4_s2";
         MatvecShape s{N, K, tt, K, N};
         pipe(nm);
@@ -852,6 +852,61 @@ class MetalBackend final : public Backend {
 
   void attention(const AttnArgs& a, Tensor& out) override {
     if (skip("attn")) return; attention_impl(a, nullptr, out); }
+  // ---- B's fused decode ops (default on since batch 7; INK_NO_FUSE2=1 runs the primitive sequences).
+  bool fuse2() const { return fuse2_; }
+  void attention_gated(const AttnArgs& a, const Tensor& gate, Tensor& out) override {
+    uint32_t H = uint32_t(a.q.dim(1)), KVH = uint32_t(a.k_new.dim(1));
+    if (!fuse2_ || H != 3 * KVH) return Backend::attention_gated(a, gate, out);
+    if (skip("attn")) return;
+    attention_impl(a, &gate, out);  // every path rounds O/L to bf16, then multiplies by sigmoid(gate)
+  }
+  void attn_prep_local(const Tensor& kraw, const Tensor& vraw, const Tensor& k_conv, const Tensor& v_conv,
+                       Tensor& kstate, Tensor& vstate, Tensor* khist, Tensor* vhist, Tensor& q3, const Tensor& q_scale,
+                       Tensor& r3, const Tensor& rel_scale, float qk_clip, float rel_clip, float eps, Tensor& kc,
+                       Tensor& vc, Tensor& k3, Tensor& v3) override {
+    uint32_t T = uint32_t(q3.dim(0)), H = uint32_t(q3.dim(1)), KVH = uint32_t(k3.dim(1));
+    // rows are walked in order inside each unit, so any T is bit-equal to the primitives; 32 = verify limit (D's kMR)
+    if (!fuse2_ || T > 32 || q3.dim(2) != 128 || k3.dim(2) != 128 || r3.dim(2) != 16)
+      return Backend::attn_prep_local(kraw, vraw, k_conv, v_conv, kstate, vstate, khist, vhist, q3, q_scale, r3,
+                                      rel_scale, qk_clip, rel_clip, eps, kc, vc, k3, v3);
+    if (skip("small")) return;
+    bool hh = khist && khist->valid();
+    PrepParams p{T, H, KVH, qk_clip, rel_clip, eps, hh ? 1u : 0u};
+    pipe("attn_prep_local");
+    bind(0, q3);
+    bind(1, q_scale);
+    bind(2, r3);
+    bind(3, rel_scale);
+    bind(4, kraw);
+    bind(5, vraw);
+    bind(6, k_conv);
+    bind(7, v_conv);
+    bind(8, kstate);
+    bind(9, vstate);
+    bind(10, hh ? *khist : kstate);
+    bind(11, hh ? *vhist : vstate);
+    bind(12, k3);
+    bind(13, v3);
+    g_.set_value(14, p);
+    g_.dispatch({2 * H + 2 * KVH, 1, 1}, {32, 1, 1});
+  }
+  void conv_add(const Tensor& x, const Tensor& w, Tensor& state, Tensor* hist, const Tensor& other, Tensor& tmp,
+                Tensor& out) override {
+    uint32_t C = uint32_t(x.dim(-1)), T = uint32_t(x.numel() / C);
+    if (!fuse2_ || T > 32) return Backend::conv_add(x, w, state, hist, other, tmp, out);
+    if (skip("small")) return;
+    bool hh = hist && hist->valid();
+    ConvAddParams p{T, C, hh ? 1u : 0u, dtc(other.dtype), dtc(out.dtype)};
+    pipe("conv_add4");
+    bind(0, x);
+    bind(1, w);
+    bind(2, state);
+    bind(3, hh ? *hist : state);
+    bind(4, other);
+    bind(5, out);
+    g_.set_value(6, p);
+    g_.dispatch({cdiv(C, 256), 1, 1}, {256, 1, 1});
+  }
   void attention_impl(const AttnArgs& a, const Tensor* gate, Tensor& out) {
     uint32_t T = uint32_t(a.q.dim(0)), H = uint32_t(a.q.dim(1)), KVH = uint32_t(a.k_new.dim(1));
     if (ga_ && a.window == 0 && !a.kv.ring && T <= kMR && H == 3 * KVH && a.kv.len + T >= ga_min_len_ &&
@@ -1106,7 +1161,7 @@ class MetalBackend final : public Backend {
     const Tensor& kc = a.kv.k.valid() ? a.kv.k : a.k_new;
     const Tensor& vc = a.kv.v.valid() ? a.kv.v : a.v_new;
     AgParams p{T, 0, rows_pad, H, KVH, uint32_t(a.kv.cap), len, a.kv.ring ? 1u : 0u, window, ext, 0, 0,
-               gate ? 1u : 0u, 0};
+               gate ? 1u : 0u, 0, ag_half_ ? 0u : 1u};
     pipe("ag_rel_t");
     bind(0, a.rel_proj);
     bind(1, rpt);
@@ -1335,7 +1390,8 @@ class MetalBackend final : public Backend {
       uint32_t rps = getenv("INK_MOE_RPS") ? uint32_t(atoi(getenv("INK_MOE_RPS"))) : 4;
       if (rps != 1 && rps != 2) rps = 4;
       std::string gun = std::string(nv ? "moe_gateup_nvfp4" : "moe_gateup_mxfp8") + (rps == 4 ? "" : rps == 2 ? "_r2" : "_r1");
-      if (nv && rps == 4 && getenv("INK_FP4_VEC")) gun = "moe_gateup_nvfp4_vec";  // bit-identical decode variant
+      // bit-identical vector decode: 137.0 -> 131.6 us per call, tokens identical (batch 6); INK_FP4_SCALAR=1 = old
+      if (nv && rps == 4 && !getenv("INK_FP4_SCALAR")) gun = "moe_gateup_nvfp4_vec";
       pipe(gun);
       bind(0, m.gate.weight);
       bind(1, m.gate.scales);
@@ -1391,7 +1447,7 @@ class MetalBackend final : public Backend {
   void moe_gemm(const QuantProj& q, const Tensor& a, const Tensor& perm, const Tensor& offs, const Tensor& tiles,
                 const Tensor& tiles_n, uint32_t max_tiles, uint32_t topk, bool gather, bool scatter, Tensor& out) {
     MoeGemmParams p{uint32_t(q.n), uint32_t(q.k), topk, gather ? 1u : 0u, scatter ? 1u : 0u};
-    pipe(q.mode == QuantMode::NVFP4 ? "moe_gemm_nvfp4" : "moe_gemm_mxfp8");
+    pipe(std::string(q.mode == QuantMode::NVFP4 ? "moe_gemm_nvfp4" : "moe_gemm_mxfp8") + (moe_cur_m_ == 32 ? "_m32" : ""));
     bind(0, q.weight);
     bind(1, q.scales);
     bind(2, q.global.valid() ? q.global : q.scales);
@@ -1402,12 +1458,14 @@ class MetalBackend final : public Backend {
     bind(7, tiles_n);
     bind(8, out);
     g_.set_value(9, p);
-    g_.dispatch({cdiv(p.N, 64), max_tiles, 1}, {128, 1, 1});
+    g_.dispatch({cdiv(p.N, 64), max_tiles, 1}, {2 * moe_cur_m_, 1, 1});
   }
   void moe_prefill(const Tensor& x, const Tensor& idx, const Tensor& w, const MoeWeights& m, Tensor& out, uint32_t T,
                    uint32_t D, uint32_t topk) {
     uint32_t routes = T * topk, I = uint32_t(m.gate.n), E = 128;
-    uint32_t max_tiles = cdiv(routes, 64) + E;
+    // INK_MOE_M=0: by rows per expert (T / 16 on average): 32-row tiles below ~80 rows per expert
+    moe_cur_m_ = moe_m_ == 32 ? 32 : (moe_m_ == 0 && T < 1280) ? 32 : 64;
+    uint32_t max_tiles = cdiv(routes, moe_cur_m_) + E;
     Tensor perm = scratch("moep-perm", DType::I32, {routes});
     Tensor offs = scratch("moep-offs", DType::I32, {E + 1});
     Tensor tiles = scratch("moep-tiles", DType::I32, {max_tiles, 2});
@@ -1416,7 +1474,7 @@ class MetalBackend final : public Backend {
     Tensor ut = scratch("moe-u", DType::BF16, {routes, I});
     Tensor at = scratch("moe-a", DType::BF16, {routes, I});
     Tensor dt = scratch("moe-d", DType::BF16, {routes, D});
-    SortParams sp{routes, E, 64};
+    SortParams sp{routes, E, moe_cur_m_};
     pipe("moe_sort");
     bind(0, idx);
     bind(1, perm);
@@ -1471,6 +1529,11 @@ class MetalBackend final : public Backend {
   bool pending_ = false;
   bool profile_ = false;
   bool gpu_time_ = false;
+  // rows of one expert per MoE prefill tile (bit-identical for any choice)
+  uint32_t moe_cur_m_ = 64;
+  uint32_t moe_m_ = getenv("INK_MOE_M") ? uint32_t(atoi(getenv("INK_MOE_M"))) : 64u;  // 32, 64 or 0 = by T (opt-in)
+  bool t2_off_ = getenv("INK_NO_T2") != nullptr;  // 2-row matvec kernels (same per-row arithmetic as t1 / t4)
+  bool fuse2_ = getenv("INK_NO_FUSE2") == nullptr;  // batch 7: tokens identical, 43.5 vs 42.9 tok/s (8-bit)
   std::string skip_;
   std::chrono::steady_clock::time_point last_sync_;
   double acc_gpu_ = 0, acc_wall_ = 0, acc_wait_ = 0;
@@ -1501,12 +1564,13 @@ class MetalBackend final : public Backend {
   long moe_calls_[17] = {}, moe_routes_[17] = {}, moe_uniq_[17] = {};
   bool mr_attn_ = !(getenv("INK_MR_ATTN") && getenv("INK_MR_ATTN")[0] == '0');  // D: 5..16-row attention
   bool ag_stats_ = getenv("INK_AG_STATS") != nullptr;
+  bool ag_half_ = getenv("INK_AG_HALF") != nullptr;  // prefill attention with P as one half tile (experiment, A)
   // Chain kernels (A), opt-in with INK_CHAIN=1: measured SLOWER than the separate ops (decode 28.6 vs 36.9 tok/s;
   // chain_front 198 us, chain_mid 117 us per call). One threadgroup of 1024 threads has the throughput of one
   // slice of the GPU, so the router and controller matvecs inside it cost far more than the ~7.5 us per
   // dependent dispatch they save.
   bool chain_ = getenv("INK_CHAIN") != nullptr;
-  uint32_t ag_min_t_ = getenv("INK_AG_MIN_T") ? uint32_t(atoi(getenv("INK_AG_MIN_T"))) : 64;  // GEMM attention from this T
+  uint32_t ag_min_t_ = getenv("INK_AG_MIN_T") ? uint32_t(atoi(getenv("INK_AG_MIN_T"))) : 17;  // GEMM attention from this T (3..16 rows: multi-row split kernels)
   std::string cur_;
   std::map<std::string, std::pair<double, long>> prof_;
   std::unordered_map<void*, size_t> sizes_;

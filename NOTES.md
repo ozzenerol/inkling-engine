@@ -569,6 +569,59 @@ head 0.93 -> 0.48). Check script: tests/ref/check_8bit_layout.py (tensor-by-tens
   so the 8-bit plain step (23.7 ms) is now almost all MoE + head + small-dispatch latency; q8 linear_multi and
   conv_mix: no gain; MoE gate/up with 2 or 1 rows per simdgroup: slower (249 / 237 vs 262 GB/s).
 
+## B: correction (fused decode ops were not wired)
+
+The Metal overrides for `attn_prep_local`, `attention_gated` and `conv_add` were missing from metal_backend.mm from
+5f0fe21 until b/work ab13ba8: the edit that inserted them did not apply, so the Backend defaults (primitive
+sequences) ran. Consequences: the "fused attn_prep_local / attention_gated / conv_add" item in "B: decode speed
+work" contributed nothing to 31.8 -> 36.7 tok/s (that came from the wide mix, router matvec, concurrent encoder and
+mix+norm); the op_diff "prep" / "conv_add" cases compared primitives with primitives; the INK_SKIP numbers were on
+the unfused paths. The overrides now exist behind INK_FUSE2=1 and are unmeasured until a batch runs
+tools/queue/b.sh (exact op_diff cases, attention_gated identity, decode off vs on, DSpark identity).
+Also: batch 5's "q8 matvec 795 GB/s" came from zero-filled weights in bench_q8 and is not a read measurement.
+- **Batch 6** (main 73d0183, 20:45-21:05; stopped by A during C's full sweep): gates pass. D's q8 multi-row: 8-bit
+  copy 119-129 tok/s (118.8 without), token-identical. Parallel target sampling of verify rows in. C's cold sweep,
+  lossless build, temp 0.7 (prefill / gen tok/s): 1.2k 749 / 34.8, 9.5k 815 / 32.9, 18.9k 782 / 31.5, 38.6k
+  710 / 29.2, 78k 593 / 23.8 (MLX: 565 / 23.1, 602 / 24.2, 571 / 23.3, 495 / 22.0, 385 / 16.5).
+  B's 8-bit plain-step ablation (23.6 ms): MoE 7.5, dense 6.2, small ops 4.7, attention 3.0, mix 2.5, controllers
+  2.5, router 2.0, logits 1.5 ms; ~1200 dependent barriers per 1560 dispatches per token. The same q8 dense bytes
+  take 1.8 ms model-free (random codes): in-model they are 3x slower, cause open (dispatch gaps / GPU performance
+  state: B tests INTERLEAVE and INK_BUSY in batch 7). 8-bit verify: T=1 24.3 ms, T=2 33.3 (the 4-row matvec
+  template computed 4 rows at T=2: B adds 2-row kernels), T=3 36.8, T=4 42.4.
+- **Target (user, 21:00): 60 tok/s at the start of the context, 40 tok/s at 128k.** See tools/WORKFLOW.md.
+- **Target relaxed (user, 21:20): "even 40 tok/s at the beginning and 20-30 at the end is fine, as long as each
+  prompt is read fast".** Priority is now prefill (read tok/s, time to first token).
+- **Batch 7** (main b5799a2, 21:06-21:35): all gates pass. C's depth bench (8-bit server, one growing conversation
+  of essay requests, temp 0.7, 400 tokens per turn, one run):
+
+  | prompt tokens | 1.2k | 9.6k | 39k | 79k | 127k |
+  |---|---|---|---|---|---|
+  | gen tok/s | 39.0 | 38.8 | 31.0 | 26.0 | 22.7 |
+  | read tok/s (new tokens / TTFT) | 724 | 792 | 658 | 504 | 384 |
+
+  Agent bench 8-bit: median gen 65.1, copy scenario 87.1, median TTFT 1.35 s; qh e2e PASS in 20 s.
+  A: 8-bit, temp 0.7, spec_check: p2 43.0 tok/s; long32k 31.2 (plain step 31.8 ms, T=2 37.1, T=4 50.2, prefill
+  489 tok/s); long64k 26.7 (prefill 436).
+  B: fused decode ops finally wired (FUSE2): tokens identical, 43.5 vs 42.9 tok/s on 8-bit (+1.4%) -> default;
+  2-row matvec kernels: T=2 verify 29.2 vs 32.8 ms, 49.4 vs 45.3 tok/s -> kept; INK_BUSY background load: no
+  effect at any level (the "GPU performance state" hypothesis for the 3x in-model dense gap is refuted).
+- **Batch 8** (main f5fb5b1, 21:40-22:15): all gates pass. C's depth bench (8-bit server, temp 0.7): gen 38.1 /
+  37.8 / 30.5 / 25.8 / 21.8 tok/s and read 745 / 790 / 657 / 503 / 381 tok/s at 1.2k / 9.6k / 39k / 79k / 127k.
+  [ttft] lines: a turn's time to first token is its prefill (775 new tokens at ~640 tok/s = 1.2 s) plus ~85 ms
+  until the first visible byte (two marker tokens); tokenize / cache / checkpoint are ~1-10 ms.
+  A: 8-bit at 126k context (spec_check, temp 0.7): 21.2 tok/s; plain step 47.1 ms, verify T=2/3/4 52.7 / 67.1 /
+  70.1 ms, drafter 17 ms per round (6-8 ms at short context: its global layer reads the whole context).
+  Prefill attention with P as ONE half tile (INK_AG_HALF=1): long set mean KL 4.33e-3 vs 3.99e-3 hi+lo (median
+  3.49 vs 3.89, max 1.07e-2 vs 5.69e-3), prefill at 64k 467 vs 438 tok/s (+6.6%) -> not worth it, stays off.
+  B: 8-bit prefill 2048 tokens 2.51 s (816 tok/s), 800 tokens 1.27 s (630 tok/s); at T = 2048 moe_gemm_nvfp4
+  54% (~9 TFLOPS), gemm_q8 22% (~10 TFLOPS), attention 8%: both big GEMMs are within 1.3x of the GPU's 13.1
+  TFLOPS, so steady-state prefill is near the hardware. MoE tiles of 128 rows: slower (4.46 vs 3.87 s).
+  B's INTERLEAVE bench (batch 7): q8 matvec x 288 back to back 1.76 ms, with 2 tiny dependent dispatches after
+  each 7.82 ms, with 6 14.13 ms (~10 us per tiny dependent dispatch), which contradicts the small gains of
+  FUSE2 (-320 dispatches, +1.4%) -> B runs a NULL-kernel chain (same dispatches, no work) in batch 9 to settle
+  how much of the 23.6 ms plain step is dispatch latency.
+- **User (22:15): keep going "until this is blazingly fast".**
+
 ## D: long-context attention, INK_GA (2026-11-21 late, model-free, one run each; last run overlapped batch 8's start)
 
 - The split kernels (B's and mine) stage every K / V tile in threadgroup memory for 8x8 matrix products: at 128k

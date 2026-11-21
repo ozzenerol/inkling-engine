@@ -2,6 +2,10 @@
 # One GPU test batch on the main checkout (integrator: A). See tools/WORKFLOW.md.
 #   tools/batch.sh [gates] [queues] [full]     default: gates queues
 cd "$(dirname "$0")/.."
+# Never test a half-merged or edited tree: everything must be committed (the user's rule: merge, then test).
+if [ -n "$(git status --porcelain --untracked-files=no)" ]; then
+  echo "batch refused: the main checkout has uncommitted or unmerged files:"; git status --short --untracked-files=no; exit 1
+fi
 N=$(( $(ls -d bench/batch-* 2>/dev/null | wc -l) + 1 ))
 OUT=bench/batch-$N; mkdir -p $OUT
 what=${*:-gates queues}
@@ -22,7 +26,8 @@ if [[ " $what " == *" gates "* ]]; then
   gate rollback ./build/inktest --backend metal --ids ref_data/p2.ids --rollback-test --out $OUT; tail -1 $OUT/gate-rollback.log | tee -a $OUT/summary.log
 fi
 if [[ " $what " == *" queues "* ]]; then
-  for q in tools/queue/*.sh; do
+  # C's server benchmarks run last (they are the longest and want a quiet machine)
+  for q in $(ls tools/queue/*.sh | grep -v '/c.sh$') $(ls tools/queue/c.sh 2>/dev/null); do
     [ -f "$q" ] || continue
     l=$(basename $q .sh); echo "== queue $l" | tee -a $OUT/summary.log
     FULL=$([[ " $what " == *" full "* ]] && echo 1) OUT=$OUT bash $q > $OUT/$l.log 2>&1; echo "   exit $? ($(wc -l < $OUT/$l.log) lines in $OUT/$l.log)" | tee -a $OUT/summary.log

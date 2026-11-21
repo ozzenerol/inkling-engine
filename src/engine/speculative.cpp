@@ -14,6 +14,7 @@
 #include <array>
 #include <unordered_map>
 
+#include "core/parallel.h"
 #include "engine/sampling.h"
 #include "gpu/dspark.h"
 #include "model/model.h"
@@ -28,7 +29,7 @@ struct Spec {
   double draft_ms = 0, verify_ms = 0;
   // Adaptive draft length (A): running estimates, kept across requests.
   double acc[8] = {0.7, 0.7, 0.7, 0.7, 0.7, 0.7, 0.7, 0.7};  // P(draft j accepted | drafts before it accepted)
-  double t_plain = 0, t_draft = 0, t_verify[17] = {};  // ms, 0 = not measured yet
+  double t_plain = 0, t_draft = 0, t_verify[33] = {};  // ms, 0 = not measured yet
   long plain_steps = 0;
   double arm_rate[9] = {0, 0, 0, 0, 0, 0, 0, 0, 0};  // tokens per ms delivered by draft count k (EMA)
   long arm_n[9] = {0, 0, 0, 0, 0, 0, 0, 0, 0};
@@ -221,7 +222,7 @@ bool speculative_generate(Engine& e, Model& m, const SamplingParams& p, int max_
         s.lk_skip--;
       } else {
         // Up to 15 drafts (a 16-row forward: 8 rows cost 73 ms against 30 for one); INK_LOOKUP_MAX lowers it.
-        static const int lk_max = getenv("INK_LOOKUP_MAX") ? std::max(1, std::min(15, atoi(getenv("INK_LOOKUP_MAX")))) : 15;
+        static const int lk_max = getenv("INK_LOOKUP_MAX") ? std::max(1, std::min(31, atoi(getenv("INK_LOOKUP_MAX")))) : 15;
         lookup(b, std::min({s.lk_k, lk_max, max_tokens - emitted}), lk);
         double best = 0;
         for (int j = 0; j <= count_max; j++) best = std::max(best, s.arm_rate[j]);
@@ -313,14 +314,27 @@ bool speculative_generate(Engine& e, Model& m, const SamplingParams& p, int max_
       if (!st.accepted) break;
       a++;
     }
-    for (size_t j = 0; !sampled && j < verify.size(); j++) {
-      const float* row = lg.data() + j * V;
-      y[j] = p.temperature <= 0.0f ? int32_t(std::max_element(row, row + V) - row) : e.sample(p, row, V);
-      if (int(j) < k && drafts[j] == y[j]) {
-        a++;
-        continue;
-      }
-      break;
+    if (!sampled) {
+      // The target's token for every row at once, on all cores (a full-vocabulary sample is 0.3 ms, and a 16-row
+      // verify would spend 5 ms on them one after the other). One fresh uniform per row keeps each an exact,
+      // independent sample; rows after the first mismatch are simply not used.
+      const size_t R = verify.size();
+      std::vector<double> us(R, 0.0);
+      if (p.temperature > 0.0f)
+        for (auto& u : us) u = std::generate_canonical<double, 53>(s.rng);
+      parallel_for(int64_t(R), [&](int64_t r0, int64_t r1) {
+        static thread_local std::vector<float> pt;
+        for (int64_t r = r0; r < r1; r++) {
+          const float* row = lg.data() + r * V;
+          if (p.temperature <= 0.0f) {
+            y[size_t(r)] = argmax_first(row, V);
+          } else {
+            target_probs(p, row, V, pt);
+            y[size_t(r)] = sample_from(pt, us[size_t(r)]);
+          }
+        }
+      }, 1);
+      while (a < k && drafts[size_t(a)] == y[size_t(a)]) a++;
     }
     if (getenv("INK_SPEC_DEBUG") && s.rounds < 1000) {
       fprintf(stderr, "round %ld%s: b=%d drafts", s.rounds, use_lookup ? " (lookup)" : "", b);
@@ -335,7 +349,7 @@ bool speculative_generate(Engine& e, Model& m, const SamplingParams& p, int max_
       s.lk_accepted += a;
       ema(s.lk_rate, (a + 1) / std::chrono::duration<double, std::milli>(c2 - c0).count(), 0.2);
       s.lk_n++;
-      s.lk_k = a == k ? std::min(15, 2 * s.lk_k + 1) : std::max(3, (a + s.lk_k) / 2);
+      s.lk_k = a == k ? std::min(31, 2 * s.lk_k + 1) : std::max(3, (a + s.lk_k) / 2);
     } else {
       s.rounds++;
       s.drafted += k;

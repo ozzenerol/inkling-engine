@@ -56,6 +56,7 @@ int main(int argc, char** argv) {
     else { std::fprintf(stderr, "unknown option %s\n", a.c_str()); return 2; }
   }
   eo.model_dir = model;
+  ao.prefill_chunk = eo.prefill_chunk;
   ao.model_id = model;
 
   {

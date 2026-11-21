@@ -51,6 +51,7 @@ const pyjson::DumpOptions kSorted{",", ":", true, false};
 Api::Api(const Tokenizer& tok, EngineIface& eng, ApiOptions o)
     : tok_(tok), eng_(eng), o_(std::move(o)), cache_(eng), stops_(OutputParser::stop_ids(tok)) {
   cache_.set_shared_prefix_min(o_.shared_prefix_min);
+  cache_.set_chunk(o_.prefill_chunk);
 }
 
 std::string Api::turn_key(const std::string& reasoning, const std::string& content,
@@ -277,7 +278,9 @@ void Api::chat(const http::Request& req, http::Response& res) {
   };
 
   // ---- wait for the engine
+  const double t_tok = now_s();  // body parsed, template rendered, prompt tokenized
   std::unique_lock<std::mutex> lock(mu_);
+  const double t_lock = now_s();
   if (res.peer_closed()) return;
   if (stream) {
     if (!res.start_stream(200, "text/event-stream")) return;
@@ -291,7 +294,7 @@ void Api::chat(const http::Request& req, http::Response& res) {
   OutputParser parser(tok_);
   std::vector<int32_t> emitted;
   std::string finish = "stop";
-  double t_gen0 = 0, t_first = 0, t_end = 0;
+  double t_gen0 = 0, t_first = 0, t_end = 0, t_byte = 0;  // t_byte: first delta written to the socket
   size_t n_calls_sent = 0;
   bool client_gone = false;
   double cb_s = 0;  // server-side time per token, inside on_token
@@ -336,6 +339,7 @@ void Api::chat(const http::Request& req, http::Response& res) {
           n_calls_sent += d.tool_calls.size();
         }
         if (!res.write(chunk(std::move(dv), Value()))) client_gone = true;
+        if (t_byte == 0) t_byte = now_s();
       }
       if (!stream && (emitted.size() & 63) == 0 && res.peer_closed()) client_gone = true;
       if (stream && (emitted.size() & 15) == 0 && res.peer_closed()) client_gone = true;
@@ -403,6 +407,21 @@ void Api::chat(const http::Request& req, http::Response& res) {
   timings.set("predicted_ms", gen_s * 1000);
   timings.set("predicted_per_second", gen_s > 0 && n_gen > 1 ? (n_gen - 1) / gen_s : 0.0);
   timings.set("cache", prep.how);
+  {
+    // Where the time to the first token went (ms).
+    Value b = Value::object();
+    b.set("tokenize_ms", (t_tok - t_req) * 1000);
+    b.set("queue_ms", (t_lock - t_tok) * 1000);
+    b.set("cache_ms", prep.position_s * 1000);
+    b.set("prefill_ms", prep.prefill_s * 1000);
+    b.set("checkpoint_ms", prep.ckpt_s * 1000);
+    b.set("first_token_ms", t_first > 0 ? (t_first - t_gen0) * 1000 : 0.0);
+    b.set("first_byte_ms", t_byte > 0 && t_first > 0 ? (t_byte - t_first) * 1000 : 0.0);
+    Value ch = Value::array();
+    for (int64_t c : prep.chunks) ch.arr.emplace_back(c);
+    b.set("prefill_chunks", std::move(ch));
+    timings.set("ttft_breakdown", std::move(b));
+  }
   timings.set("server_us_per_token", n_gen ? cb_s * 1e6 / n_gen : 0.0);
 
   if (o_.log)
@@ -414,6 +433,19 @@ void Api::chat(const http::Request& req, http::Response& res) {
                  (long long)n_gen, gen_s, gen_s > 0 && n_gen > 1 ? (n_gen - 1) / gen_s : 0.0,
                  (t_first > 0 ? t_first : t_end) - t_req, n_gen ? cb_s * 1e6 / n_gen : 0.0, finish.c_str(), client_gone ? " (client gone)" : "");
 
+  if (o_.log) {
+    std::string cs;
+    for (int64_t c : prep.chunks) cs += (cs.empty() ? "" : "+") + std::to_string(c);
+    std::fprintf(stderr,
+                 "[ttft] %.0f ms = tokenize %.1f + queue %.1f + cache %.1f (%s) + prefill %.1f (%s tok, %.0f tok/s) + "
+                 "checkpoint %.1f + first token %.1f + first byte %.1f%s\n",
+                 ((t_byte > 0 ? t_byte : (t_first > 0 ? t_first : t_end)) - t_req) * 1000, (t_tok - t_req) * 1000,
+                 (t_lock - t_tok) * 1000, prep.position_s * 1000, prep.how.c_str(), prep.prefill_s * 1000, cs.c_str(),
+                 prep.prefill_s > 0 ? prep.prefilled / prep.prefill_s : 0.0, prep.ckpt_s * 1000,
+                 t_first > 0 ? (t_first - t_gen0) * 1000 : 0.0,
+                 t_byte > 0 && t_first > 0 ? (t_byte - t_first) * 1000 : 0.0,
+                 t_byte > 0 && t_first > 0 && t_byte - t_first > 0.05 ? " (first tokens were markers: no visible delta)" : "");
+  }
   if (client_gone) return;
   if (stream) {
     res.write(chunk(Value::object(), Value(finish)));
