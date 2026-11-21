@@ -24,7 +24,7 @@ kernel void attn_prefill(device const ushort* q [[buffer(0)]], device const usho
   constexpr uint LDV = 128 + 4;
   threadgroup bfloat Ks[AP_BK * LDK];
   threadgroup float Vs[AP_BK * LDV];  // fp32 V tile (simdgroup_load into fp32 frags); also Q staging at start
-  threadgroup float Rp[16][RPW];
+  threadgroup float4 Rp[RPW][4];  // [column][16 dims as 4 float4]
   threadgroup bfloat* Qst_base = (threadgroup bfloat*)Vs;  // AP_SG x 8 x 32 bf16 = 6 KB < 16.9 KB
 
   uint q0 = tg.x * AP_BQ, kvh = tg.y;
@@ -88,7 +88,8 @@ kernel void attn_prefill(device const ushort* q [[buffer(0)]], device const usho
       for (uint i = tid; i < 16 * RPW; i += 32 * AP_SG) {
         uint d = i / RPW, c = i % RPW;
         int dist = dlo + int(c);
-        Rp[d][c] = (dist >= 0 && dist < int(p.rel_extent)) ? bf2f(rel_proj[d * p.rel_extent + uint(dist)]) : 0.0f;
+        ((threadgroup float*)&Rp[c][0])[d] =
+            (dist >= 0 && dist < int(p.rel_extent)) ? bf2f(rel_proj[d * p.rel_extent + uint(dist)]) : 0.0f;
       }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -114,7 +115,13 @@ kernel void attn_prefill(device const ushort* q [[buffer(0)]], device const usho
           if (dist < p.rel_extent) {
             uint col = uint(int(dist) - dlo);
             float b = 0;
-            for (uint d = 0; d < 16; d++) b = fma(rr[d], Rp[d][col], b);
+            for (uint d4 = 0; d4 < 4; d4++) {
+              float4 rp = Rp[col][d4];
+              b = fma(rr[d4 * 4 + 0], rp.x, b);
+              b = fma(rr[d4 * 4 + 1], rp.y, b);
+              b = fma(rr[d4 * 4 + 2], rp.z, b);
+              b = fma(rr[d4 * 4 + 3], rp.w, b);
+            }
             sc += round_bf(b);
           }
         }
