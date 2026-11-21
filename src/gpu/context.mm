@@ -1,0 +1,313 @@
+// GPU context implementation (Objective-C++, ARC). Owner: B.
+#import <Foundation/Foundation.h>
+#import <Metal/Metal.h>
+
+#include "gpu/context.h"
+
+#include <fcntl.h>
+#include <unistd.h>
+
+#include <atomic>
+#include <cstdio>
+#include <cstdlib>
+#include <map>
+#include <mutex>
+#include <thread>
+#include <unordered_map>
+
+namespace ink::gpu {
+
+[[noreturn]] static void die(const std::string& msg) {
+  fprintf(stderr, "gpu: %s\n", msg.c_str());
+  abort();
+}
+
+struct Context::Impl {
+  id<MTLDevice> device;
+  id<MTLCommandQueue> queue;
+  id residency = nil;  // id<MTLResidencySet> (macOS 15+)
+  std::vector<id<MTLLibrary>> libs;
+  std::unordered_map<std::string, id<MTLComputePipelineState>> pipelines;
+  id<MTLCommandBuffer> cmd = nil;
+  id<MTLComputeCommandEncoder> enc = nil;
+  id<MTLCommandBuffer> last = nil;
+  std::map<std::string, size_t> by_tag;
+  std::unordered_map<void*, std::pair<std::string, size_t>> live;  // mtl ptr -> tag, size
+  bool residency_dirty = false;
+};
+
+Context& Context::get() {
+  static Context ctx;
+  return ctx;
+}
+
+Context::Context() : impl_(new Impl) {
+  @autoreleasepool {
+    impl_->device = MTLCreateSystemDefaultDevice();
+    if (!impl_->device) die("no Metal device");
+    impl_->queue = [impl_->device newCommandQueue];
+    device_name_ = [[impl_->device name] UTF8String];
+    if (getenv("INK_RESIDENCY") == nullptr || std::string(getenv("INK_RESIDENCY")) != "0") {
+      if (@available(macOS 15.0, *)) {
+        MTLResidencySetDescriptor* d = [MTLResidencySetDescriptor new];
+        d.label = @"ink-resident";
+        NSError* err = nil;
+        id<MTLResidencySet> set = [impl_->device newResidencySetWithDescriptor:d error:&err];
+        if (set) {
+          impl_->residency = set;
+          [impl_->queue addResidencySet:set];
+        } else {
+          fprintf(stderr, "gpu: residency set unavailable: %s\n", err ? [[err description] UTF8String] : "?");
+        }
+      }
+    }
+    // All kernel files form one library, in file-name order (00_common.metal first holds shared helpers).
+    std::string all;
+    for (auto& [name, src] : embedded_kernels()) all += "// ---- " + name + "\n" + src + "\n";
+    if (!all.empty()) compile("ink", all);
+  }
+}
+
+uint64_t Context::recommended_working_set() const { return [impl_->device recommendedMaxWorkingSetSize]; }
+
+void Context::compile(const std::string& name, const std::string& source, const std::string& prefix) {
+  @autoreleasepool {
+    MTLCompileOptions* opt = [MTLCompileOptions new];
+    opt.mathMode = MTLMathModeSafe;  // no fast-math: numerics must match the reference
+    opt.languageVersion = MTLLanguageVersion3_1;
+    NSError* err = nil;
+    std::string full = prefix + source;
+    id<MTLLibrary> lib = [impl_->device newLibraryWithSource:[NSString stringWithUTF8String:full.c_str()]
+                                                     options:opt
+                                                       error:&err];
+    if (!lib) die("compile " + name + ":\n" + (err ? [[err description] UTF8String] : "?"));
+    impl_->libs.push_back(lib);
+  }
+}
+
+Pipeline Context::pipeline(const std::string& function) {
+  auto it = impl_->pipelines.find(function);
+  if (it != impl_->pipelines.end()) return (__bridge void*)it->second;
+  @autoreleasepool {
+    NSString* fname = [NSString stringWithUTF8String:function.c_str()];
+    for (auto it2 = impl_->libs.rbegin(); it2 != impl_->libs.rend(); ++it2) {
+      id<MTLFunction> fn = [*it2 newFunctionWithName:fname];
+      if (!fn) continue;
+      NSError* err = nil;
+      id<MTLComputePipelineState> p = [impl_->device newComputePipelineStateWithFunction:fn error:&err];
+      if (!p) die("pipeline " + function + ": " + (err ? [[err description] UTF8String] : "?"));
+      impl_->pipelines[function] = p;
+      return (__bridge void*)p;
+    }
+  }
+  die("no kernel function " + function);
+}
+
+uint32_t Context::max_threads(Pipeline p) const {
+  return (uint32_t)[(__bridge id<MTLComputePipelineState>)p maxTotalThreadsPerThreadgroup];
+}
+
+// ---- memory
+
+Buf Context::alloc(size_t bytes, const char* tag, bool resident) {
+  if (bytes == 0) bytes = 16;
+  id<MTLBuffer> b = [impl_->device newBufferWithLength:bytes
+                                               options:MTLResourceStorageModeShared |
+                                                       MTLResourceHazardTrackingModeTracked];
+  if (!b) die("alloc " + std::to_string(bytes) + " bytes for " + tag);
+  b.label = [NSString stringWithUTF8String:tag];
+  if (resident && impl_->residency) {
+    if (@available(macOS 15.0, *)) {
+      [(id<MTLResidencySet>)impl_->residency addAllocation:b];
+      impl_->residency_dirty = true;
+    }
+  }
+  Buf out;
+  out.mtl = (__bridge_retained void*)b;
+  out.host = [b contents];
+  out.size = bytes;
+  allocated_ += bytes;
+  impl_->by_tag[tag] += bytes;
+  impl_->live[out.mtl] = {tag, bytes};
+  return out;
+}
+
+void Context::release(Buf& b) {
+  if (!b.mtl) return;
+  id<MTLBuffer> mb = (__bridge_transfer id<MTLBuffer>)b.mtl;
+  if (impl_->residency) {
+    if (@available(macOS 15.0, *)) {
+      [(id<MTLResidencySet>)impl_->residency removeAllocation:mb];
+      impl_->residency_dirty = true;
+    }
+  }
+  auto it = impl_->live.find(b.mtl);
+  if (it != impl_->live.end()) {
+    impl_->by_tag[it->second.first] -= it->second.second;
+    allocated_ -= it->second.second;
+    impl_->live.erase(it);
+  }
+  mb = nil;
+  b = Buf{};
+}
+
+static void pread_all(const std::string& path, size_t offset, size_t bytes, char* dst) {
+  // Split into 64 MB pieces over up to 8 threads; files on the internal SSD read at several GB/s.
+  constexpr size_t piece = 64ull << 20;
+  size_t n = (bytes + piece - 1) / piece;
+  std::atomic<size_t> next{0};
+  std::atomic<bool> failed{false};
+  auto worker = [&] {
+    int fd = open(path.c_str(), O_RDONLY);
+    if (fd < 0) {
+      failed = true;
+      return;
+    }
+    fcntl(fd, F_NOCACHE, 1);  // don't keep a second copy in the page cache
+    for (size_t i; (i = next++) < n;) {
+      size_t off = i * piece, len = std::min(piece, bytes - off);
+      size_t done = 0;
+      while (done < len) {
+        ssize_t r = pread(fd, dst + off + done, len - done, (off_t)(offset + off + done));
+        if (r <= 0) {
+          failed = true;
+          break;
+        }
+        done += (size_t)r;
+      }
+    }
+    close(fd);
+  };
+  unsigned nt = (unsigned)std::min<size_t>(n, 8);
+  std::vector<std::thread> ts;
+  for (unsigned t = 1; t < nt; t++) ts.emplace_back(worker);
+  worker();
+  for (auto& t : ts) t.join();
+  if (failed) die("read failed: " + path);
+}
+
+Buf Context::load_file(const std::string& path, size_t offset, size_t bytes, const char* tag) {
+  Buf b = alloc(bytes, tag, true);
+  pread_all(path, offset, bytes, (char*)b.host);
+  return b;
+}
+
+std::vector<Buf> Context::load_files(const std::vector<FileRange>& reqs) {
+  std::vector<Buf> out;
+  out.reserve(reqs.size());
+  for (auto& r : reqs) out.push_back(alloc(r.bytes, r.tag.c_str(), true));
+  // Small tensors: one thread per file range from a shared queue; big ones are split inside pread_all.
+  std::atomic<size_t> next{0};
+  auto worker = [&] {
+    for (size_t i; (i = next++) < reqs.size();) {
+      if (reqs[i].bytes >= (256ull << 20)) continue;  // big ones below
+      pread_all(reqs[i].path, reqs[i].offset, reqs[i].bytes, (char*)out[i].host);
+    }
+  };
+  std::vector<std::thread> ts;
+  for (int t = 0; t < 8; t++) ts.emplace_back(worker);
+  for (auto& t : ts) t.join();
+  for (size_t i = 0; i < reqs.size(); i++)
+    if (reqs[i].bytes >= (256ull << 20)) pread_all(reqs[i].path, reqs[i].offset, reqs[i].bytes, (char*)out[i].host);
+  return out;
+}
+
+void Context::read_file_into(const std::string& path, size_t offset, size_t bytes, Buf dst, size_t dst_offset) {
+  if (dst_offset + bytes > dst.size) die("read_file_into: out of range");
+  pread_all(path, offset, bytes, (char*)dst.host + dst_offset);
+}
+
+void Context::print_memory() const {
+  fprintf(stderr, "gpu memory: %.1f MB in all\n", allocated_ / 1e6);
+  for (auto& [tag, n] : impl_->by_tag)
+    if (n) fprintf(stderr, "  %-24s %10.1f MB\n", tag.c_str(), n / 1e6);
+}
+
+// ---- encoding
+
+void Context::ensure_encoder() {
+  if (impl_->enc) return;
+  if (!impl_->cmd) {
+    if (impl_->residency_dirty && impl_->residency) {
+      if (@available(macOS 15.0, *)) [(id<MTLResidencySet>)impl_->residency commit];
+      impl_->residency_dirty = false;
+    }
+    impl_->cmd = [impl_->queue commandBufferWithUnretainedReferences];
+  }
+  impl_->enc = [impl_->cmd computeCommandEncoderWithDispatchType:MTLDispatchTypeSerial];
+}
+
+void Context::end_encoder() {
+  if (impl_->enc) {
+    [impl_->enc endEncoding];
+    impl_->enc = nil;
+  }
+}
+
+void Context::set_pipeline(Pipeline p) {
+  ensure_encoder();
+  [impl_->enc setComputePipelineState:(__bridge id<MTLComputePipelineState>)p];
+}
+
+void Context::set_buffer(uint32_t index, Buf b, size_t offset) {
+  ensure_encoder();
+  [impl_->enc setBuffer:(__bridge id<MTLBuffer>)b.mtl offset:offset atIndex:index];
+}
+
+void Context::set_bytes(uint32_t index, const void* data, size_t n) {
+  ensure_encoder();
+  [impl_->enc setBytes:data length:n atIndex:index];
+}
+
+void Context::set_threadgroup_memory(uint32_t index, size_t bytes) {
+  ensure_encoder();
+  [impl_->enc setThreadgroupMemoryLength:(bytes + 15) & ~size_t(15) atIndex:index];
+}
+
+void Context::dispatch(Dim3 g, Dim3 t) {
+  ensure_encoder();
+  [impl_->enc dispatchThreadgroups:MTLSizeMake(g.x, g.y, g.z) threadsPerThreadgroup:MTLSizeMake(t.x, t.y, t.z)];
+}
+
+void Context::barrier() {
+  if (impl_->enc) [impl_->enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+}
+
+void Context::blit_copy(Buf src, size_t src_off, Buf dst, size_t dst_off, size_t bytes) {
+  end_encoder();
+  if (!impl_->cmd) {
+    ensure_encoder();
+    end_encoder();
+  }
+  id<MTLBlitCommandEncoder> bl = [impl_->cmd blitCommandEncoder];
+  [bl copyFromBuffer:(__bridge id<MTLBuffer>)src.mtl
+           sourceOffset:src_off
+               toBuffer:(__bridge id<MTLBuffer>)dst.mtl
+      destinationOffset:dst_off
+                   size:bytes];
+  [bl endEncoding];
+}
+
+void Context::commit() {
+  end_encoder();
+  if (!impl_->cmd) return;
+  [impl_->cmd commit];
+  impl_->last = impl_->cmd;
+  impl_->cmd = nil;
+}
+
+void Context::wait() {
+  if (!impl_->last) return;
+  [impl_->last waitUntilCompleted];
+  if (impl_->last.status == MTLCommandBufferStatusError)
+    die(std::string("command buffer failed: ") + [[impl_->last.error description] UTF8String]);
+  last_gpu_ms_ = (impl_->last.GPUEndTime - impl_->last.GPUStartTime) * 1e3;
+  impl_->last = nil;
+}
+
+void Context::commit_and_wait() {
+  commit();
+  wait();
+}
+
+}  // namespace ink::gpu
