@@ -31,6 +31,7 @@ struct Ckpt {
 };
 
 class Model;  // src/model/model.h
+struct EngineState;  // engine.cpp
 
 // Single sequence. The cache holds KV + conv state for all 48 layer visits.
 class Engine {
@@ -64,8 +65,17 @@ class Engine {
 
   const std::vector<float>& last_logits() const;  // fp32, unpadded vocab (200058), after softcap
 
+  // Internals for speculative.cpp (B) and tests.
+  Model& model() { return *model_; }
+  EngineState* state() const { return st_.get(); }
+  const EngineOptions& options() const { return opts_; }
+  int32_t sample(const SamplingParams&, const float* logits, int64_t vocab);
+  void invalidate_from(int64_t pos);  // checkpoints that rely on global KV at positions >= pos become invalid
+
  private:
+  std::unique_ptr<EngineState> st_;
   std::unique_ptr<Model> model_;
+  EngineOptions opts_;
 };
 
 }  // namespace ink
