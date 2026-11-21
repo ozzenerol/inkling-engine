@@ -15,14 +15,12 @@ Append-only log plus the agreed layout. Read before each chunk of work.
 One model on the GPU at a time. Before loading weights: add a line here AND message the others.
 Format: `LOCK <agent> <what> <start time>` / `UNLOCK <agent> <time>`.
 
-(none held)
-UNLOCK B 2026-11-21 (C next: server run)  [A ran the MLX reference dump 17:22, done]
-LOCK C MLX-VLM baseline (serve_inkling.sh :8091, qh e2e + ctxbench) 17:43 / UNLOCK C 17:50
-LOCK C inkling-server real engine (:8091, smoke + qh e2e + ctxbench) 17:56 / UNLOCK C 18:08 (queue: A, then B)
-UNLOCK B 18:41 (was: LOCK B kernel benches + DSpark spec_check + acc_check 18:11 / UNLOCK C
-LOCK A CPU p3 run + fp32 MLX reference dump 18:08 / UNLOCK A 18:10 (B next)
-LOCK B fused-op checks (cpu cmp, acc_check, spec_check) 18:47
-LOCK C full bench inkling-server (tools/bench_c.sh inkling, :8091) 18:51
+**One line, always current. Replace it (do not append). Message the next holder when you release.**
+
+HOLDER: B (fused-op checks since 18:47; A released at 18:51) -> NEXT: C (full bench, 60-90 min) -> then A (8-bit validation)
+
+Kernel micro-benches on synthetic buffers (op_diff, bench_*) do not need the lock but skew a running benchmark:
+do not run them while C is benchmarking.
 
 ## Module layout and file ownership
 
@@ -369,3 +367,34 @@ worse than MLX-bf16's.
 - 2026-11-21 C: **caveat on my first real-engine numbers** (17:56 run): per B, that build had DSpark shadowed by
   weak stubs (plain decode only) and a kv_append race for prefill chunks > the 1536-slot local ring, so prompts
   > 2048 tokens ran on a partly wrong local KV. Treat those ctxbench/qh numbers as superseded; rerun on >= 5f0fe21.
+
+## A: prefill attention as matrix products (2026-11-21)
+
+`src/gpu/kernels/attn_gemm.metal` + `attention_gemm()` in metal_backend.mm, used for T >= 64 (INK_AG_MIN_T).
+Port of saetta's fused attention_gemm: per 1024-key block, `ag_scores` (S = Q K^T in 64x64 bf16 tiles, fp32
+accumulators, + bias from a transposed rel_proj table, window mask, exp(s - tile max) stored fp32) and `ag_pv`
+(online softmax over tile maxes, O = a O + P V). Sink = initial m, l = 1.
+bench_attn T=2048, one run each (TFLOPS): flash 0.74-0.82 | P as one half tile 7.6-10.0 | fp32 tiles 1.3-1.5
+(fp32 simdgroup matrices are slow whatever the threadgroup memory) | **P as hi + lo half tiles 5.5 / 6.9 / 6.6
+(len 0 / 32k / 127k), local 4.5** = default. op_diff vs CPU: 99.93-99.99% bit-exact (flash: same level; one half
+tile: 91%).
+Profile of a 2886-token prefill after this (INK_PROFILE, GPU ms): moe_gemm_nvfp4 1947 (50%), gemm_bf16 827 (21%),
+ctrl_out 280 (7%), moe_gemm_mxfp8 175, ag_pv 168 + ag_scores 131 (8%), short_conv4 153. Short-context prefill is
+now MoE GEMM (about 8.3 TFLOPS already) + dense GEMM; ctrl_out and short_conv4 look cheap to fix (B).
+Accuracy on p3 (one prompt, 64 forced steps) is NOT a reliable ranking: KL mean between any two implementations
+of equal op-level accuracy is 5e-3..1.1e-2 (flash vs CPU 5.7e-3, MLX-bf16 vs flash 6.5e-3, GEMM vs flash 1.1e-2,
+GEMM vs fp32 1.0e-2 at chunk 2048 / 1.2e-2 at 512, flash vs fp32 4.8e-3, MLX-bf16 vs fp32 8.2e-3). At step 0
+(straight after prefill) GEMM is the closest to fp32 (KL 1.5e-2 / 9.3e-3 vs flash 1.9e-2, CPU 1.5e-2, MLX 1.8e-2).
+TODO (A): a set of ~8 long prompts with fp32 references so long-context accuracy is a distribution, not one draw.
+p0-p2 with GEMM attention: greedy unchanged (64/64, 63/64 after-stop, 63/64 near-tie), KL vs fp32 1.7e-3 /
+1.7e-3 / 8.3e-4.
+
+## A: 8-bit build (2026-11-21, user request)
+
+`~/llm/mlx-models/Inkling-2-Mini-MLX-8bit` = pipenetwork/Inkling-2-Mini-MLX-8bit (18.1 GB, mlx-lm PR 2086 names).
+Experts unchanged (NVFP4 / MXFP8, gate+up fused and row-interleaved in `gate_up_proj`, `global_scale`); every
+dense linear + embed + lm_head is MLX affine 8-bit (U32 codes [N, K/4], bf16 scales/biases [N, K/64], group 64);
+router weight and controller forget/gain are f32. No mtp.safetensors (use the 4-8bit dir's), config identical.
+Stage 1 (A, in Model::load): converted at load to the 4-8bit in-memory form, so all kernels run unchanged.
+Stage 2 (B): q8 kernels reading the codes in place; that is the speed gain (dense bytes per token 2.79 -> ~1.5 GB,
+head 0.93 -> 0.48). Check script: tests/ref/check_8bit_layout.py (tensor-by-tensor against the 4-8bit build).
