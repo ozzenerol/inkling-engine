@@ -1,6 +1,7 @@
 #!/bin/bash
 # Owner: C. Server benchmarks for inkling-server vs MLX-VLM, one server at a time on port 8091.
-#   tools/bench_c.sh inkling   start build/src/server/inkling-server (or BIN), measure it, stop it
+#   tools/bench_c.sh inkling [LABEL]  start build/src/server/inkling-server (or BIN), measure it, stop it;
+#                              LABEL (default inkling) names the result files, e.g. inkling-8bit
 #   tools/bench_c.sh mlx       start ~/llm/serve_inkling.sh (MLX-VLM + DSpark), measure it, stop it
 #   tools/bench_c.sh report    print markdown tables from the JSON files
 # Measures: ~/llm/ctxbench.py (BRIEF baseline: temp 0.7, effort none, 400 tokens) and tools/agent_bench.py
@@ -62,8 +63,9 @@ case "${1:-}" in
 inkling)
 	up && { echo "something already serves $url; stop it first"; exit 1; }
 	# shellcheck disable=SC2086
-	start_and_wait "$out/inkling-serve.log" "$bin" --port 8091 ${SERVER_ARGS:-}
-	measure inkling
+	label=${2:-inkling}
+	start_and_wait "$out/$label-serve.log" "$bin" --port 8091 ${SERVER_ARGS:-}
+	measure "$label"
 	;;
 mlx)
 	up && { echo "something already serves $url; stop it first"; exit 1; }
