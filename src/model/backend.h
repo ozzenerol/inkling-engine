@@ -1,0 +1,133 @@
+// Owner: A (interface). Implementations: CpuBackend (A, src/model/cpu_backend.cpp, the reference oracle) and
+// MetalBackend (B, src/gpu/). model.cpp only talks to this interface, so the same forward pass runs on both and
+// every Metal op can be checked against the CPU op on the same inputs.
+//
+// Conventions
+// - Shapes are row-major contiguous. T = tokens in this call. D = 2304.
+// - "bf16 out" means: compute in fp32, round to bf16 once at the end (round-to-nearest-even), exactly where the
+//   MLX reference rounds. The comments say where the reference rounds; keep those points.
+// - All ops are enqueued in order; results are only guaranteed visible to the host after sync().
+#pragma once
+#include <cstdint>
+#include <memory>
+#include <string>
+#include <vector>
+
+#include "core/safetensors.h"
+#include "core/tensor.h"
+
+namespace ink {
+
+enum class QuantMode : uint8_t { NVFP4, MXFP8 };
+
+// One projection of all 128 experts. NVFP4: weight u32 [E,N,K/8] (low nibble first, e2m1), scales u8 e4m3
+// [E,N,K/16], global f32 [E] (w = fp4 * e4m3 * global). MXFP8: weight u32 [E,N,K/4] (e4m3 bytes), scales u8 e8m0
+// [E,N,K/32] (w = e4m3 * 2^(s-127)), global unused.
+struct QuantProj {
+  QuantMode mode;
+  Tensor weight, scales, global;
+  int64_t n = 0, k = 0;  // per expert: out rows, in cols
+};
+struct MoeWeights {
+  Tensor gate_w;   // bf16 [128, D] router
+  Tensor bias;     // f32 [128] e_score_correction_bias (selection only)
+  QuantProj gate, up, down;  // gate/up: [1152, D], down: [D, 1152]
+};
+
+// Per-visit KV cache. Layout: k, v bf16 [kv_heads=8][cap][128]. Global: slot = pos (cap grows by realloc in
+// Model). Local: ring, slot = pos % cap, cap = window + slack (1024 + 512). `len` = tokens already stored.
+struct KvView {
+  Tensor k, v;
+  int64_t cap = 0;
+  int64_t len = 0;
+  bool ring = false;
+};
+
+struct AttnArgs {
+  Tensor q;         // bf16 [T,24,128] already l2-clipped (and tau-scaled on global layers)
+  Tensor k_new;     // bf16 [T,8,128] this call's keys (clipped), positions len..len+T-1
+  Tensor v_new;     // bf16 [T,8,128] (rms-normed)
+  Tensor r;         // bf16 [T,24,16] relative query (clipped, tau-scaled on global)
+  Tensor rel_proj;  // bf16 [16,1024]
+  Tensor sink;      // bf16 [T,24] per-query sink logit (zero K/V column)
+  KvView kv;        // past tokens (positions [0, kv.len)), NOT yet containing k_new/v_new
+  int window = 0;   // 0 = global (causal, bias for dist < 1024, 0 bias beyond); 1024 = local (dist >= 1024 masked)
+  // Reference math per head h (kv head h/3), query i at pos p_i = kv.len + i, key j at pos p_j <= p_i:
+  //   bias = bf16(sum_d r[i,h,d] * rel_proj[d, p_i - p_j]) if dist < 1024 else 0
+  //   s_ij = (q . k_j) * 128^-0.5 + bias  (fp32), plus a sink logit s = float(sink[i,h]) with value 0
+  //   out = softmax(s) @ v  -> bf16
+};
+
+class Backend {
+ public:
+  virtual ~Backend() = default;
+  virtual const char* name() const = 0;
+
+  // Memory.
+  virtual Tensor alloc(DType, std::initializer_list<int64_t> shape, const char* tag) = 0;  // zero-filled
+  virtual void free(Tensor&) = 0;
+  // Load a weight from its safetensors file into resident memory (B: pread into wired buffers).
+  virtual Tensor load_weight(const SafeTensors::Entry&) = 0;
+  virtual void sync() = 0;                         // wait for all enqueued work
+  virtual void copy(const Tensor& src, Tensor& dst, size_t src_off = 0, size_t dst_off = 0, size_t bytes = 0) = 0;
+  // Host access (tests, logits): read back after sync.
+  virtual void read(const Tensor& t, void* dst, size_t bytes, size_t off = 0) = 0;
+  virtual void write(Tensor& t, const void* src, size_t bytes, size_t off = 0) = 0;
+
+  // Ops.
+  virtual void embed(const Tensor& ids_i32, const Tensor& table_bf16, Tensor& out_bf16) = 0;
+  // out[t] = x[t] * rsqrt(mean(x[t]^2) + eps) * gamma (gamma may be invalid = none); rows = numel/last_dim
+  // where last_dim = `dim`. fp32 math, out dtype f32 or bf16.
+  virtual void rms_norm(const Tensor& x, const Tensor* gamma, float eps, int64_t dim, Tensor& out) = 0;
+  // out[T,N] = x[T,K] @ w[N,K]^T. x bf16 or f32 (f32 x: w promoted to f32), fp32 accumulate, out bf16 or f32.
+  virtual void linear(const Tensor& x, const Tensor& w, Tensor& out) = 0;
+  // Same as several linear() calls on one input (B may fuse); results identical to separate calls.
+  virtual void linear_multi(const Tensor& x, const std::vector<const Tensor*>& ws, const std::vector<Tensor*>& outs) {
+    for (size_t i = 0; i < ws.size(); ++i) linear(x, *ws[i], *outs[i]);
+  }
+  // Attention residual mix. states = [blocks..., partial] (each [T,D], bf16 or f32), keys = rms_norm(states, no
+  // gamma, eps 1e-6) fp32, scores[t,b,q] = keys[t,b] . query[q] * D^-0.5, softmax over b, out[t,q] = sum_b w * keys.
+  // query f32 [nq,D]; out f32 [nq,T,D] (each query's result contiguous).
+  virtual void attn_residual(const std::vector<const Tensor*>& states, const Tensor& query, Tensor& out) = 0;
+  // Loop messages. bank = rms_norm(states) fp32 (states f32/bf16 [T,D] each); out[t,q] = softmax_b(query[q] .
+  // bank[t,b] * D^-0.5) @ bank[t]. query f32 [4,D]; out f32 [4,T,D].
+  virtual void loop_messages(const std::vector<const Tensor*>& states, const Tensor& query, Tensor& out) = 0;
+  // MessageController: pair = [rms(x), rms(m)] (eps = 1e-6, no gamma) -> bf16; h = bf16(pair @ down^T) -> f32;
+  // f = tanh(h @ forget^T), g = tanh(h @ gain^T) (fp32, weights promoted); out = (1-f)*x + g*m. x, m f32 [T,D];
+  // out f32 [T,D] (may alias x).
+  virtual void controller(const Tensor& x, const Tensor& m, const Tensor& down,
+                          const Tensor& forget, const Tensor& gain, Tensor& out) = 0;
+  // Causal depthwise conv K=4 over [state(3 rows, f32); x] + residual: out[t,c] = bf16((sum_j xin[t-3+j,c] *
+  // w[c,j] + x[t,c]) / sqrt(5)); then state = last 3 inputs (f32). w bf16 [C,4]. x, out bf16 [T,C].
+  virtual void short_conv(const Tensor& x, const Tensor& w, Tensor& state, Tensor& out) = 0;
+  // Dynamic conv (global layers' k/v): wts[t,h,c,lag] = static[lag, h*128+c] + dyn[t, h*4+lag] (fp32);
+  // out = bf16((sum_lag xin[t-lag] * wts[..lag] + x[t]) / sqrt(9)), accumulated lag 0..3 in order; state as above.
+  // x bf16 [T,1024]; dyn bf16 [T,32]; static bf16 [4,1024].
+  virtual void dyn_conv(const Tensor& x, const Tensor& dyn, const Tensor& static_w, Tensor& state, Tensor& out) = 0;
+  // y = x * scale (fp32, scale bf16 [H,d] or none), y *= min(thr / (|y| + 1e-6), 1) over last dim d -> bf16.
+  // If tau (f32 [T]) is valid: out = bf16(float(that bf16) * tau[t]). x [T,H,d] bf16, out bf16.
+  virtual void l2_clip(const Tensor& x, const Tensor* scale, float thr, const Tensor* tau, Tensor& out) = 0;
+  // out = bf16(float(a) * sigmoid(float(g)))
+  virtual void sigmoid_gate(const Tensor& a, const Tensor& g, Tensor& out) = 0;
+  // out = float(a) + float(b) in out's dtype (a, b any of f32/bf16, same numel).
+  virtual void add(const Tensor& a, const Tensor& b, Tensor& out) = 0;
+  // dtype conversion copy (f32<->bf16), round-to-nearest-even.
+  virtual void cast(const Tensor& a, Tensor& out) = 0;
+  // Attention (see AttnArgs). out bf16 [T, 24*128].
+  virtual void attention(const AttnArgs&, Tensor& out) = 0;
+  // Write k_new/v_new into the cache slots for positions kv.len.. (ring: modulo cap).
+  virtual void kv_append(const Tensor& k_new, const Tensor& v_new, KvView& kv) = 0;
+  // Router: s = sigmoid(f32(x) @ f32(gate_w)^T); idx = top-k of (s + bias); w = s[idx] / (sum + 1e-20) * scale.
+  // idx i32 [T,k], w f32 [T,k].
+  virtual void router(const Tensor& x, const MoeWeights& m, int topk, float scale, Tensor& idx, Tensor& w) = 0;
+  // MoE: for each route: g = bf16(x @ Wg^T), u = bf16(x @ Wu^T) (dequantized, fp32 acc);
+  // a = bf16(tanh(g/4)*4*sigmoid(g)*tanh(u/25)*25); d = bf16(a @ Wd^T); out = bf16(sum_k f32(d_k) * w_k).
+  virtual void moe(const Tensor& x, const Tensor& idx, const Tensor& w, const MoeWeights& m, Tensor& out) = 0;
+  // Logits: hb = f32(bf16(h)); z = hb @ f32(head)^T; out = tanh(z/30)*30, first `vocab` columns. h f32 [T,D].
+  virtual void logits(const Tensor& h, const Tensor& head, int64_t vocab, float softcap, Tensor& out) = 0;
+};
+
+std::unique_ptr<Backend> make_cpu_backend();
+std::unique_ptr<Backend> make_metal_backend();  // B
+
+}  // namespace ink

@@ -3,3 +3,5 @@ logs/
 *.o
 ref_data/
 bench/*.log
+build*/
+.cache/
