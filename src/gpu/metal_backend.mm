@@ -1384,7 +1384,7 @@ class MetalBackend final : public Backend {
   void moe_gemm(const QuantProj& q, const Tensor& a, const Tensor& perm, const Tensor& offs, const Tensor& tiles,
                 const Tensor& tiles_n, uint32_t max_tiles, uint32_t topk, bool gather, bool scatter, Tensor& out) {
     MoeGemmParams p{uint32_t(q.n), uint32_t(q.k), topk, gather ? 1u : 0u, scatter ? 1u : 0u};
-    pipe(q.mode == QuantMode::NVFP4 ? "moe_gemm_nvfp4" : "moe_gemm_mxfp8");
+    pipe(std::string(q.mode == QuantMode::NVFP4 ? "moe_gemm_nvfp4" : "moe_gemm_mxfp8") + (moe_m_ == 128 ? "_m128" : ""));
     bind(0, q.weight);
     bind(1, q.scales);
     bind(2, q.global.valid() ? q.global : q.scales);
@@ -1395,12 +1395,12 @@ class MetalBackend final : public Backend {
     bind(7, tiles_n);
     bind(8, out);
     g_.set_value(9, p);
-    g_.dispatch({cdiv(p.N, 64), max_tiles, 1}, {128, 1, 1});
+    g_.dispatch({cdiv(p.N, 64), max_tiles, 1}, {2 * moe_m_, 1, 1});
   }
   void moe_prefill(const Tensor& x, const Tensor& idx, const Tensor& w, const MoeWeights& m, Tensor& out, uint32_t T,
                    uint32_t D, uint32_t topk) {
     uint32_t routes = T * topk, I = uint32_t(m.gate.n), E = 128;
-    uint32_t max_tiles = cdiv(routes, 64) + E;
+    uint32_t max_tiles = cdiv(routes, moe_m_) + E;
     Tensor perm = scratch("moep-perm", DType::I32, {routes});
     Tensor offs = scratch("moep-offs", DType::I32, {E + 1});
     Tensor tiles = scratch("moep-tiles", DType::I32, {max_tiles, 2});
@@ -1409,7 +1409,7 @@ class MetalBackend final : public Backend {
     Tensor ut = scratch("moe-u", DType::BF16, {routes, I});
     Tensor at = scratch("moe-a", DType::BF16, {routes, I});
     Tensor dt = scratch("moe-d", DType::BF16, {routes, D});
-    SortParams sp{routes, E, 64};
+    SortParams sp{routes, E, moe_m_};
     pipe("moe_sort");
     bind(0, idx);
     bind(1, perm);
@@ -1464,6 +1464,9 @@ class MetalBackend final : public Backend {
   bool pending_ = false;
   bool profile_ = false;
   bool gpu_time_ = false;
+  // rows of one expert per MoE prefill tile: 128 dequantizes each weight tile once for twice the rows (bit-identical
+  // to 64); opt-in INK_MOE_M=128 until measured
+  uint32_t moe_m_ = getenv("INK_MOE_M") && atoi(getenv("INK_MOE_M")) == 128 ? 128u : 64u;
   bool t2_off_ = getenv("INK_NO_T2") != nullptr;  // 2-row matvec kernels (same per-row arithmetic as t1 / t4)
   bool fuse2_ = getenv("INK_NO_FUSE2") == nullptr;  // batch 7: tokens identical, 43.5 vs 42.9 tok/s (8-bit)
   std::string skip_;

@@ -12,3 +12,9 @@ INK_PROFILE=1 run $BS/p800.ids | grep -A16 "kernel profile"
 echo "== B same two on the lossless build, top 8 (for comparison)"
 M8=$HOME/llm/mlx-models/Inkling-2-Mini-MLX-4-8bit
 INK_PROFILE=1 run $BS/p2048.ids | grep -A8 "kernel profile"
+echo "== B MoE prefill tile of 128 rows per expert (INK_MOE_M=128, bit-identical): prefill time and logits cmp, both builds"
+for M8 in $HOME/llm/mlx-models/Inkling-2-Mini-MLX-8bit $HOME/llm/mlx-models/Inkling-2-Mini-MLX-4-8bit; do
+  for v in "X=1" "INK_MOE_M=128"; do echo -n "[$(basename $M8) $v] "; env $v build/inktest --backend metal --model $M8 --ids ref_data/p3.ids --steps 1 --ctx 8192 --chunk 2048 --out "$BS/m_$v" 2>&1 | grep prefill; done
+  cmp "$BS/m_X=1/logits.f32" "$BS/m_INK_MOE_M=128/logits.f32" && echo "moe m128 logits IDENTICAL"
+done
+INK_MOE_M=128 build/gpu/op_diff 2>&1 | grep -E "moe .*T=300|ALL|FAILED"
