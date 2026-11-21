@@ -74,6 +74,13 @@ inline float dot_bf16(const float* a, const uint16_t* b, int64_t n) {
   return s;
 }
 
+// INK_CPU_ROWEXACT=1: never use BLAS, so every row's result is independent of the batch it is computed in
+// (needed to check speculative rollback bit for bit; slower).
+inline bool row_exact() {
+  static const bool v = std::getenv("INK_CPU_ROWEXACT") != nullptr;
+  return v;
+}
+
 inline float sigmoidf(float x) { return 1.0f / (1.0f + std::exp(-x)); }
 
 // x [T,K] (any float dtype) -> f32 rows
@@ -85,7 +92,7 @@ std::vector<float> to_f32(const Tensor& x) {
 
 // out[T,N] = X[T,K] @ W[N,K]^T with W bf16 (rows [n0, n0+N) of w), X f32. Writes f32 into y (row stride ldy).
 void gemm_bf16w(const float* X, int64_t T, int64_t K, const uint16_t* W, int64_t N, float* y, int64_t ldy) {
-  if (T < 4) {
+  if (T < 4 || row_exact()) {
     parallel_for(N, [&](int64_t b, int64_t e) {
       for (int64_t n = b; n < e; ++n)
         for (int64_t t = 0; t < T; ++t) y[t * ldy + n] = dot_bf16(X + t * K, W + n * K, K);
@@ -510,7 +517,7 @@ class CpuBackend final : public Backend {
         const int64_t n = int64_t(rs.size());
         std::vector<float> xs(static_cast<size_t>(n * D)), g(static_cast<size_t>(n * I)), u(static_cast<size_t>(n * I)), a(static_cast<size_t>(n * I)), d(static_cast<size_t>(n * D));
         for (int64_t j = 0; j < n; ++j) std::memcpy(&xs[j * D], &X[(rs[j] / K) * D], size_t(D) * 4);
-        if (n >= 8) {
+        if (n >= 8 && !row_exact()) {
           cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, int(n), int(I), int(D), 1.f, xs.data(), int(D), wg.data(), int(D), 0.f, g.data(), int(I));
           cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, int(n), int(I), int(D), 1.f, xs.data(), int(D), wu.data(), int(D), 0.f, u.data(), int(I));
         } else {
@@ -525,7 +532,7 @@ class CpuBackend final : public Backend {
           float gg = round_bf16(g[q] * sg), uu = round_bf16(u[q] * su);
           a[q] = round_bf16(std::tanh(gg / 4.0f) * 4.0f * sigmoidf(gg) * std::tanh(uu / 25.0f) * 25.0f);
         }
-        if (n >= 8) {
+        if (n >= 8 && !row_exact()) {
           cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, int(n), int(D), int(I), 1.f, a.data(), int(I), wd.data(), int(I), 0.f, d.data(), int(D));
         } else {
           for (int64_t j = 0; j < n; ++j)

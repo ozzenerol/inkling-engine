@@ -9,6 +9,7 @@
 #include <unistd.h>
 #include <chrono>
 #include <cstdio>
+#include <algorithm>
 #include <cmath>
 #include <cstring>
 #include <fstream>
@@ -46,7 +47,8 @@ int main(int argc, char** argv) {
   int64_t chunk = 2048, ctx = 8192;
   bool hidden = false;
   std::string isolate;
-  int debug_visit = -1;  // prefix of ref hidden files: PREFIX{v}.f32
+  int debug_visit = -1;
+  bool rollback_test = false;  // prefix of ref hidden files: PREFIX{v}.f32
   for (int i = 1; i < argc; ++i) {
     std::string a = argv[i];
     auto next = [&] { return std::string(argv[++i]); };
@@ -59,6 +61,7 @@ int main(int argc, char** argv) {
     else if (a == "--hidden") hidden = true;
     else if (a == "--isolate") isolate = next();
     else if (a == "--debug-visit") debug_visit = std::stoi(next());
+    else if (a == "--rollback-test") rollback_test = true;
     else if (a == "--chunk") chunk = std::stoll(next());
     else if (a == "--ctx") ctx = std::stoll(next());
     else { std::fprintf(stderr, "unknown arg %s\n", a.c_str()); return 2; }
@@ -72,6 +75,51 @@ int main(int argc, char** argv) {
     auto t1 = std::chrono::steady_clock::now();
     std::fprintf(stderr, "[inktest] backend %s, load %.1f s\n", be->name(), std::chrono::duration<double>(t1 - t0).count());
     const int64_t D = m.config().hidden, V = m.config().vocab_unpadded;
+    if (rollback_test) {
+      // Speculative rollback: [prefix][4 rows with history] -> keep 2 -> [3 more] must equal the straight run
+      // [prefix][2][3] (bit-identical on Metal where rows are independent; CPU differs by BLAS summation order).
+      const int64_t n0 = std::min<int64_t>(int64_t(ids.size()) - 7, 12);
+      if (n0 < 1) throw std::runtime_error("rollback test needs at least 8 ids");
+      std::vector<std::vector<std::vector<float>>> snap;
+      auto run = [&](bool spec) {
+        m.reset();
+        m.forward(ids.data(), n0, false);
+        if (spec) {
+          int32_t four[4] = {ids[size_t(n0)], ids[size_t(n0 + 1)], 7, 9};  // rows 2, 3 are rejected drafts
+          m.forward(four, 4, true, true);
+          m.rollback(2);
+        } else {
+          m.forward(ids.data() + n0, 2, false);
+        }
+        be->sync();
+        snap.emplace_back();
+        for (auto& vs : m.visits())
+          for (int i = 0; i < 4; ++i) {
+            std::vector<float> c(size_t(vs.conv[i].numel()));
+            be->read(vs.conv[i], c.data(), c.size() * 4);
+            snap.back().push_back(c);
+          }
+        m.forward(ids.data() + n0 + 2, 3, true);
+        return m.logits();
+      };
+      auto a1 = run(true), a2 = run(false);
+      for (size_t k = 0; k < snap[0].size(); ++k) {
+        double d = 0;
+        for (size_t i = 0; i < snap[0][k].size(); ++i) d = std::max(d, double(std::fabs(snap[0][k][i] - snap[1][k][i])));
+        if (d > 1e-3) { std::printf("  conv state differs: visit %zu conv %zu max diff %.4g\n", k / 4, k % 4, d); if (k > 12) break; }
+      }
+      double maxd = 0;
+      size_t same = 0;
+      int argdiff = 0;
+      for (size_t i = 0; i < a1.size(); ++i) { maxd = std::max(maxd, double(std::fabs(a1[i] - a2[i]))); same += a1[i] == a2[i]; }
+      for (int r = 0; r < 3; ++r) {
+        auto b1 = a1.begin() + r * V, b2 = a2.begin() + r * V;
+        argdiff += (std::max_element(b1, b1 + V) - b1) != (std::max_element(b2, b2 + V) - b2);
+      }
+      std::printf("rollback test (%s): max |dlogit| %.4g, identical %.2f%%, argmax differences %d/3, len %lld\n", be->name(),
+                  maxd, 100.0 * same / a1.size(), argdiff, (long long)m.len());
+      return (argdiff == 0 && maxd < 0.5 && m.len() == n0 + 5) ? 0 : 1;
+    }
     if (!isolate.empty()) {
       // Per-visit isolation: run each visit on the reference input/blocks/bank, compare with the next ref input.
       const auto& cfg = m.config();
