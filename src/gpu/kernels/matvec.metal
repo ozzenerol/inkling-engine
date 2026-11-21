@@ -275,3 +275,54 @@ kernel void gemm_skinny2(device const ushort* W [[buffer(0)]], device const usho
     }
   }
 }
+
+// 5..8 rows of bf16 x in one pass over W: x staged in threadgroup memory in chunks of 1024 columns. Per row the
+// arithmetic is the one of matvec_bf16 (lane-strided 8-column chunks, fma in order, simd_sum), so each output row
+// equals the 1-row matvec bit for bit.
+template <typename YT>
+kernel void matvec_bf16_t8(device const uint4* W [[buffer(0)]], device const ushort* x [[buffer(1)]],
+                           device YT* y [[buffer(2)]], constant MatvecShape& s [[buffer(3)]],
+                           uint tg [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
+                           uint simd [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {
+  constexpr uint R = 4, CH = 1024;
+  threadgroup float xs[8][CH];
+  uint row0 = (tg * 2 + simd) * R;
+  uint kv = s.K / 8;
+  float acc[8][R];
+  for (uint t = 0; t < 8; t++)
+    for (uint r = 0; r < R; r++) acc[t][r] = 0;
+  for (uint c0 = 0; c0 < s.K; c0 += CH) {
+    uint cn = min(CH, s.K - c0);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint i = tid; i < 8 * cn; i += 64) {
+      uint t = i / cn, k = i % cn;
+      xs[t][k] = t < s.T ? bf2f(x[t * s.x_stride + c0 + k]) : 0.0f;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (row0 >= s.N) continue;
+    for (uint k8 = c0 / 8 + lane; k8 < (c0 + cn) / 8; k8 += 32) {
+      uint kl = k8 * 8 - c0;
+#pragma clang loop unroll(full)
+      for (uint r = 0; r < R; r++) {
+        uint row = min(row0 + r, s.N - 1);
+        float w[8];
+        unpack_bf8(W[row * kv + k8], w);
+        for (uint t = 0; t < 8; t++) {
+          float a = acc[t][r];
+          for (uint i = 0; i < 8; i++) a = fma(w[i], xs[t][kl + i], a);
+          acc[t][r] = a;
+        }
+      }
+    }
+  }
+  if (row0 >= s.N) return;
+  for (uint t = 0; t < 8; t++)
+    for (uint r = 0; r < R; r++) {
+      float v = simd_sum(acc[t][r]);
+      if (lane == 0 && row0 + r < s.N && t < s.T) y[t * s.y_stride + row0 + r] = YT(v);
+    }
+}
+template [[host_name("matvec_bf16_bf16_bf16_t8tg")]] kernel void matvec_bf16_t8<bf16_out>(
+    device const uint4*, device const ushort*, device bf16_out*, constant MatvecShape&, uint, uint, uint, uint);
+template [[host_name("matvec_bf16_bf16_f32_t8tg")]] kernel void matvec_bf16_t8<float>(
+    device const uint4*, device const ushort*, device float*, constant MatvecShape&, uint, uint, uint, uint);

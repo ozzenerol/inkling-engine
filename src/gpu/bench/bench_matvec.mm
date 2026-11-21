@@ -57,10 +57,11 @@ int main(int argc, char** argv) {
   for (int i = 0; i < 3072 * 16; i++) xp[i] = f2bf(nd(rng) * 50);
 
   int R = argc > 2 ? atoi(argv[2]) : 4, S = argc > 3 ? atoi(argv[3]) : 2;
-  bool skinny = T > 4;
+  bool skinny = T > 4 && !getenv("T8TG");
   std::string name = skinny ? (getenv("SK1") ? "gemm_skinny_bf16" : "gemm_skinny2")
-                            : "matvec_bf16_bf16_bf16_t" + std::to_string(T == 1 ? 1 : 4) + "_r" + std::to_string(R) +
-                                  "_s" + std::to_string(S);
+                            : (T > 4 ? std::string("matvec_bf16_bf16_bf16_t8tg")
+                                     : "matvec_bf16_bf16_bf16_t" + std::to_string(T == 1 ? 1 : 4) + "_r" +
+                                           std::to_string(R) + "_s" + std::to_string(S));
   Pipeline p = g.pipeline(name);
   struct SkinnyParams {
     uint32_t N, K, T, dt_out;

@@ -399,6 +399,20 @@ class MetalBackend final : public Backend {
       g_.dispatch({cdiv(N, 16), 1, 1}, {64, 1, 1});
       return;
     }
+    if (K % 8 == 0 && T > 4 && T <= 16 && x.dtype == DType::BF16 && getenv("INK_MV_T8")) {
+      // passes of up to 8 rows (one W read per 8 rows); per-row results equal the 1-row matvec
+      for (uint32_t t0 = 0; t0 < T; t0 += 8) {
+        uint32_t tt = std::min<uint32_t>(8, T - t0);
+        MatvecShape ms{N, K, tt, K, N};
+        pipe(out.dtype == DType::BF16 ? "matvec_bf16_bf16_bf16_t8tg" : "matvec_bf16_bf16_f32_t8tg");
+        bind(0, w);
+        g_.set_buffer(1, bufof(x), x.offset + size_t(t0) * K * 2);
+        g_.set_buffer(2, bufof(out), out.offset + size_t(t0) * N * dtype_size(out.dtype));
+        g_.set_value(3, ms);
+        g_.dispatch({cdiv(N, 8), 1, 1}, {64, 1, 1});
+      }
+      return;
+    }
     if (K % 8 == 0 && T <= 16) {
       for (uint32_t t0 = 0; t0 < T; t0 += 4) {
         uint32_t tt = std::min<uint32_t>(4, T - t0);
