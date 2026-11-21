@@ -35,7 +35,12 @@ class PromptCache {
     std::vector<int64_t> chunks;  // sizes of the prefill calls made
   };
   // Afterwards the engine has prefilled the whole prompt and holds its last logits.
-  Prep prepare(const std::vector<int32_t>& prompt, const std::function<void(int64_t done, int64_t total)>& progress);
+  // prefix_hint: tokens of the prompt that every session with this system prompt and tools starts with (0 = not
+  // known). When the prefill passes it and no pinned checkpoint covers it, the prefill stops there once and
+  // pins a checkpoint, so the second session already restores it (without the hint the pin is made only when a
+  // second session misses the cache).
+  Prep prepare(const std::vector<int32_t>& prompt, const std::function<void(int64_t done, int64_t total)>& progress,
+               int64_t prefix_hint = 0);
 
   // After Engine::generate: emitted = every token on_token saw. turn_done: ended on a stop token.
   void after_generate(const std::vector<int32_t>& emitted, bool turn_done);

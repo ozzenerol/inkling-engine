@@ -127,6 +127,28 @@ std::vector<int32_t> Api::prompt_ids(const Value& messages, const Value& tools, 
   return ids;
 }
 
+// Tokens of `prompt` that any conversation with the same leading system messages and tools starts with: the
+// common token prefix with the render of those alone. 0 when that render fails.
+int64_t Api::stable_prefix(const Value& messages, const Value& tools, const Value& effort,
+                           const std::vector<int32_t>& prompt) {
+  try {
+    Value head = Value::array();
+    for (auto& m : messages.arr) {
+      const std::string role = m.str_or("role");
+      if (role != "system" && role != "developer") break;
+      head.arr.push_back(m);
+    }
+    if (head.arr.size() == messages.arr.size()) return 0;
+    std::vector<int32_t> ids;
+    tok_.encode_append(render_chat(head, tools, effort).text, ids);
+    size_t k = 0;
+    while (k < ids.size() && k < prompt.size() && ids[k] == prompt[k]) k++;
+    return (int64_t)k;
+  } catch (const std::exception&) {
+    return 0;
+  }
+}
+
 void Api::handle(const http::Request& req, http::Response& res) {
   if (req.method == "OPTIONS") {
     res.send(204, "text/plain", "");
@@ -307,7 +329,7 @@ void Api::chat(const http::Request& req, http::Response& res) {
         last_ka = now_s();
         res.write(": prefill " + std::to_string(done) + "/" + std::to_string(total) + "\n\n");
       }
-    });
+    }, stable_prefix(messages, body["tools"], effort, prompt));
     if (o_.log && prep.lcp < (int64_t)before.size() && prep.lcp + 1 < n_prompt) {
       // Where did this prompt leave the cached sequence? Text on both sides of the divergence.
       auto snip = [&](const std::vector<int32_t>& v, int64_t a, int64_t b) {

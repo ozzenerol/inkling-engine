@@ -41,7 +41,8 @@ void PromptCache::invalidate() {
 }
 
 PromptCache::Prep PromptCache::prepare(const std::vector<int32_t>& prompt,
-                                       const std::function<void(int64_t, int64_t)>& progress) {
+                                       const std::function<void(int64_t, int64_t)>& progress,
+                                       int64_t prefix_hint) {
   Prep r;
   const auto t_begin = std::chrono::steady_clock::now();
   const int64_t n = (int64_t)prompt.size();
@@ -119,9 +120,20 @@ PromptCache::Prep PromptCache::prepare(const std::vector<int32_t>& prompt,
     take_ckpt(pin);
     r.ckpt_s += std::chrono::duration<double>(std::chrono::steady_clock::now() - c0).count();
   };
+  // Known stable prefix (system prompt + tools) that this prefill passes: checkpoint and pin it on the way.
+  if (shared_prefix_min_ > 0 && max_ckpts_ > 1 && prefix_hint >= shared_prefix_min_ && cur < prefix_hint &&
+      prefix_hint < n) {
+    bool have_pin = false;
+    for (auto& x : ck_) have_pin |= x.pinned && x.c.len <= prefix_hint;
+    if (!have_pin) {
+      feed(prefix_hint);
+      toks_.assign(prompt.begin(), prompt.begin() + prefix_hint);
+      timed_ckpt(true);
+    }
+  }
   // Shared prefix of a missed prompt: stop there once to checkpoint it.
   // (diverged: the cache went on differently after the common prefix, and the prompt goes on too.)
-  if (shared_prefix_min_ > 0 && target >= shared_prefix_min_ && diverged && max_ckpts_ > 1) {
+  if (shared_prefix_min_ > 0 && target >= shared_prefix_min_ && diverged && max_ckpts_ > 1 && cur <= target) {
     if (cur < target) feed(target);
     toks_.assign(prompt.begin(), prompt.begin() + target);
     // Pin it unless a shorter pinned prefix (the system prompt + tools) already covers this conversation:
