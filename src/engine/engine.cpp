@@ -2,6 +2,9 @@
 // speculative_generate() in speculative.cpp when it exists.
 #include "engine/engine.h"
 
+#define ACCELERATE_NEW_LAPACK
+#include <Accelerate/Accelerate.h>
+
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
@@ -35,6 +38,8 @@ struct EngineState {
   int64_t next_id = 1;
   std::mt19937_64 rng{0};
   uint64_t seeded = ~0ull;
+  std::vector<float> probs;    // sampler scratch
+  std::vector<int32_t> cand;
 };
 
 static EngineState& S(const Engine* e) { return *e->state(); }
@@ -163,42 +168,71 @@ void Engine::prefill(std::span<const int32_t> tokens, std::function<void(int64_t
 
 const std::vector<float>& Engine::last_logits() const { return model_->logits(); }
 
-int32_t Engine::sample(const SamplingParams& p, const float* logits, int64_t V) {
-  auto& st = S(this);
+// Samples from softmax(logits / temperature) over the FULL vocabulary (no hidden truncation), with optional
+// min_p (relative to the top probability), top_k and top_p filters. One vectorized exp pass, no full sort:
+// about 0.15 ms per call for 200k tokens, so it stays small next to a 10-30 ms decode step.
+static int32_t sample_with_state(EngineState& st, const SamplingParams& p, const float* logits, int64_t V) {
+  float mx = 0;
+  vDSP_maxv(logits, 1, &mx, vDSP_Length(V));
   if (p.temperature <= 0.0f) {
-    return int32_t(std::max_element(logits, logits + V) - logits);
+    for (int64_t i = 0; i < V; ++i)
+      if (logits[i] == mx) return int32_t(i);  // first maximum, as std::max_element
+    return 0;
   }
   if (st.seeded != p.seed) {
     st.rng.seed(p.seed ? p.seed : std::random_device{}());
     st.seeded = p.seed;
   }
-  std::vector<int32_t> idx(static_cast<size_t>(V));
-  std::iota(idx.begin(), idx.end(), 0);
-  int64_t k = (p.top_k > 0 && p.top_k < V) ? p.top_k : std::min<int64_t>(V, 1024);
-  std::partial_sort(idx.begin(), idx.begin() + k, idx.end(), [&](int32_t a, int32_t b) { return logits[a] > logits[b]; });
-  std::vector<double> pr(static_cast<size_t>(k));
-  const double inv_t = 1.0 / p.temperature, m = logits[idx[0]];
+  auto& pr = st.probs;
+  pr.resize(static_cast<size_t>(V));
+  const float inv_t = 1.0f / p.temperature, shift = -mx * inv_t;
+  vDSP_vsmsa(logits, 1, &inv_t, &shift, pr.data(), 1, vDSP_Length(V));  // (l - max) / T  <= 0
+  const int n = int(V);
+  vvexpf(pr.data(), pr.data(), &n);  // top token has pr = 1
   double z = 0;
-  for (int64_t i = 0; i < k; ++i) z += (pr[i] = std::exp((logits[idx[i]] - m) * inv_t));
-  int64_t keep = k;
-  if (p.min_p > 0)
-    for (int64_t i = 0; i < k; ++i)
-      if (pr[i] < p.min_p * pr[0]) { keep = std::max<int64_t>(1, i); break; }
+  for (int64_t i = 0; i < V; ++i) z += pr[i];
+  std::uniform_real_distribution<double> uni(0.0, 1.0);
+  const bool filtered = p.min_p > 0.0f || (p.top_k > 0 && p.top_k < V) || p.top_p < 1.0f;
+  if (!filtered) {
+    double r = uni(st.rng) * z;
+    int64_t last = 0;
+    for (int64_t i = 0; i < V; ++i) {
+      if (pr[i] <= 0.0f) continue;
+      last = i;
+      r -= pr[i];
+      if (r <= 0) return int32_t(i);
+    }
+    return int32_t(last);
+  }
+  // Candidates: everything above min_p * top (or above 1e-9 * top when only top_k / top_p apply; the mass left
+  // out is below 2e-4 in the worst case and only matters for top_p > 0.9998, where all candidates are kept).
+  const float thr = p.min_p > 0.0f ? p.min_p : 1e-9f;
+  auto& cand = st.cand;
+  cand.clear();
+  for (int64_t i = 0; i < V; ++i)
+    if (pr[i] >= thr) cand.push_back(int32_t(i));
+  std::sort(cand.begin(), cand.end(), [&](int32_t a, int32_t b) { return pr[a] > pr[b] || (pr[a] == pr[b] && a < b); });
+  size_t keep = cand.size();
+  if (p.top_k > 0 && size_t(p.top_k) < keep) keep = size_t(p.top_k);
   if (p.top_p < 1.0f) {
     double c = 0;
-    for (int64_t i = 0; i < keep; ++i) {
-      c += pr[i] / z;
+    for (size_t i = 0; i < keep; ++i) {
+      c += pr[cand[i]] / z;
       if (c >= p.top_p) { keep = i + 1; break; }
     }
   }
   double tot = 0;
-  for (int64_t i = 0; i < keep; ++i) tot += pr[i];
-  double r = std::uniform_real_distribution<double>(0, tot)(st.rng);
-  for (int64_t i = 0; i < keep; ++i) {
-    r -= pr[i];
-    if (r <= 0) return idx[i];
+  for (size_t i = 0; i < keep; ++i) tot += pr[cand[i]];
+  double r = uni(st.rng) * tot;
+  for (size_t i = 0; i < keep; ++i) {
+    r -= pr[cand[i]];
+    if (r <= 0) return cand[i];
   }
-  return idx[keep - 1];
+  return cand[keep - 1];
+}
+
+int32_t Engine::sample(const SamplingParams& p, const float* logits, int64_t V) {
+  return sample_with_state(S(this), p, logits, V);
 }
 
 void Engine::generate(const SamplingParams& p, int max_tokens, const std::vector<int32_t>& stop_ids,
@@ -222,11 +256,13 @@ void Engine::generate(const SamplingParams& p, int max_tokens, const std::vector
 
 }  // namespace ink
 
-// Default until B's speculative.cpp defines it (weak so the strong definition wins when linked).
-__attribute__((weak)) bool ink::speculative_generate(Engine&, Model&, const SamplingParams&, int,
-                                                     const std::vector<int32_t>&, const std::function<bool(int32_t)>&,
-                                                     const std::function<int32_t()>&) {
-  return false;
-}
+// speculative_generate / speculative_attach: src/engine/speculative.cpp (B). No weak defaults here: with both in
+// libinkcore.a the linker resolves the weak copy from engine.cpp.o and never pulls speculative.cpp.o.
 
-__attribute__((weak)) void ink::speculative_attach(Engine&, Model&) {}
+// Test shim (tests/ref/sample_test.cpp): the sampler without a model.
+namespace ink {
+int32_t sample_for_test(const SamplingParams& p, const float* logits, int64_t V, uint64_t*) {
+  static EngineState st;
+  return sample_with_state(st, p, logits, V);
+}
+}  // namespace ink

@@ -1,6 +1,5 @@
-// Greedy decode with DSpark on and off on the same prompt: token streams must be identical. Owner: B.
-// Usage: spec_check IDS_FILE [n_tokens=200] [block=4] [model_dir]
-// Prints tok/s for both and the acceptance rate. One process loads the model once per mode (sequentially).
+// One greedy (or sampled) generation with DSpark on or off; writes the token ids to OUT. Owner: B.
+// Usage: spec_check plain|dspark IDS N BLOCK OUT [temperature] ; tools/spec_check.sh runs both and compares.
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -20,56 +19,40 @@ static std::vector<int32_t> read_i32(const std::string& path) {
   return v;
 }
 
-struct Run {
-  std::vector<int32_t> toks;
-  double prefill_s = 0, gen_s = 0;
-};
-
-static Run run(const std::string& dir, const std::vector<int32_t>& ids, int n, bool mtp, int block) {
+int main(int argc, char** argv) {
+  if (argc < 6) {
+    fprintf(stderr, "usage: spec_check plain|dspark IDS N BLOCK OUT [temperature]\n");
+    return 2;
+  }
+  bool mtp = std::string(argv[1]) == "dspark";
+  auto ids = read_i32(argv[2]);
+  int n = atoi(argv[3]), block = atoi(argv[4]);
+  std::string out = argv[5];
+  float temp = argc > 6 ? float(atof(argv[6])) : 0.0f;
   EngineOptions o;
-  o.model_dir = dir;
-  o.max_context = 32768;
+  o.model_dir = std::string(getenv("HOME")) + "/llm/mlx-models/Inkling-2-Mini-MLX-4-8bit";
+  if (const char* d = getenv("INK_MODEL")) o.model_dir = d;
+  o.max_context = 65536;
   o.use_mtp = mtp;
   o.draft_block = block;
   o.prefill_chunk = 512;
   Engine e(o);
-  Run r;
+  std::vector<int32_t> toks;
   auto t0 = std::chrono::steady_clock::now();
   e.prefill(ids);
   auto t1 = std::chrono::steady_clock::now();
-  SamplingParams p;  // greedy
-  e.generate(p, n, {}, [&](int32_t t) {
-    r.toks.push_back(t);
+  SamplingParams p;
+  p.temperature = temp;
+  p.seed = 1;
+  e.generate(p, n, {200006, 200000, 200002, 200003, 199999}, [&](int32_t t) {
+    toks.push_back(t);
     return true;
   });
   auto t2 = std::chrono::steady_clock::now();
-  r.prefill_s = std::chrono::duration<double>(t1 - t0).count();
-  r.gen_s = std::chrono::duration<double>(t2 - t1).count();
-  return r;
-}
-
-int main(int argc, char** argv) {
-  if (argc < 2) {
-    fprintf(stderr, "usage: spec_check IDS [n] [block] [model_dir]\n");
-    return 2;
-  }
-  auto ids = read_i32(argv[1]);
-  int n = argc > 2 ? atoi(argv[2]) : 200;
-  int block = argc > 3 ? atoi(argv[3]) : 4;
-  std::string dir = argc > 4 ? argv[4] : std::string(getenv("HOME")) + "/llm/mlx-models/Inkling-2-Mini-MLX-4-8bit";
-  setenv("INK_SPEC_STATS", "1", 0);
-  Run a = run(dir, ids, n, false, block);
-  printf("plain : %zu tokens, prefill %zu tok %.2f s, decode %.2f s -> %.1f tok/s\n", a.toks.size(), ids.size(),
-         a.prefill_s, a.gen_s, (a.toks.size() - 1) / a.gen_s);
-  fflush(stdout);
-  Run b = run(dir, ids, n, true, block);
-  printf("dspark: %zu tokens, prefill %.2f s, decode %.2f s -> %.1f tok/s (block %d)\n", b.toks.size(), b.prefill_s,
-         b.gen_s, (b.toks.size() - 1) / b.gen_s, block);
-  size_t first = 0;
-  while (first < a.toks.size() && first < b.toks.size() && a.toks[first] == b.toks[first]) first++;
-  bool same = a.toks == b.toks;
-  printf("token streams %s", same ? "IDENTICAL\n" : "DIFFER");
-  if (!same) printf(" at %zu (plain %d, dspark %d)\n", first, first < a.toks.size() ? a.toks[first] : -1,
-                    first < b.toks.size() ? b.toks[first] : -1);
-  return same ? 0 : 1;
+  double ps = std::chrono::duration<double>(t1 - t0).count(), gs = std::chrono::duration<double>(t2 - t1).count();
+  printf("%-6s: prompt %zu tok, prefill %.2f s (%.0f tok/s); %zu tokens, decode %.2f s -> %.1f tok/s (block %d)\n",
+         argv[1], ids.size(), ps, ids.size() / ps, toks.size(), gs, (toks.size() - 1) / gs, block);
+  std::ofstream f(out, std::ios::binary);
+  f.write(reinterpret_cast<const char*>(toks.data()), std::streamsize(toks.size() * 4));
+  return 0;
 }

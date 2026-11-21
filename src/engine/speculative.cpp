@@ -4,6 +4,7 @@
 #include "engine/speculative.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <map>
@@ -19,6 +20,7 @@ struct Spec {
   std::unique_ptr<DSpark> dsp;
   bool in_verify = false;
   long rounds = 0, drafted = 0, accepted = 0;
+  double draft_ms = 0, verify_ms = 0;
 };
 std::map<const Engine*, std::unique_ptr<Spec>>& registry() {
   static std::map<const Engine*, std::unique_ptr<Spec>> r;
@@ -61,15 +63,21 @@ void speculative_attach(Engine& e, Model& m) {
     }
   };
   registry()[&e] = std::move(sp);
+  if (getenv("INK_SPEC_STATS")) fprintf(stderr, "dspark: attached to engine %p\n", (void*)&e);
 }
 
 bool speculative_generate(Engine& e, Model& m, const SamplingParams& p, int max_tokens,
                           const std::vector<int32_t>& stop_ids, const std::function<bool(int32_t)>& on_token,
                           const std::function<int32_t()>& sample_last) {
   auto it = registry().find(&e);
-  if (it == registry().end() || !it->second->dsp) return false;
+  if (it == registry().end() || !it->second->dsp) {
+    if (getenv("INK_SPEC_STATS")) fprintf(stderr, "dspark: no drafter attached to this engine\n");
+    return false;
+  }
   Spec& s = *it->second;
   DSpark& d = *s.dsp;
+  if (getenv("INK_SPEC_STATS")) fprintf(stderr, "dspark: generate, ctx %lld, model len %lld\n", (long long)d.ctx_len(),
+                                        (long long)m.len());
   const int64_t V = m.config().vocab_unpadded;
   int block = std::max(2, e.options().draft_block);
   int count_max = std::min(block - 1, d.max_count());
@@ -87,13 +95,18 @@ bool speculative_generate(Engine& e, Model& m, const SamplingParams& p, int max_
   while (true) {
     int k = std::min(count_max, max_tokens - emitted);
     if (k <= 0) break;
+    auto c0 = std::chrono::steady_clock::now();
     std::vector<int32_t> drafts = d.draft(b, k);
+    auto c1 = std::chrono::steady_clock::now();
     verify.assign(1, b);
     verify.insert(verify.end(), drafts.begin(), drafts.end());
     const int64_t base = m.len();
     s.in_verify = true;
     m.forward(verify.data(), int64_t(verify.size()), true, true);
     s.in_verify = false;
+    auto c2 = std::chrono::steady_clock::now();
+    s.draft_ms += std::chrono::duration<double, std::milli>(c1 - c0).count();
+    s.verify_ms += std::chrono::duration<double, std::milli>(c2 - c1).count();
     const auto& lg = m.logits();
     // Sample-and-compare (as mlx_vlm's DSpark walk): sample the target at each row in order; accept the draft
     // while it equals the sample. Every emitted token is an exact target sample (greedy: the argmax).
@@ -107,6 +120,13 @@ bool speculative_generate(Engine& e, Model& m, const SamplingParams& p, int max_
         continue;
       }
       break;
+    }
+    if (getenv("INK_SPEC_DEBUG") && s.rounds < 1000) {
+      fprintf(stderr, "round %ld: b=%d drafts", s.rounds, b);
+      for (int x : drafts) fprintf(stderr, " %d", x);
+      fprintf(stderr, " | target");
+      for (int x : y) fprintf(stderr, " %d", x);
+      fprintf(stderr, " | a=%d\n", a);
     }
     s.rounds++;
     s.drafted += k;
@@ -134,8 +154,9 @@ bool speculative_generate(Engine& e, Model& m, const SamplingParams& p, int max_
     b = next;
   }
   if (getenv("INK_SPEC_STATS"))
-    fprintf(stderr, "dspark: %ld rounds, accepted %ld of %ld drafts (%.2f per round)\n", s.rounds, s.accepted,
-            s.drafted, s.rounds ? double(s.accepted) / s.rounds : 0.0);
+    fprintf(stderr, "dspark: %ld rounds, accepted %ld of %ld drafts (%.2f per round), draft %.2f ms, verify %.2f ms per round\n",
+            s.rounds, s.accepted, s.drafted, s.rounds ? double(s.accepted) / s.rounds : 0.0,
+            s.rounds ? s.draft_ms / s.rounds : 0.0, s.rounds ? s.verify_ms / s.rounds : 0.0);
   return true;
 }
 

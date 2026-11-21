@@ -72,11 +72,12 @@ kernel void moe_gateup(device const uint4* gw [[buffer(0)]], device const uchar*
                        uint lane [[thread_index_in_simdgroup]], uint sg [[simdgroup_index_in_threadgroup]]) {
   // x staged with one pad float per 32 (chunk c at c*33): lanes reading different chunks hit different banks
   threadgroup float xs[33 * 128];
-  uint route = tg.y, t = route / p.topk;
+  // grid: x = route (fastest), y = row block: routes that share an expert read the same rows close together
+  uint route = tg.x, t = route / p.topk;
   for (uint i = tid; i < p.K; i += 32 * GU_SIMDS) xs[(i / 32) * 33 + i % 32] = bf2f(x[t * p.K + i]);
   threadgroup_barrier(mem_flags::mem_threadgroup);
   uint e = uint(idx[route]);
-  uint n = (tg.x * GU_SIMDS + sg) * 4 + lane / 8;
+  uint n = (tg.y * GU_SIMDS + sg) * 4 + lane / 8;
   uint sub = lane % 8;
   bool valid = n < p.N;
   n = min(n, p.N - 1);
@@ -137,8 +138,8 @@ kernel void moe_down(device const uint4* dw [[buffer(0)]], device const uchar* d
                      device ushort* out [[buffer(6)]], constant MoeFastParams& p [[buffer(7)]],
                      uint2 tg [[threadgroup_position_in_grid]], uint lane [[thread_index_in_simdgroup]],
                      uint sg [[simdgroup_index_in_threadgroup]]) {
-  uint t = tg.y;
-  uint n = tg.x * DN_SIMDS + sg;
+  uint t = tg.x;  // grid: x = token (fastest), y = row group
+  uint n = tg.y * DN_SIMDS + sg;
   if (n >= p.N) return;
   uint k = lane / 4, sub = lane % 4;
   uint route = t * p.topk + k;

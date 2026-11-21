@@ -120,6 +120,8 @@ class MetalBackend final : public Backend {
   MetalBackend() : g_(Context::get()) {
     profile_ = getenv("INK_PROFILE") != nullptr;
     skinny_ = getenv("INK_SKINNY") != nullptr;  // off until it beats 2-4 passes of the 4-row matvec
+    if (const char* sk = getenv("INK_SPLIT_KEYS")) split_keys_ = uint32_t(atoi(sk));
+    if (const char* sk = getenv("INK_SPLIT_LOCAL")) split_local_ = uint32_t(atoi(sk));
   }
   ~MetalBackend() override {
     sync();
@@ -452,7 +454,9 @@ class MetalBackend final : public Backend {
       uint32_t len = uint32_t(a.kv.len), window = uint32_t(a.window);
       uint32_t first = (window && len + 1 > window) ? len + 1 - window : 0;
       uint32_t nkeys = len + T - first;
-      uint32_t split_keys = 512;  // fixed and position-aligned: verify == decode bit for bit
+      // fixed per layer type and position-aligned: verify rows == decode bit for bit. Measured (one run each):
+      // local window 1024: 64 keys best (0.056 ms vs 0.207 at 512); global 128k: 512 best (2.94 ms vs 3.76 at 128)
+      uint32_t split_keys = window ? split_local_ : split_keys_;
       uint32_t nsplit = cdiv(len + T, split_keys) - first / split_keys;
       (void)nkeys;
       AttnDecParams p{T, H, KVH, uint32_t(a.kv.cap), len, a.kv.ring ? 1u : 0u, window, uint32_t(a.rel_proj.dim(1)),
@@ -572,7 +576,7 @@ class MetalBackend final : public Backend {
       bind(7, idx);
       bind(8, at);
       g_.set_value(9, gp);
-      g_.dispatch({cdiv(I, 16), routes, 1}, {128, 1, 1});
+      g_.dispatch({routes, cdiv(I, 16), 1}, {128, 1, 1});
       MoeFastParams dp{D, I, topk};
       pipe(nv ? "moe_down_nvfp4" : "moe_down_mxfp8");
       bind(0, m.down.weight);
@@ -583,7 +587,7 @@ class MetalBackend final : public Backend {
       bind(5, w);
       bind(6, out);
       g_.set_value(7, dp);
-      g_.dispatch({cdiv(D, 4), T, 1}, {128, 1, 1});
+      g_.dispatch({T, cdiv(D, 4), 1}, {128, 1, 1});
       return;
     }
     if (topk == 8 && !getenv("INK_MOE_SLOW")) {
@@ -694,6 +698,8 @@ class MetalBackend final : public Backend {
   bool pending_ = false;
   bool profile_ = false;
   bool skinny_ = false;
+  uint32_t split_keys_ = 512;
+  uint32_t split_local_ = 64;
   std::string cur_;
   std::map<std::string, std::pair<double, long>> prof_;
   std::unordered_map<void*, size_t> sizes_;
