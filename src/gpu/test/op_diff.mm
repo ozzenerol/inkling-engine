@@ -79,6 +79,11 @@ static void compare(const char* name, Pair& p, double tol = 1e-5, int ulps = 1, 
     }
   }
   double rel = maxabs / std::max(maxref, 1e-30);
+  if (maxref == 0) {
+    printf("%-28s FAIL  reference is all zeros\n", name);
+    fails++;
+    return;
+  }
   bool ok = nan == 0 && (p.c.dtype == DType::BF16 ? bad <= a.size() * bad_frac : rel <= tol);
   if (!ok) fails++;
   printf("%-28s %s  n=%zu exact=%.2f%%  max|d|=%.3g (rel %.2e)%s  %s\n", name, ok ? "ok  " : "FAIL", a.size(),

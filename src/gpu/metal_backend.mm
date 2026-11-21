@@ -48,6 +48,9 @@ struct RmsParams {
   float eps;
   uint32_t has_gamma, dt_x, dt_out;
 };
+struct GemmParams {
+  uint32_t T, N, K, dt_x, dt_out, ldo;
+};
 struct LinParams {
   uint32_t T, N, K, dt_x, dt_out;
 };
@@ -220,6 +223,16 @@ class MetalBackend final : public Backend {
         g_.set_value(3, s);
         g_.dispatch({cdiv(N, 8), 1, 1}, {64, 1, 1});
       }
+      return;
+    }
+    if (!getenv("INK_GEMM_SLOW")) {
+      GemmParams gp{T, N, K, dtc(x.dtype), dtc(out.dtype), N};
+      pipe(x.dtype == DType::BF16 && K % 8 == 0 && !getenv("INK_GEMM_F32") ? "gemm_bf16" : "gemm_bf16w");
+      bind(0, w);
+      bind(1, x);
+      bind(2, out);
+      g_.set_value(3, gp);
+      g_.dispatch({cdiv(N, 64), cdiv(T, 64), 1}, {128, 1, 1});
       return;
     }
     LinParams p{T, N, K, dtc(x.dtype), dtc(out.dtype)};
