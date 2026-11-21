@@ -30,3 +30,10 @@ echo "== B INTERLEAVE bench: dependent vs independent tiny dispatches between th
 for n in 0 2 6; do INTERLEAVE=$n $(bin bench_q8) 1; done
 for n in 2 6; do INTERLEAVE_INDEP=1 INTERLEAVE=$n $(bin bench_q8) 1; done
 INK_SERIAL=1 INTERLEAVE=2 $(bin bench_q8) 1; INK_NULL=1 INTERLEAVE=2 $(bin bench_q8) 1
+echo "== B read/write hazard tracking (INK_RW=1): op_diff, barriers per dispatch, decode off vs on with token cmp (both builds), dspark identity"
+INK_RW=1 $(bin op_diff) 2>&1 | grep -E "ALL|FAILED|FAIL "
+for m in $HOME/llm/mlx-models/Inkling-2-Mini-MLX-8bit $HOME/llm/mlx-models/Inkling-2-Mini-MLX-4-8bit; do for v in "X=1" "INK_RW=1"; do
+  echo -n "[$(basename $m) $v] "; env $v INK_GPU_TIME=1 INK_MODEL=$m $(bin spec_check) plain ref_data/p2.ids 200 4 "$BS/rw_$(basename $m)_$v.i32" 2>&1 | grep -E "hazard|tok/s" | tr '\n' ' '; echo
+done; cmp "$BS/rw_$(basename $m)_X=1.i32" "$BS/rw_$(basename $m)_INK_RW=1.i32" && echo "rw tokens IDENTICAL"; done
+echo -n "[rw dspark identity] "; INK_RW=1 tools/spec_check.sh ref_data/p2.ids 200 8 2>&1 | grep -E "IDENT|DIFF"
+echo -n "[rw prefill p3 8-bit] "; INK_RW=1 build/inktest --backend metal --model $M8 --ids ref_data/p3.ids --steps 1 --ctx 8192 --chunk 2048 --out $BS/m0 2>&1 | grep prefill
