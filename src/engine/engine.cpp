@@ -45,6 +45,7 @@ Engine::Engine(const EngineOptions& o) {
   st_->be = (b && std::string(b) == "cpu") ? make_cpu_backend() : make_metal_backend();
   model_ = std::make_unique<Model>(*st_->be, o.model_dir, o.max_context, o.prefill_chunk);
   opts_ = o;
+  if (opts_.use_mtp) speculative_attach(*this, *model_);
 }
 
 Engine::~Engine() {
@@ -227,3 +228,5 @@ __attribute__((weak)) bool ink::speculative_generate(Engine&, Model&, const Samp
                                                      const std::function<int32_t()>&) {
   return false;
 }
+
+__attribute__((weak)) void ink::speculative_attach(Engine&, Model&) {}
