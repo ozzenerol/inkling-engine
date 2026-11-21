@@ -1,4 +1,4 @@
-// DSpark speculative decoding for Engine::generate. Owner: B.
+// DSpark speculative decoding for Engine::generate (greedy and sampled). Owner: B.
 // draft (GPU) -> verify [bonus, drafts] in one target forward with conv history -> accept the longest matching
 // prefix -> roll the cache back to the accepted rows -> feed their captured hidden states to the drafter.
 #include "engine/speculative.h"
@@ -68,7 +68,6 @@ bool speculative_generate(Engine& e, Model& m, const SamplingParams& p, int max_
                           const std::function<int32_t()>& sample_last) {
   auto it = registry().find(&e);
   if (it == registry().end() || !it->second->dsp) return false;
-  if (p.temperature > 0.0f) return false;  // TODO(B): speculative sampling; greedy only for now
   Spec& s = *it->second;
   DSpark& d = *s.dsp;
   const int64_t V = m.config().vocab_unpadded;
@@ -96,13 +95,19 @@ bool speculative_generate(Engine& e, Model& m, const SamplingParams& p, int max_
     m.forward(verify.data(), int64_t(verify.size()), true, true);
     s.in_verify = false;
     const auto& lg = m.logits();
+    // Sample-and-compare (as mlx_vlm's DSpark walk): sample the target at each row in order; accept the draft
+    // while it equals the sample. Every emitted token is an exact target sample (greedy: the argmax).
     std::vector<int32_t> y(verify.size());
+    int a = 0;
     for (size_t j = 0; j < verify.size(); j++) {
       const float* row = lg.data() + j * V;
-      y[j] = int32_t(std::max_element(row, row + V) - row);
+      y[j] = p.temperature <= 0.0f ? int32_t(std::max_element(row, row + V) - row) : e.sample(p, row, V);
+      if (int(j) < k && drafts[j] == y[j]) {
+        a++;
+        continue;
+      }
+      break;
     }
-    int a = 0;
-    while (a < k && drafts[a] == y[a]) a++;
     s.rounds++;
     s.drafted += k;
     s.accepted += a;
