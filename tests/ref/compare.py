@@ -1,6 +1,6 @@
 """Owner: A. Compare an inktest run with the MLX reference dump.
 
-  python tests/ref/compare.py ref_data/p0.npz OUTDIR
+  python tests/ref/compare.py ref_data/p0.npz OUTDIR|OTHER.npz
 Prints: greedy match (teacher-forced argmax vs reference greedy tokens), first mismatch, KL(ref || ours) per
 step (mean / max), and with hidden_*.f32 present the relative error of the state entering each visit.
 """
@@ -12,7 +12,8 @@ import numpy as np
 ref = np.load(sys.argv[1])
 out = Path(sys.argv[2])
 V = ref["logits"].shape[1]
-ours = np.fromfile(out / "logits.f32", np.float32).reshape(-1, V)
+# OUTDIR may also be another reference .npz (e.g. score MLX-bf16 against the fp32 reference).
+ours = np.load(out)["logits"] if out.suffix == ".npz" else np.fromfile(out / "logits.f32", np.float32).reshape(-1, V)
 n = ours.shape[0]
 rl = ref["logits"][:n].astype(np.float64)
 ol = ours.astype(np.float64)
@@ -41,7 +42,7 @@ for i in np.nonzero(~match)[0]:
 gaps = np.sort(rl, -1)
 gaps = gaps[:, -1] - gaps[:, -2]
 print(f"  ref top-2 gap: min {gaps.min():.4f}, steps with gap < 0.1: {int((gaps < 0.1).sum())}")
-hs = sorted(out.glob("hidden_*.f32"), key=lambda p: int(p.stem.split("_")[1]))
+hs = [] if out.suffix == ".npz" else sorted(out.glob("hidden_*.f32"), key=lambda p: int(p.stem.split("_")[1]))
 for p in hs:
     v = int(p.stem.split("_")[1])
     key = f"hidden_{v}"

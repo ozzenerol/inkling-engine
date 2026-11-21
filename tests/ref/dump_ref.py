@@ -4,7 +4,10 @@ For each prompt: token ids, greedy continuation (N tokens, one token per forward
 of every step (prefill last position + each decode step), and for prompt 0 the hidden state entering every
 layer visit at prefill (capture_layer_ids 0..48, 48 = final normed).
 
-Usage: ~/llm/inkling-venv/bin/python tests/ref/dump_ref.py OUT_DIR [N_STEPS]
+Usage: ~/llm/inkling-venv/bin/python tests/ref/dump_ref.py OUT_DIR [N_STEPS] [--fp32] [--prompts 0,1,..] [--gen-from DIR]
+  --fp32: cast every bf16 parameter to fp32 and run activations in fp32 (quantized experts unchanged): a
+          higher-precision reference to score both MLX-bf16 and our engine against.
+  --gen-from DIR: teacher-force the greedy tokens of an earlier dump (so logits are comparable step by step).
 Output: OUT_DIR/p{i}.npz with ids (prompt), gen (greedy ids), logits [steps, V] float32, and for p0 hidden_{v}.
 """
 import json
@@ -16,13 +19,28 @@ import numpy as np
 from mlx_vlm import load
 
 MODEL = str(Path.home() / "llm/mlx-models/Inkling-2-Mini-MLX-4-8bit")
-out = Path(sys.argv[1])
-steps = int(sys.argv[2]) if len(sys.argv) > 2 else 64
+args = [a for a in sys.argv[1:]]
+fp32 = "--fp32" in args
+sel = None
+gen_from = None
+if "--prompts" in args:
+    sel = [int(x) for x in args[args.index("--prompts") + 1].split(",")]
+if "--gen-from" in args:
+    gen_from = Path(args[args.index("--gen-from") + 1])
+pos = [a for i, a in enumerate(args) if not a.startswith("--") and (i == 0 or args[i - 1] not in ("--prompts", "--gen-from"))]
+out = Path(pos[0])
+steps = int(pos[1]) if len(pos) > 1 else 64
 out.mkdir(parents=True, exist_ok=True)
 
 model, processor = load(MODEL)
 tok = processor.tokenizer if hasattr(processor, "tokenizer") else processor
 lm = model.language_model
+if fp32:
+    from mlx.utils import tree_flatten, tree_unflatten
+    params = [(k, v.astype(mx.float32) if v.dtype == mx.bfloat16 else v) for k, v in tree_flatten(lm.parameters())]
+    lm.update(tree_unflatten(params))
+    mx.eval(lm.parameters())
+    # TextModel.embed -> embed_norm(embed_tokens(x)) now yields fp32, so every x.dtype cast below is fp32.
 
 conversations = [
     [{"role": "user", "content": "Write a Python function that checks whether a number is prime."}],
@@ -40,6 +58,9 @@ prompts.append(tok.encode(long_text + "\nSummarize the text above.", add_special
 
 meta = []
 for pi, ids in enumerate(prompts):
+    if sel is not None and pi not in sel:
+        continue
+    forced = np.load(gen_from / f"p{pi}.npz")["gen"] if gen_from else None
     cache = lm.make_cache()
     x = mx.array([ids])
     extra = {}
@@ -52,7 +73,7 @@ for pi, ids in enumerate(prompts):
     logits = [np.array(o.logits[0, -1].astype(mx.float32))]
     gen = []
     for s in range(steps):
-        t = int(np.argmax(logits[-1]))
+        t = int(forced[s]) if forced is not None else int(np.argmax(logits[-1]))
         gen.append(t)
         if s == steps - 1:
             break
