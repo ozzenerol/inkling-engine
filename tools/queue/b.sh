@@ -26,3 +26,8 @@ for v in "INK_NO_T2=1" "X=1"; do echo "[$v]"; env $SP $v $(bin spec_check) dspar
 cmp "$BS/t2_INK_NO_T2=1.i32" "$BS/t2_X=1.i32" && echo "t2 kernels tokens IDENTICAL"
 echo "[profile plain T=1]"; INK_PROFILE=1 INK_MODEL=$M8 $(bin spec_check) plain ref_data/p2.ids 60 4 /dev/null 2>&1 | grep -A14 "kernel profile"
 echo "[profile dspark block 2 (T=2 verifies + drafts)]"; env $SP INK_PROFILE=1 $(bin spec_check) dspark ref_data/p2.ids 60 2 /dev/null 2>&1 | grep -A22 "kernel profile"
+echo "== B GPU performance-state experiment: 8-bit plain decode with a background spin load on a second queue"
+for b in 0 1 4 16; do for it in 20000 200000; do [ $b = 0 ] && [ $it = 200000 ] && continue
+  echo -n "[busy groups $b iters $it] "; INK_BUSY=$b INK_BUSY_ITERS=$it INK_MODEL=$M8 $(bin spec_check) plain ref_data/p2.ids 100 4 /dev/null 2>&1 | grep -oE "decode [0-9.]+ s -> [0-9.]+ tok/s"
+done; done
+echo "[profile with busy 4 x 20000]"; INK_BUSY=4 INK_PROFILE=1 INK_MODEL=$M8 $(bin spec_check) plain ref_data/p2.ids 60 4 /dev/null 2>&1 | grep -E "matvec_q8_bf16_bf16_t1|moe_gateup_nvfp4|attn_decode_split|kernel profile"
