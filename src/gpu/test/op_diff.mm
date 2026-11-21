@@ -173,8 +173,7 @@ int main(int argc, char** argv) {
     CPU->copy(o1.c, c.c);
     compare("copy", c, 0, 0);
   }
-  {  // attn residual
-    int64_t T = 3;
+  for (int64_t T : {3, 5, 8, 11, 16}) {  // attn residual (T > 4: D, same kernels as decode up to 16 rows)
     auto s0 = make(DType::BF16, {T, D}, 2.0f), s1 = make(DType::F32, {T, D}, 1.0f), s2 = make(DType::F32, {T, D}, 5.0f);
     auto q = make(DType::F32, {3, D}, 0.05f);
     auto o = zeros(DType::F32, {3, T, D});
