@@ -847,8 +847,7 @@ class MetalBackend final : public Backend {
 
   void attention(const AttnArgs& a, Tensor& out) override {
     if (skip("attn")) return; attention_impl(a, nullptr, out); }
-  // ---- B's fused decode ops. NOTE: these overrides were missing until now (a silent failed edit in 5f0fe21: the
-  // kernels existed but the defaults ran). Opt-in INK_FUSE2=1 until a batch has run them.
+  // ---- B's fused decode ops (default on since batch 7; INK_NO_FUSE2=1 runs the primitive sequences).
   bool fuse2() const { return fuse2_; }
   void attention_gated(const AttnArgs& a, const Tensor& gate, Tensor& out) override {
     uint32_t H = uint32_t(a.q.dim(1)), KVH = uint32_t(a.k_new.dim(1));
@@ -1466,7 +1465,7 @@ class MetalBackend final : public Backend {
   bool profile_ = false;
   bool gpu_time_ = false;
   bool t2_off_ = getenv("INK_NO_T2") != nullptr;  // 2-row matvec kernels (same per-row arithmetic as t1 / t4)
-  bool fuse2_ = getenv("INK_FUSE2") != nullptr;
+  bool fuse2_ = getenv("INK_NO_FUSE2") == nullptr;  // batch 7: tokens identical, 43.5 vs 42.9 tok/s (8-bit)
   std::string skip_;
   std::chrono::steady_clock::time_point last_sync_;
   double acc_gpu_ = 0, acc_wall_ = 0, acc_wait_ = 0;
