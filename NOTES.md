@@ -722,3 +722,52 @@ B's t8tg and skinny GEMMs (handed to me).
    then cut rows / the head pass accordingly.
 3. Profile a 17..63-token read (prompt tail, small agent turn) and fix what is slow there besides attention
    (A moved the attention GEMM down to 17 rows); INK_MR_MAX and bench_dense / bench_moe at 20..63 rows are ready.
+
+- **Batch 9** (main c618174, 22:04-22:37, the last run of 2026-11-21): all gates pass.
+  - C's depth bench (8-bit server, temp 0.7, one growing conversation): gen 39.9 / 38.1 / 30.3 / 27.2 / 22.0 tok/s
+    and read 729 / 794 / 658 / 503 / 381 tok/s at 1.2k / 9.6k / 39k / 79k / 127k. Agent bench: median gen 64.6,
+    copy scenario 87.7, median TTFT 1.35 s, read 573 tok/s per turn; qh e2e PASS.
+  - D's INK_GA (direct global attention, opt-in), 8-bit, temp 0.7: **126k context 26.4 tok/s vs 21.1** (plain
+    step 36.0 vs 46.8 ms, T=2 43.5 vs 52.6, T=4 64.6 vs 70.3); 32k 35.7 vs 31.7 (plain 27.2 vs 31.3 ms).
+    Lossless long32k greedy: dspark token-identical to plain with GA; op_diff with GA ALL OK.
+    -> make INK_GA the default (first batch tomorrow).
+  - B's NULL chain (every dispatch replaced by a one-thread kernel, same barriers and commits): 510 tok/s, i.e. the
+    whole dispatch chain of a plain step costs ~2 ms. So the 23 ms step on the 8-bit build is real kernel time, not
+    dispatch latency. Open question for tomorrow: why the same q8 dense bytes take 1.8 ms model-free and ~6 ms in
+    the model (INTERLEAVE: 2 dependent tiny dispatches after each matvec 7.8 ms, independent ones 4.5 ms, back to
+    back 1.8 ms: the big readers slow down when anything runs between them).
+  - B's read/write hazard tracking (INK_RW=1): barriers 83.6k vs 101.5k per 121k dispatches, 45.4 vs 44.0 tok/s on
+    8-bit (+3%), no change on lossless, tokens identical, dspark identity holds -> default tomorrow.
+  - B's MoE prefill tile of 32 rows (INK_MOE_M=0 = 32 rows below T = 1280): an 800-token read 1.19 s vs 1.36 s
+    (8-bit) and 1.20 vs 1.54 s (lossless), 2048 and 2886 tokens unchanged, logits byte-identical -> default tomorrow.
+
+## A: handover at the end of 2026-11-21
+
+State of main: everything of A, B, D merged (c/work: see C's final line below). All gates pass on c618174.
+
+Reference numbers (8-bit build = server default; one run each):
+- Generation, free text, temp 0.7 (C's depth bench): 39.9 tok/s at 1.2k, 38.1 at 9.6k, 30.3 at 39k, 27.2 at 79k,
+  22.0 at 127k (26.4 at 126k with INK_GA=1). MLX: 23.1 / 24.2 / 22.0 / 16.5 / 13.8.
+- Reading new tokens: 729 / 794 / 658 / 503 / 381 tok/s at the same depths (MLX cold: 565 / 602 / 495 / 385 /
+  324). A turn's time to first token is its prefill: ~775 new tokens in 1.2 s.
+- Copy-heavy output (lossless, spec_check, token-identical to plain): 128 tok/s copy, 114-116 edit; 8-bit 119-130.
+- Agent bench (10 turns): median gen 64.6 (8-bit) / 88.6 (lossless), median TTFT 1.35 s; MLX 44.1 and 13.5 s.
+- Plain decode step: 27 ms lossless, 23 ms 8-bit at short context; 36 ms at 126k with GA.
+
+User's target (relaxed 21:20): ~40 tok/s at the start, 20-30 at the end of the context, and prompts read fast.
+Later (22:15): keep going until it is "blazingly fast". Then: one last run and stop; continue the next day.
+
+First batch tomorrow (defaults to flip, each already measured identical or gated):
+1. INK_GA on by default (D) - +25% at 126k, +13% at 32k.
+2. INK_RW on by default (B) - +3% on 8-bit.
+3. INK_MOE_M=0 by default (B) - 800-token reads 13-22% faster.
+4. Measure D's unmerged-but-unrun switches: drafter on GA, INK_DSPARK_ROWS=1 (drafter 17 ms per round at 126k).
+Then: (a) why kernels run 3x slower inside the model than back to back (the only big lever left for the plain
+step; candidates: cold weights per visit vs the bench re-reading warm buffers, pipeline switches, threadgroup
+memory setup); (b) reading at depth (381 tok/s at 127k; ceiling ~600: prefill attention is 5.5-6.9 TFLOPS with
+P as hi + lo half tiles; one half tile is +7% at 64k but showed a KL outlier, off); (c) FULL sweep + MLX
+baselines for docs/RESULTS.md (cold 127.5k rows, MLX copy scenario).
+Things tried and dropped today: chain kernels (single-threadgroup megakernels: slower), real speculative
+sampling (no better than compare with this drafter), 8-arm bandit over draft counts, attention key pruning (not
+sparse), MoE tiles of 128 rows, FP4 LUT, conv+mix merge, q8 linear_multi, GPU "busy" load, 8-bit KV (on hold:
+INK_KV_Q8SIM in the CPU backend simulates it for an accuracy check that was not run).
