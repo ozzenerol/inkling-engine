@@ -127,6 +127,7 @@ struct AttnDecParams {
 };
 struct MrAttnParams {  // kernels/multirow.metal (D)
   uint32_t T, H, KVH, cap, len, ring, window, rel_extent, split_keys, nsplit, causal, first, use_sink, use_gate, prow;
+  uint32_t t0, nq;  // query rows [t0, t0 + nq) of the T new tokens
 };
 struct RouterParams {
   uint32_t T, D, E, topk, dt_x;
@@ -153,6 +154,10 @@ struct SoftcapParams {
 };
 
 uint32_t cdiv(uint64_t a, uint64_t b) { return uint32_t((a + b - 1) / b); }
+// D: largest T that takes the decode/verify kernels (rows bit-equal to T = 1). Dense ops run passes of 16 rows.
+// The code handles 32 (attention in two row groups, union MoE lists of 32) but that is unmeasured and parked
+// (2026-11-21, priority moved to long context): to go to 32, set this and add 17..32 to the op_diff row lists.
+constexpr uint32_t kMR = 16;
 
 class MetalBackend final : public Backend {
  public:
@@ -365,19 +370,22 @@ class MetalBackend final : public Backend {
   }
   void linear_q8(const Tensor& x, const Tensor& w, Tensor& out, uint32_t T, uint32_t N, uint32_t K) {
     auto& sb = affine_of(w);
-    if (T > 4 && T <= 16 && mr_ && K % 64 == 0) {
-      // D: one pass over the codes for 5..16 rows; every row equals the 1-row q8 matvec bit for bit
-      const uint32_t R = mr_q8_r_ ? mr_q8_r_ : (T <= 8 ? 2u : 4u);  // INK_MR_Q8_R: bench only
-      Q8Params qp{N, K, T, K, N};
-      pipe(std::string("mr_matvec_q8_") + dtn(x.dtype) + "_" + dtn(out.dtype) + (T <= 8 ? "_t8_r" : "_t16_r") +
-           std::to_string(R) + "_s2");
-      bind(0, w);
-      bind(1, sb.first);
-      bind(2, sb.second);
-      bind(3, x);
-      bind(4, out);
-      g_.set_value(5, qp);
-      g_.dispatch({cdiv(N, 2 * R), 1, 1}, {64, 1, 1});
+    if (T > 4 && T <= kMR && mr_ && K % 64 == 0) {
+      // D: one pass over the codes per 16 rows; every row equals the 1-row q8 matvec bit for bit
+      for (uint32_t t0 = 0; t0 < T; t0 += 16) {
+        const uint32_t tt = std::min<uint32_t>(16, T - t0);
+        const uint32_t R = mr_q8_r_ ? mr_q8_r_ : (tt <= 8 ? 2u : 4u);  // INK_MR_Q8_R: bench only
+        Q8Params qp{N, K, tt, K, N};
+        pipe(std::string("mr_matvec_q8_") + dtn(x.dtype) + "_" + dtn(out.dtype) + (tt <= 8 ? "_t8_r" : "_t16_r") +
+             std::to_string(R) + "_s2");
+        bind(0, w);
+        bind(1, sb.first);
+        bind(2, sb.second);
+        g_.set_buffer(3, bufof(x), x.offset + size_t(t0) * K * dtype_size(x.dtype));
+        g_.set_buffer(4, bufof(out), out.offset + size_t(t0) * N * dtype_size(out.dtype));
+        g_.set_value(5, qp);
+        g_.dispatch({cdiv(N, 2 * R), 1, 1}, {64, 1, 1});
+      }
       return;
     }
     if (T <= 16) {
@@ -423,16 +431,19 @@ class MetalBackend final : public Backend {
   // rows of out computed: [0, N) of w; out row stride = N.
   void linear_rows(const Tensor& x, const Tensor& w, Tensor& out, uint32_t T, uint32_t N, uint32_t K,
                    uint32_t /*unused*/) {
-    if (K % 8 == 0 && T > 4 && T <= 16 && mr_ && !skinny_ && !getenv("INK_MV_T8")) {
-      // D: one pass over W for 5..16 rows; every row equals the 1-row matvec bit for bit (kernels/multirow.metal)
-      MatvecShape ms{N, K, T, K, N};
-      // measured (bench_multirow): up to 8 rows 2 output rows per simdgroup is best, above 8 rows 4
-      pipe(std::string("mr_matvec_") + dtn(x.dtype) + "_" + dtn(out.dtype) + (T <= 8 ? "_t8_r2_s2" : "_t16_r4_s2"));
-      bind(0, w);
-      bind(1, x);
-      bind(2, out);
-      g_.set_value(3, ms);
-      g_.dispatch({cdiv(N, T <= 8 ? 4 : 8), 1, 1}, {64, 1, 1});
+    if (K % 8 == 0 && T > 4 && T <= kMR && mr_ && !skinny_ && !getenv("INK_MV_T8")) {
+      // D: one pass over W per 16 rows; every row equals the 1-row matvec bit for bit (kernels/multirow.metal).
+      // Measured (bench_multirow): up to 8 rows 2 output rows per simdgroup is best, above 8 rows 4.
+      for (uint32_t t0 = 0; t0 < T; t0 += 16) {
+        const uint32_t tt = std::min<uint32_t>(16, T - t0);
+        MatvecShape ms{N, K, tt, K, N};
+        pipe(std::string("mr_matvec_") + dtn(x.dtype) + "_" + dtn(out.dtype) + (tt <= 8 ? "_t8_r2_s2" : "_t16_r4_s2"));
+        bind(0, w);
+        g_.set_buffer(1, bufof(x), x.offset + size_t(t0) * K * dtype_size(x.dtype));
+        g_.set_buffer(2, bufof(out), out.offset + size_t(t0) * N * dtype_size(out.dtype));
+        g_.set_value(3, ms);
+        g_.dispatch({cdiv(N, tt <= 8 ? 4 : 8), 1, 1}, {64, 1, 1});
+      }
       return;
     }
     if (K % 8 == 0 && T > 4 && T <= 16 && x.dtype == DType::BF16 && skinny_) {
@@ -527,7 +538,7 @@ class MetalBackend final : public Backend {
         return;
       }
     uint32_t K = uint32_t(ws[0]->dim(1)), T = uint32_t(x.numel() / K);
-    bool ok = (T <= 4 || (T <= 16 && mr_)) && ws.size() <= 8 && K % 8 == 0 && !getenv("INK_NO_MULTI");
+    bool ok = (T <= 4 || (T <= kMR && mr_)) && ws.size() <= 8 && K % 8 == 0 && !getenv("INK_NO_MULTI");
     for (auto* w : ws) ok = ok && w->dim(1) == K && w->dim(0) % 4 == 0 && w->dtype == DType::BF16;
     if (!ok) {
       for (size_t i = 0; i < ws.size(); ++i) linear(x, *ws[i], *outs[i]);
@@ -535,29 +546,33 @@ class MetalBackend final : public Backend {
     }
     MatvecMultiParams p{};
     p.K = K;
-    p.T = T;
     p.count = uint32_t(ws.size());
-    if (T > 4) pipe(std::string("mr_matvec_multi_") + dtn(x.dtype) + (T <= 8 ? "_t8" : "_t16"));  // D
-    else pipe(x.dtype == DType::BF16 ? "matvec_multi_bf16" : "matvec_multi_f32");
-    for (uint32_t i = 0; i < 8; i++) {
-      uint32_t j = std::min<uint32_t>(i, p.count - 1);
-      bind(i, *ws[j]);
-      bind(8 + i, *outs[j]);
-    }
     for (uint32_t i = 0; i < p.count; i++) {
       p.row_start[i + 1] = p.row_start[i] + uint32_t(ws[i]->dim(0));
       p.dt_out[i] = dtc(outs[i]->dtype);
     }
-    bind(16, x);
-    g_.set_value(17, p);
-    g_.dispatch({cdiv(p.row_start[p.count], 8), 1, 1}, {64, 1, 1});
+    for (uint32_t t0 = 0; t0 < T; t0 += 16) {  // one pass for T <= 16; D: passes of 16 rows up to kMR
+      const uint32_t tt = std::min<uint32_t>(16, T - t0);
+      p.T = tt;
+      if (T > 4) pipe(std::string("mr_matvec_multi_") + dtn(x.dtype) + (tt <= 8 ? "_t8" : "_t16"));  // D
+      else pipe(x.dtype == DType::BF16 ? "matvec_multi_bf16" : "matvec_multi_f32");
+      for (uint32_t i = 0; i < 8; i++) {
+        uint32_t j = std::min<uint32_t>(i, p.count - 1);
+        bind(i, *ws[j]);
+        g_.set_buffer(8 + i, bufof(*outs[j]),
+                      outs[j]->offset + size_t(t0) * size_t(ws[j]->dim(0)) * dtype_size(outs[j]->dtype));
+      }
+      g_.set_buffer(16, bufof(x), x.offset + size_t(t0) * K * dtype_size(x.dtype));
+      g_.set_value(17, p);
+      g_.dispatch({cdiv(p.row_start[p.count], 8), 1, 1}, {64, 1, 1});
+    }
   }
 
   void attn_residual_norm(const std::vector<const Tensor*>& states, const Tensor& query, Tensor& mixed,
                           const Tensor& gamma, float eps, Tensor& normed) override {
     uint32_t D = uint32_t(states[0]->dim(-1)), T = uint32_t(states[0]->numel() / D);
     bool nq1 = query.ndim == 1 || query.dim(0) == 1;
-    if (!nq1 || T > 16 || D > 2304 || normed.dtype != DType::BF16 || getenv("INK_NO_FUSE"))  // D: 16 (was 4)
+    if (!nq1 || T > kMR || D > 2304 || normed.dtype != DType::BF16 || getenv("INK_NO_FUSE"))  // D: kMR (was 4)
       return Backend::attn_residual_norm(states, query, mixed, gamma, eps, normed);
     mix(states, query, 1, mixed, &gamma, eps, &normed);
   }
@@ -573,7 +588,7 @@ class MetalBackend final : public Backend {
     p.nq = nq;
     // decode/verify: one threadgroup per token is latency bound, use 1024 threads. Up to 16 rows (D): the 256-thread
     // kernel reduces in a different order, so a verify row above 4 would not equal the decode row.
-    bool wide = p.T <= 16;
+    bool wide = p.T <= kMR;
     p.eps = eps;
     pipe(normed ? "attn_residual_mix_norm_1024" : wide ? "attn_residual_mix_1024" : "attn_residual_mix");
     if (normed) wide = true;
@@ -640,7 +655,7 @@ class MetalBackend final : public Backend {
   void controller_multi(int n, const Tensor* xs, const Tensor* ms, const Tensor* downs, const Tensor* forgets,
                         const Tensor* gains, Tensor* outs) override {
     uint32_t D = uint32_t(xs[0].dim(-1)), T = uint32_t(xs[0].numel() / D), R = uint32_t(downs[0].dim(0));
-    if (n != 3 || T > (mr_ ? 16u : 4u) || getenv("INK_NO_FUSE"))
+    if (n != 3 || T > (mr_ ? kMR : 4u) || getenv("INK_NO_FUSE"))
       return Backend::controller_multi(n, xs, ms, downs, forgets, gains, outs);
     if (skip("ctrl")) return;
     CtrlParams p{T, D, R, D};
@@ -657,25 +672,28 @@ class MetalBackend final : public Backend {
     // h_i = bf16(pair_i @ down_i^T): one matvec_multi with per-matrix inputs (same per-row math as linear)
     MatvecMultiParams mp{};
     mp.K = 2 * D;
-    mp.T = T;
     mp.count = 3;
-    pipe(T <= 4 ? "matvec_multi_bf16" : T <= 8 ? "mr_matvec_multi_bf16_t8" : "mr_matvec_multi_bf16_t16");  // D
-    Tensor hv[3];
-    for (uint32_t i = 0; i < 8; i++) {
-      uint32_t j = std::min<uint32_t>(i, 2);
-      bind(i, downs[j]);
-      hv[j] = h;
-      hv[j].offset = h.offset + size_t(j) * T * R * 2;
-      bind(8 + i, hv[j]);
+    for (uint32_t t0 = 0; t0 < T; t0 += 16) {  // one pass for T <= 16; D: passes of 16 rows up to kMR
+      const uint32_t tt = std::min<uint32_t>(16, T - t0);
+      mp.T = tt;
+      pipe(T <= 4 ? "matvec_multi_bf16" : tt <= 8 ? "mr_matvec_multi_bf16_t8" : "mr_matvec_multi_bf16_t16");  // D
+      Tensor hv[3];
+      for (uint32_t i = 0; i < 8; i++) {
+        uint32_t j = std::min<uint32_t>(i, 2);
+        bind(i, downs[j]);
+        hv[j] = h;
+        hv[j].offset = h.offset + (size_t(j) * T + t0) * R * 2;
+        bind(8 + i, hv[j]);
+      }
+      for (uint32_t i = 0; i < 3; i++) {
+        mp.row_start[i + 1] = mp.row_start[i] + R;
+        mp.dt_out[i] = 1;
+        mp.x_off[i] = (i * T + t0) * 2 * D;
+      }
+      bind(16, pair);
+      g_.set_value(17, mp);
+      g_.dispatch({cdiv(mp.row_start[3], 8), 1, 1}, {64, 1, 1});
     }
-    for (uint32_t i = 0; i < 3; i++) {
-      mp.row_start[i + 1] = mp.row_start[i] + R;
-      mp.dt_out[i] = 1;
-      mp.x_off[i] = i * T * 2 * D;
-    }
-    bind(16, pair);
-    g_.set_value(17, mp);
-    g_.dispatch({cdiv(mp.row_start[3], 8), 1, 1}, {64, 1, 1});
     pipe("ctrl_out3");
     for (int i = 0; i < 3; i++) {
       bind(i, xs[i]);
@@ -724,7 +742,7 @@ class MetalBackend final : public Backend {
     g_.set_value(3, p);
     g_.dispatch({T, 1, 1}, {256, 1, 1});
     linear(pair, down, h);
-    if (T > 16 && !getenv("INK_CTRL_SCALAR")) {  // batch 3: p3 prefill 3.96 -> 3.72 s (one run)
+    if (T > kMR && !getenv("INK_CTRL_SCALAR")) {  // batch 3: p3 prefill 3.96 -> 3.72 s (one run)
       // prefill: forget/gain projections as GEMMs (K = 64), then an elementwise combine
       Tensor F = scratch("ctrl-F", DType::F32, {T, D}), G = scratch("ctrl-G", DType::F32, {T, D});
       linear(h, forget, F);
@@ -919,31 +937,36 @@ class MetalBackend final : public Backend {
       g_.dispatch({T, H, 1}, {128, 1, 1});
       return;
     }
-    if (T <= 16 && H == 3 * KVH && mr_attn_ && !getenv("INK_ATTN_SLOW")) {
-      // D: 5..16 rows (verify). Same splits and per-row arithmetic as the T <= 4 path above (rows == decode), K/V
-      // staged once per split for all rows (kernels/multirow.metal).
+    if (T <= kMR && H == 3 * KVH && mr_attn_ && !getenv("INK_ATTN_SLOW")) {
+      // D: 3..32 rows (verify). Same splits and per-row arithmetic as the T <= 4 path above (rows == decode), K/V
+      // staged once per split for a group of up to 16 query rows (kernels/multirow.metal); above 16 rows two
+      // groups over the same keys.
       uint32_t len = uint32_t(a.kv.len), window = uint32_t(a.window);
       uint32_t first = (window && len + 1 > window) ? len + 1 - window : 0;
       uint32_t split_keys = window ? split_local_ : split_keys_;
       uint32_t nsplit = cdiv(len + T, split_keys) - first / split_keys;
-      uint32_t nfg = cdiv(3 * T, 8);
       MrAttnParams p{T, H, KVH, uint32_t(a.kv.cap), len, a.kv.ring ? 1u : 0u, window, uint32_t(a.rel_proj.dim(1)),
-                     split_keys, nsplit, 1u, first, 1u, gate ? 1u : 0u, 48u};
-      // sized for 16 rows and nsplit rounded up, so the scratch is not regrown (a sync) as T or the context grows
+                     split_keys, nsplit, 1u, first, 1u, gate ? 1u : 0u, 3 * kMR, 0u, T};
+      // sized for kMR rows and nsplit rounded up, so the scratch is not regrown (a sync) as T or the context grows
       Tensor part = scratch("mr-attn-part", DType::F32, {KVH * cdiv(nsplit, 64) * 64 * p.prow, 132});
-      std::string nm = "mr_attn_split_g" + std::to_string(nfg);
-      if (const char* ab = getenv("INK_MR_ABL")) nm = std::string("mr_attn_split_g6_abl") + ab;  // bench only
-      pipe(nm);
-      bind(0, a.q);
-      bind(1, a.k_new);
-      bind(2, a.v_new);
-      bind(3, a.r);
-      bind(4, a.rel_proj);
-      bind(5, a.kv.k.valid() ? a.kv.k : a.k_new);
-      bind(6, a.kv.v.valid() ? a.kv.v : a.v_new);
-      bind(7, part);
-      g_.set_value(8, p);
-      g_.dispatch({KVH, nsplit, 1}, {64 * nfg, 1, 1});
+      for (uint32_t t0 = 0; t0 < T; t0 += 16) {
+        p.t0 = t0;
+        p.nq = std::min<uint32_t>(16, T - t0);
+        const uint32_t nfg = cdiv(3 * p.nq, 8);
+        std::string nm = "mr_attn_split_g" + std::to_string(nfg);
+        if (const char* ab = getenv("INK_MR_ABL")) nm = std::string("mr_attn_split_g6_abl") + ab;  // bench only
+        pipe(nm);
+        bind(0, a.q);
+        bind(1, a.k_new);
+        bind(2, a.v_new);
+        bind(3, a.r);
+        bind(4, a.rel_proj);
+        bind(5, a.kv.k.valid() ? a.kv.k : a.k_new);
+        bind(6, a.kv.v.valid() ? a.kv.v : a.v_new);
+        bind(7, part);
+        g_.set_value(8, p);
+        g_.dispatch({KVH, nsplit, 1}, {64 * nfg, 1, 1});
+      }
       pipe("mr_attn_combine");
       bind(0, part);
       bind(1, a.sink);
@@ -1247,14 +1270,14 @@ class MetalBackend final : public Backend {
       moe_routes_[T] += routes;
       moe_uniq_[T] += uniq;
     }
-    if (topk == 8 && T >= mr_moe_min_ && T <= 16 && mr_moe_ && m.gate_w.dim(0) <= 128 && !getenv("INK_MOE_SLOW")) {
+    if (topk == 8 && T >= mr_moe_min_ && T <= kMR && mr_moe_ && m.gate_w.dim(0) <= 128 && !getenv("INK_MOE_SLOW")) {
       // D: expert union (kernels/multirow.metal): each used expert is read once for all the rows routed to it;
       // per (route, row) the arithmetic of the two-dispatch path below, so rows equal T = 1 bit for bit.
       bool nv = m.gate.mode == QuantMode::NVFP4;
       const uint32_t E = 128, slots = std::min(routes, E);
       Tensor at = scratch("moe-a", DType::BF16, {routes, I});
-      Tensor dd = scratch("mr-moe-d", DType::BF16, {16 * topk, D});
-      Tensor ul = scratch("mr-moe-ulist", DType::I32, {E, 18});
+      Tensor dd = scratch("mr-moe-d", DType::BF16, {kMR * topk, D});
+      Tensor ul = scratch("mr-moe-ulist", DType::I32, {E, 2 + kMR});
       Tensor uh = scratch("mr-moe-uhdr", DType::I32, {4});
       struct { uint32_t routes, E; } gp{routes, E};
       pipe("mr_moe_group");
