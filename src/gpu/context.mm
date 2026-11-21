@@ -123,7 +123,7 @@ Context::Context() : impl_(new Impl) {
     if (const char* ws = getenv("INK_WARM_SECS")) impl_->warm_secs = atof(ws);
     impl_->concurrent = getenv("INK_CONCURRENT") != nullptr;
     impl_->null_mode = getenv("INK_NULL") != nullptr;
-    impl_->rw = getenv("INK_RW") != nullptr;
+    impl_->rw = !(getenv("INK_RW") && getenv("INK_RW")[0] == '0');  // default on since batch 10 (INK_RW=0 off)
     impl_->smart = getenv("INK_SERIAL") == nullptr && !impl_->concurrent;
     g_barrier_report.b = &impl_->barriers;
     g_barrier_report.d = &impl_->dispatches;

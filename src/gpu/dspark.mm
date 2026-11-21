@@ -92,9 +92,9 @@ struct DSpark::Impl {
   // workspace
   Tensor mixed, kx, vx, tokens, e0, e1, x, xin, q, kb, vb, at, o, summed, res, post, gt, ut, a, h, base, frnn, cat,
       ctxm, state, zero_state, latent, part, last_feat, apart, zbuf, stats, qbuf, ga_s, ga_bmax, ga_m, ga_part;
-  // D: direct global attention (multirow_ga.metal) for the drafter's global layer: with INK_GA=1 unless
+  // D: direct global attention (multirow_ga.metal) for the drafter's global layer: on unless INK_GA=0 or
   // INK_GA_DRAFT=0
-  bool ga = getenv("INK_GA") && getenv("INK_GA")[0] == '1' && !(getenv("INK_GA_DRAFT") && getenv("INK_GA_DRAFT")[0] == '0');
+  bool ga = !(getenv("INK_GA") && getenv("INK_GA")[0] == '0') && !(getenv("INK_GA_DRAFT") && getenv("INK_GA_DRAFT")[0] == '0');
   float last_temp = 0;
 
   Impl(Backend& b, const Tensor& em, const Tensor& en, const Tensor& hd) : be(b), embed(em), embed_norm(en), head(hd) {}

@@ -1531,7 +1531,7 @@ class MetalBackend final : public Backend {
   bool gpu_time_ = false;
   // rows of one expert per MoE prefill tile (bit-identical for any choice)
   uint32_t moe_cur_m_ = 64;
-  uint32_t moe_m_ = getenv("INK_MOE_M") ? uint32_t(atoi(getenv("INK_MOE_M"))) : 64u;  // 32, 64 or 0 = by T (opt-in)
+  uint32_t moe_m_ = getenv("INK_MOE_M") ? uint32_t(atoi(getenv("INK_MOE_M"))) : 0u;  // 32, 64 or 0 = by T (default since batch 10)
   bool t2_off_ = getenv("INK_NO_T2") != nullptr;  // 2-row matvec kernels (same per-row arithmetic as t1 / t4)
   bool fuse2_ = getenv("INK_NO_FUSE2") == nullptr;  // batch 7: tokens identical, 43.5 vs 42.9 tok/s (8-bit)
   std::string skip_;
@@ -1552,10 +1552,10 @@ class MetalBackend final : public Backend {
   uint32_t mr_q8_r_ = getenv("INK_MR_Q8_R") ? uint32_t(atoi(getenv("INK_MR_Q8_R"))) : 0;
   bool mr_moe_ = !(getenv("INK_MR_MOE") && getenv("INK_MR_MOE")[0] == '0');
   uint32_t mr_moe_min_ = getenv("INK_MR_MOE_MIN") ? uint32_t(atoi(getenv("INK_MR_MOE_MIN"))) : 3;
-  // D: two-pass global attention without staging. Opt-in (INK_GA=1) until measured. INK_GA_THR=x: weights below
+  // D: two-pass global attention without staging. On by default since batch 10 (INK_GA=0 off). INK_GA_THR=x: weights below
   // exp(-x) of the row maximum are dropped and blocks with nothing above it are not read (default: nothing dropped).
   // INK_GA_MIN_LEN=n: only from n keys.
-  bool ga_ = getenv("INK_GA") && getenv("INK_GA")[0] == '1';
+  bool ga_ = !(getenv("INK_GA") && getenv("INK_GA")[0] == '0');
   uint32_t ga_tok_ = getenv("INK_GA_TOK") ? uint32_t(atoi(getenv("INK_GA_TOK"))) : 16;
   bool ga_no_pv_ = getenv("INK_GA_NOPV") != nullptr;
   float ga_thr_ = getenv("INK_GA_THR") ? float(atof(getenv("INK_GA_THR"))) : 1e30f;
