@@ -225,6 +225,79 @@ ARM_INST("attn_residual_mix_1024", 1024, false, false)
 ARM_INST("attn_residual_mix_norm_1024", 1024, true, false)
 ARM_INST("conv_mix_norm_1024", 1024, true, true)
 
+// ---------------------------------------------------------------- mix in two wide dispatches (decode / verify)
+// The single-threadgroup mix above is latency bound: its threads walk all states and run 5 barriers (15 us a
+// call). Here: mix2_red, one threadgroup of 1024 per (state b, row t), reduces sum(x_b^2) and x_b . q with the
+// thread / simdgroup grouping of attn_residual_mix_1024 (same sums); mix2_out, one thread per (element, row),
+// computes inv, the softmax weights and the output with the same formulas.
+struct Mix2Params {
+  uint T, D, nb, nq;
+  uint dt[8];
+};
+kernel void mix2_red(device const void* s0 [[buffer(0)]], device const void* s1 [[buffer(1)]],
+                     device const void* s2 [[buffer(2)]], device const void* s3 [[buffer(3)]],
+                     device const void* s4 [[buffer(4)]], device const void* s5 [[buffer(5)]],
+                     device const void* s6 [[buffer(6)]], device const void* s7 [[buffer(7)]],
+                     device const float* query [[buffer(8)]], device float* red [[buffer(9)]],
+                     constant Mix2Params& p [[buffer(10)]], uint2 tg [[threadgroup_position_in_grid]],
+                     uint tid [[thread_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]],
+                     uint sg [[simdgroup_index_in_threadgroup]]) {
+  threadgroup float part[32][5];
+  uint b = tg.x, t = tg.y;
+  device const void* st[8] = {s0, s1, s2, s3, s4, s5, s6, s7};
+  uint base = t * p.D;
+  float acc[5] = {0, 0, 0, 0, 0};
+  for (uint i = tid; i < p.D; i += 1024) {
+    float v = ldv(st[b], p.dt[b], base + i);
+    acc[0] = fma(v, v, acc[0]);
+    for (uint q = 0; q < p.nq; q++) acc[1 + q] = fma(v, query[q * p.D + i], acc[1 + q]);
+  }
+  for (uint j = 0; j <= p.nq; j++) {
+    float v = simd_sum(acc[j]);
+    if (lane == 0) part[sg][j] = v;
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (tid <= p.nq) {
+    float v = 0;
+    for (uint i = 0; i < 32; i++) v += part[i][tid];
+    red[(t * 8 + b) * 5 + tid] = v;
+  }
+}
+kernel void mix2_out(device const void* s0 [[buffer(0)]], device const void* s1 [[buffer(1)]],
+                     device const void* s2 [[buffer(2)]], device const void* s3 [[buffer(3)]],
+                     device const void* s4 [[buffer(4)]], device const void* s5 [[buffer(5)]],
+                     device const void* s6 [[buffer(6)]], device const void* s7 [[buffer(7)]],
+                     device const float* red [[buffer(8)]], device float* out [[buffer(9)]],
+                     constant Mix2Params& p [[buffer(10)]], uint2 gid [[thread_position_in_grid]]) {
+  uint i = gid.x, t = gid.y;
+  if (i >= p.D) return;
+  device const void* st[8] = {s0, s1, s2, s3, s4, s5, s6, s7};
+  float scale = metal::precise::rsqrt(float(p.D));
+  float inv[8], k[8];
+  for (uint b = 0; b < p.nb; b++) {
+    inv[b] = metal::precise::rsqrt(red[(t * 8 + b) * 5] / float(p.D) + 1e-6f);
+    k[b] = ldv(st[b], p.dt[b], t * p.D + i) * inv[b];
+  }
+  for (uint q = 0; q < p.nq; q++) {
+    float w[8];
+    float m = -INFINITY;
+    for (uint b = 0; b < p.nb; b++) {
+      float sc = red[(t * 8 + b) * 5 + 1 + q] * inv[b] * scale;
+      w[b] = sc;
+      m = max(m, sc);
+    }
+    float s = 0;
+    for (uint b = 0; b < p.nb; b++) {
+      float e = exp(w[b] - m);
+      w[b] = e;
+      s += e;
+    }
+    float o = 0;
+    for (uint b = 0; b < p.nb; b++) o += (w[b] / s) * k[b];
+    out[(q * p.T + t) * p.D + i] = o;
+  }
+}
+
 // ---------------------------------------------------------------- message controller
 // pair = bf16([rms(x), rms(m)]); h = bf16(pair @ down^T) (rank R); f = tanh(h @ forget^T); g = tanh(h @ gain^T)
 // out = (1-f)*x + g*m. One threadgroup (256) per token. x, m, out f32.
