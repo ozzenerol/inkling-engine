@@ -52,7 +52,7 @@ struct Context::Impl {
   id<MTLComputePipelineState> warm_pipe = nil;
   id<MTLBuffer> warm_buf = nil;
   std::atomic<double> last_activity{0};
-  double warm_secs = 300;
+  double warm_secs = 0;  // INK_WARM_SECS=300 to enable (off until tested on the GPU)
   std::thread warm_thread;
   int since_commit = 0;
   int commit_every = 128;

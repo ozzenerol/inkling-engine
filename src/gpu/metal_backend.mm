@@ -510,7 +510,7 @@ class MetalBackend final : public Backend {
     g_.set_value(3, p);
     g_.dispatch({T, 1, 1}, {256, 1, 1});
     linear(pair, down, h);
-    if (T > 16 && !getenv("INK_CTRL_SCALAR")) {
+    if (T > 16 && getenv("INK_CTRL_GEMM")) {  // opt-in until measured
       // prefill: forget/gain projections as GEMMs (K = 64), then an elementwise combine
       Tensor F = scratch("ctrl-F", DType::F32, {T, D}), G = scratch("ctrl-G", DType::F32, {T, D});
       linear(h, forget, F);

@@ -348,7 +348,7 @@ std::vector<int32_t> DSpark::draft_sample(int32_t anchor, int count, float tempe
 
 int64_t DSpark::vocab() const { return impl_->Vu; }
 
-const std::vector<float>& DSpark::q_row(int j) {
+const float* DSpark::q_row(int j) {
   auto& m = *impl_;
   if (!m.qbuf.valid()) m.qbuf = m.be.alloc(DType::F32, {m.Vu}, "dspark.q");
   SampleParams sp{uint32_t(m.Vu), 0, 0, uint32_t(j), 1.0f / m.last_temp, 0};
@@ -362,7 +362,7 @@ const std::vector<float>& DSpark::q_row(int j) {
   m.g.dispatch({cdiv(m.Vu, 256), 1, 1}, {256, 1, 1});
   m.be.sync();
   qrow_.assign(m.qbuf.data<float>(), m.qbuf.data<float>() + m.Vu);
-  return qrow_;
+  return qrow_.data();
 }
 
 std::vector<int32_t> DSpark::run(int32_t anchor, int count, float temperature, const float* uniforms,

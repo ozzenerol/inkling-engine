@@ -45,7 +45,7 @@ class DSpark {
   std::vector<int32_t> draft_sample(int32_t anchor, int count, float temperature, const float* uniforms,
                                     std::vector<float>* q_tok);
   // Full q_j row (vocab_unpadded floats) of the last draft_sample, computed on the host from the stored logits.
-  const std::vector<float>& q_row(int j);
+  const float* q_row(int j);
   int64_t vocab() const;
   int max_count() const { return block_ - 1; }
 
