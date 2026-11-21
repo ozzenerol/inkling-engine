@@ -20,3 +20,9 @@ for ids in copy edit p2; do
   cmp -s $OUT/a-$ids-plain.i32 $OUT/a-$ids-dspark.i32 && echo "$ids: lookup run token-identical to plain" || echo "$ids: lookup run DIFFERS from plain (T > 4 verify is not bit-identical to decode; check it is a near-tie)"
   echo "-- $ids temp 0.7: dspark"; env INK_SPEC_STATS=1 ./build/src/gpu/spec_check dspark ref_data/$ids.ids 400 4 $OUT/a-$ids-t07.i32 0.7 2>&1 | grep -E "tok/s|dspark:|lookup:"
 done
+# speculative sampling with a sharper proposal (fixed block so only the acceptance rule differs)
+for f in 0.25 0.5 0.75 1.0; do
+  echo "-- p2 temp 0.7 speculative sampling, proposal temperature x$f"
+  env INK_SPEC_STATS=1 INK_NO_LOOKUP=1 INK_SPEC_FIXED=1 INK_SPEC_SAMPLE=1 INK_SPEC_QTEMP=$f ./build/src/gpu/spec_check dspark ref_data/p2.ids 300 4 $OUT/a-q.i32 0.7 2>&1 | grep -E "tok/s|dspark:"
+done
+echo "-- p2 temp 0.7 compare, fixed block"; env INK_SPEC_STATS=1 INK_NO_LOOKUP=1 INK_SPEC_FIXED=1 ./build/src/gpu/spec_check dspark ref_data/p2.ids 300 4 $OUT/a-q.i32 0.7 2>&1 | grep -E "tok/s|dspark:"

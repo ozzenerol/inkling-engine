@@ -229,7 +229,10 @@ bool speculative_generate(Engine& e, Model& m, const SamplingParams& p, int max_
 #ifdef INK_DSPARK_HAS_SAMPLE
       float us[8];
       for (int j = 0; j < k; j++) us[j] = float(std::generate_canonical<double, 53>(s.rng));
-      drafts = d.draft_sample(b, k, p.temperature, us, &q_tok);
+      // The proposal may use any temperature: a sharper q (INK_SPEC_QTEMP, fraction of the target's) moves
+      // from 1 - TV(p, q) at equal temperature towards p(greedy draft) at 0; the best is in between.
+      static const float qf = getenv("INK_SPEC_QTEMP") ? float(atof(getenv("INK_SPEC_QTEMP"))) : 0.5f;
+      drafts = d.draft_sample(b, k, p.temperature * qf, us, &q_tok);
 #endif
     } else {
       drafts = d.draft(b, k);
