@@ -132,7 +132,7 @@ struct MrAttnParams {  // kernels/multirow.metal (D)
 struct GaParams {  // kernels/multirow_ga.metal (D)
   uint32_t T, H, KVH, cap, len, rel_extent, sr, sk, nblk, nsplit;
   float thr;
-  uint32_t use_sink, use_gate;
+  uint32_t use_sink, use_gate, causal;
 };
 struct RouterParams {
   uint32_t T, D, E, topk, dt_x;
@@ -919,7 +919,7 @@ class MetalBackend final : public Backend {
       const uint32_t tok = std::min<uint32_t>(ga_tok_, T == 1 ? 1 : T == 2 ? 2 : T <= 4 ? 4 : T <= 8 ? 8 : 16);
       const uint32_t groups = cdiv(T, tok), sr = 3 * T;
       GaParams p{T, H, KVH, uint32_t(a.kv.cap), len, uint32_t(a.rel_proj.dim(1)), sr, cdiv(nkeys, 64) * 64,
-                 cdiv(nkeys, 64), cdiv(nkeys, 512), ga_thr_, 1u, gate ? 1u : 0u};
+                 cdiv(nkeys, 64), cdiv(nkeys, 512), ga_thr_, 1u, gate ? 1u : 0u, 1u};
       // scratch sizes rounded up (16k keys, 12 rows) so they are regrown, with a sync, only rarely
       const uint32_t sra = cdiv(sr, 12) * 12, ska = cdiv(nkeys, 16384) * 16384;
       Tensor S = scratch("ga-s", DType::F32, {KVH * sra, ska});

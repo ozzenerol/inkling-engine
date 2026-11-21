@@ -22,6 +22,7 @@ struct GaParams {
   uint nsplit;   // 512-key splits
   float thr;     // p = 0 where S - M <= -thr
   uint use_sink, use_gate;
+  uint causal;   // 0: every query row sees all len + T keys (DSpark draft block)
 };
 constant float GA_SCALE = 0.08838834764831845f;
 
@@ -53,8 +54,8 @@ kernel void ga_scores(device const ushort* q [[buffer(0)]], device const ushort*
                                           : k_new + (size_t(kcl - p.len) * p.KVH + kvh) * 128;
     float kv[8];
     unpack_bf8(*(device const packed_uint4*)(kp + c * 8), kv);
-    const bool vis = key < nkeys && key <= qpos;
-    const uint dist = qpos - key;
+    const bool vis = key < nkeys && (!p.causal || key <= qpos);
+    const uint dist = qpos - key;  // used only when causal (rel_extent = 0 otherwise)
     for (uint rr = 0; rr < R; rr++) {
       float a = 0;
       for (uint i = 0; i < 8; i++) a = fma(qv[rr][i], kv[i], a);
@@ -65,7 +66,7 @@ kernel void ga_scores(device const ushort* q [[buffer(0)]], device const ushort*
       float sc = -INFINITY;
       if (vis) {
         sc = a * GA_SCALE;
-        if (dist < p.rel_extent) {
+        if (p.causal && dist < p.rel_extent) {
           float b = 0;
           for (uint d = 0; d < 16; d++)
             b = fma(bf2f(r[(t * p.H + kvh * R + rr) * 16 + d]), bf2f(rel_proj[d * p.rel_extent + dist]), b);

@@ -682,3 +682,43 @@ never measured: needs a tool with an idle gap before a request).
 
 Corrections on record: see "B: correction (fused decode ops were not wired)" above; my NOTES numbers from before
 batch 7 for those three fusions were for the unfused paths.
+
+## D: state at end of 2026-11-21
+
+**Default (measured, in main, gated by op_diff rows==T1 / verify==decode):**
+- One-pass matvec for 5..16 rows, bf16 and q8 (`mr_matvec`, `mr_matvec_q8`; linears, linear_multi, the output
+  head): INK_MR=0 restores passes of 4 rows.
+- Attention for 3..16 rows on the split kernel with K/V staged once for all rows (`mr_attn_split`), local and
+  global: INK_MR_ATTN=0 off, INK_MR_ATTN_MIN=n.
+- Expert-union MoE from 3 rows (`mr_moe_*`): INK_MR_MOE=0 off, INK_MR_MOE_MIN=n.
+- Fused mix + norm, wide mix and controller_multi up to 16 rows.
+- Effect with the model (batches 3-6, one run each): verify T=8 140.6 -> 74.1 ms, T=16 202.7 -> 130.1 ms (multi-row
+  dense + attention), copy task at lookup 15: 103.7 -> 138.9 tok/s with the union MoE; 8-bit copy 118.8 -> 128.7
+  with the q8 multi-row matvec. Every run token-identical to plain decoding.
+
+**Opt-in, measured model-free only:**
+- INK_GA=1: direct two-pass global attention for every T (see "D: long-context attention"). 128k per call: T=1
+  1.49 ms vs 2.98, T=2 1.79 vs 3.01, T=4 2.92 vs 3.81, T=8 5.67 vs 5.23, T=16 11.19 vs 11.74. With the model:
+  batch 9 (long32k / long128k, on and off); d.log not read yet.
+
+**Opt-in, built and kernel-checked, never run on the GPU:**
+- The drafter's global layer on the GA kernels (with INK_GA=1; INK_GA_DRAFT=0 keeps the split kernel).
+- INK_DSPARK_ROWS=1: the drafter block runs count + 1 rows instead of 8.
+- INK_MR_MAX=n (<= 64): prefill-only sizes 17..n through the verify kernels (dense in passes of 16, attention in
+  groups of 16 rows, union MoE lists of 64). Default 16. For 17..32-row verifies also Model::kMaxHist and the
+  op_diff row lists must go up (A).
+- INK_GA_THR=x: drop attention weights below exp(-x) of the row maximum and skip V blocks with none above it.
+
+**Known loose ends:** the q8 output head showed 14 ms per call over 2 calls in batch 6's profile (t8_r2 layout,
+possibly first touch): re-measure with bench_dense / bench_q8 on the head shape. `mr_matvec_multi` uses 4 rows per
+simdgroup at every size and q8 linear_multi above 4 rows goes matrix by matrix: neither measured against a variant.
+Bench-only kernels to delete once nobody needs them: the unused `mr_matvec` variants, `mr_attn_split_g6_abl*`,
+B's t8tg and skinny GEMMs (handed to me).
+
+**Next 3 steps (2026-11-22):**
+1. Read batch 9's d.log and tomorrow's first batch: decide INK_GA as default from the long128k end-to-end numbers;
+   judge INK_DSPARK_ROWS and the drafter on GA by tok/s and acceptance (A).
+2. The drafter at long context (17 ms per round at 126k, 6-8 ms at short context): profile it per kernel at 126k,
+   then cut rows / the head pass accordingly.
+3. Profile a 17..63-token read (prompt tail, small agent turn) and fix what is slow there besides attention
+   (A moved the attention GEMM down to 17 rows); INK_MR_MAX and bench_dense / bench_moe at 20..63 rows are ready.

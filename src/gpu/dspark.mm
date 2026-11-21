@@ -57,6 +57,11 @@ struct SampleParams {
 struct ArgmaxParams {
   uint32_t n, out_index;
 };
+struct GaParams {  // kernels/multirow_ga.metal (D)
+  uint32_t T, H, KVH, cap, len, rel_extent, sr, sk, nblk, nsplit;
+  float thr;
+  uint32_t use_sink, use_gate, causal;
+};
 struct AttnDecParams {
   uint32_t T, H, KVH, cap, len, ring, window, rel_extent, split_keys, nsplit, causal, first, use_sink, use_gate;
 };
@@ -86,7 +91,10 @@ struct DSpark::Impl {
   const Tensor &embed, &embed_norm, &head;
   // workspace
   Tensor mixed, kx, vx, tokens, e0, e1, x, xin, q, kb, vb, at, o, summed, res, post, gt, ut, a, h, base, frnn, cat,
-      ctxm, state, zero_state, latent, part, last_feat, apart, zbuf, stats, qbuf;
+      ctxm, state, zero_state, latent, part, last_feat, apart, zbuf, stats, qbuf, ga_s, ga_bmax, ga_m, ga_part;
+  // D: direct global attention (multirow_ga.metal) for the drafter's global layer: with INK_GA=1 unless
+  // INK_GA_DRAFT=0
+  bool ga = getenv("INK_GA") && getenv("INK_GA")[0] == '1' && !(getenv("INK_GA_DRAFT") && getenv("INK_GA_DRAFT")[0] == '0');
   float last_temp = 0;
 
   Impl(Backend& b, const Tensor& em, const Tensor& en, const Tensor& hd) : be(b), embed(em), embed_norm(en), head(hd) {}
@@ -114,6 +122,60 @@ struct DSpark::Impl {
   // Bidirectional attention of T block rows over the layer's context KV plus the block's own keys.
   void attend(Layer& l, const Tensor& qt, const Tensor& kn, const Tensor& vn, int64_t T, Tensor& out) {
     uint32_t len = uint32_t(l.kv.len);
+    if (ga && !l.local && !l.kv.ring && T <= 16) {
+      // D: the global layer through the direct two-pass kernels (K and V read once from device memory, no staging;
+      // at 126k the split kernel made a draft round cost 17 ms). Drafts only change speed, so no identity rule here.
+      const uint32_t Tu = uint32_t(T), nkeys = len + Tu, sr = 3 * Tu;
+      const uint32_t tok = Tu == 1 ? 1 : Tu == 2 ? 2 : Tu <= 4 ? 4 : Tu <= 8 ? 8 : 16;
+      GaParams p{Tu, uint32_t(H), uint32_t(KVH), uint32_t(l.kv.cap), len, 0u, sr, cdiv(nkeys, 64) * 64,
+                 cdiv(nkeys, 64), cdiv(nkeys, 512), 1e30f, 0u, 0u, 0u};
+      const int64_t ska = int64_t(cdiv(nkeys, 16384)) * 16384, sra = 48;
+      if (ga_s.numel() < int64_t(KVH) * sr * ska) {
+        be.sync();
+        for (Tensor* t : {&ga_s, &ga_bmax, &ga_m, &ga_part})
+          if (t->valid()) be.free(*t);
+        ga_s = be.alloc(DType::F32, {KVH * sra, ska}, "dspark.ga_s");
+        ga_bmax = be.alloc(DType::F32, {KVH * sra, ska / 64}, "dspark.ga_bmax");
+        ga_m = be.alloc(DType::F32, {KVH * sra}, "dspark.ga_m");
+        ga_part = be.alloc(DType::F32, {KVH * (ska / 512) * sra, 132}, "dspark.ga_part");
+      }
+      pipe("ga_scores");
+      bind(0, qt);
+      bind(1, kn);
+      bind(2, qt);  // r, rel_proj unused (rel_extent 0)
+      bind(3, qt);
+      bind(4, l.kv.k);
+      bind(5, ga_s);
+      bind(6, ga_bmax);
+      g.set_value(7, p);
+      g.set_value(8, tok);
+      g.dispatch({p.nblk, uint32_t(KVH), cdiv(Tu, tok)}, {32 * tok, 1, 1});
+      pipe("ga_rowmax");
+      bind(0, ga_bmax);
+      bind(1, qt);  // sink unused
+      bind(2, ga_m);
+      g.set_value(3, p);
+      g.dispatch({sr, uint32_t(KVH), 1}, {32, 1, 1});
+      pipe("ga_pv");
+      bind(0, ga_s);
+      bind(1, ga_bmax);
+      bind(2, ga_m);
+      bind(3, vn);
+      bind(4, l.kv.v);
+      bind(5, ga_part);
+      g.set_value(6, p);
+      g.set_value(7, tok);
+      g.dispatch({p.nsplit, uint32_t(KVH), cdiv(Tu, tok)}, {32 * tok, 1, 1});
+      pipe("ga_combine");
+      bind(0, ga_part);
+      bind(1, ga_m);
+      bind(2, qt);
+      bind(3, out);
+      bind(4, out);
+      g.set_value(5, p);
+      g.dispatch({Tu, uint32_t(H), 1}, {128, 1, 1});
+      return;
+    }
     uint32_t first = (l.local && len > window) ? uint32_t(len - window) : 0;
     uint32_t nkeys = len + uint32_t(T) - first;
     uint32_t split_keys = 512;
@@ -380,7 +442,30 @@ std::vector<int32_t> DSpark::run(int32_t anchor, int count, float temperature, c
   const bool sampled = temperature > 0.0f && uniforms;
   m.last_temp = temperature;
   count = std::min(count, block_ - 1);
-  const int64_t B = block_;
+  // D: INK_DSPARK_ROWS=count+1 runs the block with only the rows asked for (anchor + count masks) instead of
+  // the full block of 8: fewer rows through the 3 layers and the global attention. The drafts change (the mask
+  // rows attend to each other), so this is a speed / acceptance trade to measure.
+  static const bool rows_by_count = getenv("INK_DSPARK_ROWS") != nullptr;
+  const int64_t B = rows_by_count ? std::min<int64_t>(block_, count + 1) : block_;
+  auto rows = [&](const Tensor& t) {
+    Tensor v = t;
+    v.set_shape({B, t.dim(-1)});
+    return v;
+  };
+  Tensor w_x = rows(m.x);
+  Tensor w_xin = rows(m.xin);
+  Tensor w_q = rows(m.q);
+  Tensor w_kb = rows(m.kb);
+  Tensor w_vb = rows(m.vb);
+  Tensor w_at = rows(m.at);
+  Tensor w_o = rows(m.o);
+  Tensor w_summed = rows(m.summed);
+  Tensor w_res = rows(m.res);
+  Tensor w_post = rows(m.post);
+  Tensor w_gt = rows(m.gt);
+  Tensor w_ut = rows(m.ut);
+  Tensor w_a = rows(m.a);
+  Tensor w_h = rows(m.h);
   m.be.write(m.tokens, &anchor, 4);
   Tensor t0 = view(m.tokens, {1});
   m.be.embed(t0, m.embed, m.e0);
@@ -390,7 +475,7 @@ std::vector<int32_t> DSpark::run(int32_t anchor, int count, float temperature, c
     m.pipe("dspark_block_init");
     m.bind(0, m.e1);
     m.bind(1, m.mask);
-    m.bind(2, m.x);
+    m.bind(2, w_x);
     m.g.set_bytes(3, nd, sizeof(nd));
     m.g.dispatch({cdiv(m.D, 256), uint32_t(B), 1}, {256, 1, 1});
   }
@@ -398,41 +483,41 @@ std::vector<int32_t> DSpark::run(int32_t anchor, int count, float temperature, c
   for (size_t i = 0; i < m.L.size(); i++) {
     auto& l = m.L[i];
     if (i == 0) {
-      m.be.copy(m.x, m.res);
-      m.be.rms_norm(m.x, &l.in_ln, m.eps, m.D, m.xin);
+      m.be.copy(w_x, w_res);
+      m.be.rms_norm(w_x, &l.in_ln, m.eps, m.D, w_xin);
     } else {
-      m.be.add(m.x, m.res, m.summed);
-      m.be.cast(m.summed, m.res);
-      m.be.rms_norm(m.summed, &l.in_ln, m.eps, m.D, m.xin);
+      m.be.add(w_x, w_res, w_summed);
+      m.be.cast(w_summed, w_res);
+      m.be.rms_norm(w_summed, &l.in_ln, m.eps, m.D, w_xin);
     }
-    m.be.linear(m.xin, l.q, m.q);
-    m.be.linear(m.xin, l.k, m.kb);
-    m.be.linear(m.xin, l.v, m.vb);
-    Tensor q3 = view(m.q, {B, m.H, m.HD}), k3 = view(m.kb, {B, m.KVH, m.HD}), v3 = view(m.vb, {B, m.KVH, m.HD});
+    m.be.linear(w_xin, l.q, w_q);
+    m.be.linear(w_xin, l.k, w_kb);
+    m.be.linear(w_xin, l.v, w_vb);
+    Tensor q3 = view(w_q, {B, m.H, m.HD}), k3 = view(w_kb, {B, m.KVH, m.HD}), v3 = view(w_vb, {B, m.KVH, m.HD});
     m.be.rms_norm(q3, &l.qn, m.eps, m.HD, q3);
     m.be.rms_norm(k3, &l.kn, m.eps, m.HD, k3);
     m.rope(q3, B, m.H, pos0);
     m.rope(k3, B, m.KVH, pos0);
-    m.attend(l, q3, k3, v3, B, m.at);
-    m.be.linear(m.at, l.o, m.o);
-    m.be.add(m.o, m.res, m.summed);
-    m.be.rms_norm(m.summed, &l.post_ln, m.eps, m.D, m.post);
-    m.be.linear(m.post, l.gate, m.gt);
-    m.be.linear(m.post, l.up, m.ut);
+    m.attend(l, q3, k3, v3, B, w_at);
+    m.be.linear(w_at, l.o, w_o);
+    m.be.add(w_o, w_res, w_summed);
+    m.be.rms_norm(w_summed, &l.post_ln, m.eps, m.D, w_post);
+    m.be.linear(w_post, l.gate, w_gt);
+    m.be.linear(w_post, l.up, w_ut);
     uint32_t n = uint32_t(B * m.I);
     m.pipe("dspark_silu_mul");
-    m.bind(0, m.gt);
-    m.bind(1, m.ut);
-    m.bind(2, m.a);
+    m.bind(0, w_gt);
+    m.bind(1, w_ut);
+    m.bind(2, w_a);
     m.g.set_value(3, n);
     m.g.dispatch({cdiv(n, 256), 1, 1}, {256, 1, 1});
-    m.be.linear(m.a, l.down, m.x);
-    m.be.cast(m.summed, m.res);
+    m.be.linear(w_a, l.down, w_x);
+    m.be.cast(w_summed, w_res);
   }
-  m.be.add(m.x, m.res, m.summed);
-  m.be.rms_norm(m.summed, &m.norm, m.eps, m.D, m.h);
+  m.be.add(w_x, w_res, w_summed);
+  m.be.rms_norm(w_summed, &m.norm, m.eps, m.D, w_h);
   // rows 1..count
-  Tensor hc = m.h;
+  Tensor hc = w_h;
   hc.set_shape({count, m.D});
   hc.offset += size_t(m.D) * 2;
   Tensor base = view(m.base, {count, m.V});

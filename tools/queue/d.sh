@@ -1,24 +1,26 @@
-# D: long-context attention, INK_GA=1 (direct global attention) vs the split kernels, with the model.
+# D: drafter on the direct attention kernels, drafter block with count+1 rows (INK_DSPARK_ROWS=1), INK_GA.
 B=./build/gpu
 SC=./build/src/gpu/spec_check
 M8=~/llm/mlx-models/Inkling-2-Mini-MLX-8bit
 echo "-- op_diff with INK_GA=1"; INK_GA=1 $B/op_diff 2>&1 | grep -E "FAIL|ALL"
-for ids in long128k long32k; do
-  [ -f ref_data/$ids.ids ] || continue
-  for v in "" "INK_GA=1"; do
-    echo "-- 8-bit, $ids, temp 0.7, 300 tokens, dspark block 8, ${v:-split kernels}"
-    env INK_MODEL=$M8 INK_Q8_KERNELS=1 INK_SPEC_STATS=1 $v $SC dspark ref_data/$ids.ids 300 8 $OUT/d-$ids-t07${v:+-ga}.i32 0.7 2>&1 | grep -E "tok/s|dspark:|lookup:|adaptive"
+for ids in p2 p0; do
+  for t in "" 0.7; do
+    for v in "" "INK_DSPARK_ROWS=1"; do
+      echo "-- lossless, $ids, ${t:-greedy}, block 8, drafter rows: ${v:-8 (default)}"
+      env INK_SPEC_STATS=1 $v $SC dspark ref_data/$ids.ids 300 8 $OUT/d-$ids${v:+-rows}.i32 $t 2>&1 | grep -E "tok/s|dspark:|adaptive"
+    done
+    [ -z "$t" ] && { cmp -s $OUT/d-$ids.i32 $OUT/d-$ids-rows.i32 && echo "$ids greedy: count+1 rows token-identical to 8 rows" || echo "$ids greedy: count+1 rows DIFFERS (must not: drafts only change speed)"; }
   done
 done
-# identity: greedy, plain vs dspark, both with INK_GA=1 (lossless build, 32k)
-if [ -f ref_data/long32k.ids ]; then
-  for mode in plain dspark; do
-    echo "-- lossless, long32k greedy $mode, INK_GA=1"
-    env INK_GA=1 INK_SPEC_STATS=1 $SC $mode ref_data/long32k.ids 200 8 $OUT/d-l32-$mode-ga.i32 2>&1 | grep -E "tok/s|dspark:|adaptive"
+if [ -f ref_data/long128k.ids ]; then
+  for v in "INK_GA=1" "INK_GA=1 INK_GA_DRAFT=0" "INK_GA=1 INK_DSPARK_ROWS=1"; do
+    echo "-- 8-bit, long128k, temp 0.7, 300 tokens, dspark block 8, $v"
+    env INK_MODEL=$M8 INK_Q8_KERNELS=1 INK_SPEC_STATS=1 $v $SC dspark ref_data/long128k.ids 300 8 $OUT/d-l128.i32 0.7 2>&1 | grep -E "tok/s|dspark:|lookup:|adaptive"
   done
-  cmp -s $OUT/d-l32-plain-ga.i32 $OUT/d-l32-dspark-ga.i32 && echo "long32k INK_GA=1: dspark token-identical to plain" || echo "long32k INK_GA=1: dspark DIFFERS from plain"
-  echo "-- lossless, long32k greedy plain, split kernels"
-  env INK_SPEC_STATS=1 $SC plain ref_data/long32k.ids 200 8 $OUT/d-l32-plain.i32 2>&1 | grep -E "tok/s"
-  cmp -s $OUT/d-l32-plain.i32 $OUT/d-l32-plain-ga.i32 && echo "long32k: INK_GA=1 same tokens as the split kernels" || echo "long32k: INK_GA=1 tokens differ from the split kernels (other summation order; near-tie expected)"
 fi
-echo "-- bench_mrattn INK_GA=1 / split"; INK_GA=1 $B/bench_mrattn 1 2 4 8 16 | grep -v local; $B/bench_mrattn 1 2 4 8 16 | grep -v local
+if [ -f ref_data/long32k.ids ]; then
+  for v in "INK_GA=1" "INK_GA=1 INK_DSPARK_ROWS=1"; do
+    echo "-- 8-bit, long32k, temp 0.7, 300 tokens, dspark block 8, $v"
+    env INK_MODEL=$M8 INK_Q8_KERNELS=1 INK_SPEC_STATS=1 $v $SC dspark ref_data/long32k.ids 300 8 $OUT/d-l32.i32 0.7 2>&1 | grep -E "tok/s|dspark:|lookup:|adaptive"
+  done
+fi
