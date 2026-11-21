@@ -32,7 +32,8 @@ if runs:
         cells = []
         for l in labels:
             r = row[l]
-            cells += [str(r.get("prefill_tps", "fail")) if r else "-", str(r.get("gen_tps", "fail")) if r else "-"]
+            mark = "*" if r and r.get("source") == "BRIEF" else ""
+            cells += [str(r.get("prefill_tps", "fail")) + mark if r else "-", str(r.get("gen_tps", "fail")) + mark if r else "-"]
         for l in others:
             a, b = row[l], row["mlx"]
             for k in ("prefill_tps", "gen_tps"):
@@ -41,8 +42,11 @@ if runs:
                 except Exception:
                     cells.append("-")
         print(f"| {ctx / 1000:.1f}k | " + " | ".join(cells) + " |")
+    if any(r.get("source") == "BRIEF" for l in labels for r in runs[l]):
+        print("\n\\* from BRIEF.md's MLX table (same script and settings, not re-measured today)")
     print()
 ag = sorted(glob.glob(os.path.join(d, "agent-*.json")))
 if ag:
     print("agent_bench (qh system prompt + tools, ~800-token tool result per turn, temp 0, thinking on)\n")
+    sys.stdout.flush()
     subprocess.run([sys.executable, os.path.join(os.path.dirname(__file__), "agent_bench.py"), "--report", *ag])

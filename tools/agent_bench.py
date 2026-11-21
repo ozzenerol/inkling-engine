@@ -80,7 +80,7 @@ def run_turn(url, model, messages, tools, max_tokens, temperature):
 def bench(args):
     fx = json.load(open(FIX))
     models = json.load(urllib.request.urlopen(args.url + "/v1/models"))["data"]
-    model = next((m["id"] for m in models if m["id"].startswith("/")), models[0]["id"])
+    model = next((m["id"] for m in models if m["id"].startswith("/")), models[0]["id"] if models else args.model)
     messages = [{"role": "system", "content": fx["system"]}]
     if args.base_tokens:
         messages.append({"role": "user", "content": "Earlier I pasted the whole old version of the project, for "
@@ -152,6 +152,8 @@ def main():
     ap.add_argument("--base-tokens", type=int, default=0, help="extra context before the task, in ~tokens")
     ap.add_argument("--max-tokens", type=int, default=512)
     ap.add_argument("--temperature", type=float, default=0.0)
+    ap.add_argument("--model", default=os.path.expanduser("~/llm/mlx-models/Inkling-2-Mini-MLX-4-8bit"),
+                    help="model id when /v1/models lists none (MLX before its first load)")
     ap.add_argument("--out")
     ap.add_argument("--report", nargs="+")
     args = ap.parse_args()
