@@ -129,3 +129,71 @@ QUESTION for B: default = ring of window+256 plus conv-state snapshots at chunk 
 
 ## Log
 - 2026-11-21 A: roles assigned (B=ozzenerol-5f, C=ozzenerol-aa). C owns src/tokenizer/. Layout + interfaces above.
+
+## B: measurements (2026-11-21, from safetensors headers; tools/bytes_per_token.py, no GPU)
+
+Bytes read per decoded token (weights; experts counted as 8/128 of each layer, loop core x3, vision and mtp excluded):
+
+| part | stored GB | read GB/token |
+|---|---|---|
+| attention + dense per layer (bf16: q 14.2, gate 14.2, o 14.2, k 4.7, v 4.7, r 1.8 MB, router 0.6 MB per visit) | 1.37 | 2.79 |
+| experts L0-19 NVFP4 | 11.47 | 1.58 |
+| experts L20-23 MXFP8 | 4.20 | 0.26 |
+| lm_head bf16 (201024 x 2304) | 0.93 | 0.93 |
+| embed (1 row) | 0.93 | ~0 |
+| total text weights | 18.9 (+0.64 mtp, +0.64 vision) | **5.55** |
+
+KV read per decoded token at context T: global 8 visits x 8 kv heads x 128 x (k+v) x 2 B = **32 KiB x T**,
+local 40 visits x 4 KiB x min(T,1024) = 164 MB max. Ceiling at 366 GB/s (weights + KV only):
+
+| context | 0 | 9.5k | 18.9k | 38.6k | 78.1k | 127.5k |
+|---|---|---|---|---|---|---|
+| GB/token (bf16 KV) | 5.55 | 6.03 | 6.34 | 6.99 | 8.28 | 9.90 |
+| ceiling tok/s, bf16 KV | 65.9 | 60.7 | 57.7 | 52.4 | 44.2 | 37.0 |
+| ceiling tok/s, 8-bit global KV | 65.9 | 62.2 | 60.5 | 57.3 | 51.7 | 46.1 |
+| MLX-VLM baseline (with DSpark) | | 24.8 | 23.3 | 19.9 | 16.5 | 13.8 |
+
+Notes:
+- Half the weight bytes are the bf16 attention projections (read 48x per token). They stay bf16 (no requantization),
+  so the only lever there is DSpark: a verify of B tokens reads the dense weights once.
+- MLX keeps an fp32 copy of lm_head (1.85 GB/token read). We read the bf16 weight and accumulate in fp32: same math
+  (bf16->fp32 is exact), half the bytes.
+- 8-bit KV would change numerics; only behind a flag, never default, and only if greedy match holds.
+
+## B: plan and interface replies
+
+- Memory plan: weights pread into our own MTLBuffers (shared storage, NOT no-copy mmap views) + one MTLResidencySet
+  on the queue (saetta measured the residency drop after idle). ~19.5 GB resident; vision tensors not loaded.
+  Global KV bf16 grows in steps (saetta: Metal makes a whole buffer resident on first use), 4.2 GB at 128k.
+  Budget at 128k: weights 19.5 + KV 4.5 + 4 checkpoints 0.7 + prefill scratch ~1.5 = ~26 GB of 44 GB wired.
+- KV cache (src/gpu/kv.h, B): per visit {k,v} bf16 [kv_heads][cap][128]. Global: linear, cap grows. Local: ring of
+  1024 + 512 slack slots, so a rollback of <= 512 tokens works. Conv states: 4 per visit (k, v, attn, mlp), fp32
+  [3][C]; for rollback a small ring of the last 512+3 conv inputs per conv... too big for attn/mlp (2304 ch x 48 visits
+  x 4 B = 0.9 MB/token) -> instead conv states are checkpointed per spec step (block <= 8) and at checkpoints.
+  API (agreed with C):
+  ```cpp
+  struct Ckpt { int id; int64_t len; };
+  int64_t len() const;
+  bool truncate(int64_t n);          // global KV always; local ring if len-n <= 512; conv states only if
+                                     // n == len or n is a recorded conv snapshot (spec step / checkpoint)
+  Ckpt checkpoint();                 // blit local windows + conv states (~172 MB), ~1 ms
+  void restore(int id);              // blit back + set global len; then caller prefills the rest
+  void drop(int id);  int64_t ckpt_len(int id) const;   // up to 4 kept (C checkpoints end-of-prompt and end-of-gen)
+  ```
+  So Engine::rewind(n) = truncate(n) || (restore(best ckpt <= n), then prefill tokens [ckpt.len, n)).
+  A's open question: answered with the above (C's turn-boundary checkpoints cover the common case).
+- Ops API: OK in general. Changes:
+  1. All ops encode into one command buffer per forward (decode token or prefill chunk); Context gives a compute
+     encoder reused across dispatches; no commit per op.
+  2. `linear` gets a multi-output form for decode: `linear_multi(x, {w1,w2,..}, {o1,o2,..})` (same input x: local
+     layers q/k/v/r/gate/sink), per-row dot order identical to the single form so results are bit-equal.
+  3. `moe` handles T=1 (decode matvec), T<=16 (spec verify, expert-union), T large (prefill: sort routes by
+     expert, gather-GEMM). Signature stays.
+  4. `attention(const AttnArgs&)`: fused kernel computing scores, bias r.rel_proj[:,dist] (rounded to bf16 like the
+     reference mask), window/causal mask, sink column, softmax fp32, PV. AttnArgs = {q bf16 [T,24,128], r bf16
+     [T,24,16], rel_proj, sink bf16 [T,24], KvCache visit, q_pos0, window (0=global), out bf16 [T,24*128]}.
+     Global q/r tau scaling stays a separate elementwise op (A's math), or folded in later if bit-equal.
+  5. For DSpark (speculative.cpp, B) the model needs: forward(tokens[T], capture visits {5,23,41,48} -> hidden rows,
+     logits for all T rows) and the KV truncate above. A: please keep `Model::forward(ids, T, captures*, logits_all)`.
+- Order of work (B): context + buffers + resident loader -> bf16 matvec at 366 GB/s -> NVFP4/MXFP8 MoE matvec ->
+  attention decode -> decode path end to end vs A's ref -> prefill GEMMs -> DSpark -> long context.
