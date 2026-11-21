@@ -13,3 +13,8 @@ for ids in copy p2; do
     cmp -s $OUT/a-$ids-plain.i32 $OUT/d-$ids-$mx.i32 && echo "$ids lookup max $mx: token-identical to plain" || echo "$ids lookup max $mx: DIFFERS from plain (or no plain run in this batch)"
   done
 done
+# expert-union MoE (T >= 5): model-free bench with random routes (the least sharing there can be), new vs old
+for T in 4 5 8 12 16; do
+  echo "-- bench_moe T=$T union"; ./build/gpu/bench_moe $T | grep layer
+  echo "-- bench_moe T=$T per route (INK_MR_MOE=0)"; INK_MR_MOE=0 ./build/gpu/bench_moe $T | grep layer
+done
