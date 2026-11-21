@@ -2,6 +2,10 @@
 # One GPU test batch on the main checkout (integrator: A). See tools/WORKFLOW.md.
 #   tools/batch.sh [gates] [queues] [full]     default: gates queues
 cd "$(dirname "$0")/.."
+# Never test a half-merged or edited tree: everything must be committed (the user's rule: merge, then test).
+if [ -n "$(git status --porcelain --untracked-files=no)" ]; then
+  echo "batch refused: the main checkout has uncommitted or unmerged files:"; git status --short --untracked-files=no; exit 1
+fi
 N=$(( $(ls -d bench/batch-* 2>/dev/null | wc -l) + 1 ))
 OUT=bench/batch-$N; mkdir -p $OUT
 what=${*:-gates queues}
