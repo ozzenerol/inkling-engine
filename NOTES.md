@@ -589,3 +589,19 @@ Also: batch 5's "q8 matvec 795 GB/s" came from zero-filled weights in bench_q8 a
   state: B tests INTERLEAVE and INK_BUSY in batch 7). 8-bit verify: T=1 24.3 ms, T=2 33.3 (the 4-row matvec
   template computed 4 rows at T=2: B adds 2-row kernels), T=3 36.8, T=4 42.4.
 - **Target (user, 21:00): 60 tok/s at the start of the context, 40 tok/s at 128k.** See tools/WORKFLOW.md.
+- **Target relaxed (user, 21:20): "even 40 tok/s at the beginning and 20-30 at the end is fine, as long as each
+  prompt is read fast".** Priority is now prefill (read tok/s, time to first token).
+- **Batch 7** (main b5799a2, 21:06-21:35): all gates pass. C's depth bench (8-bit server, one growing conversation
+  of essay requests, temp 0.7, 400 tokens per turn, one run):
+
+  | prompt tokens | 1.2k | 9.6k | 39k | 79k | 127k |
+  |---|---|---|---|---|---|
+  | gen tok/s | 39.0 | 38.8 | 31.0 | 26.0 | 22.7 |
+  | read tok/s (new tokens / TTFT) | 724 | 792 | 658 | 504 | 384 |
+
+  Agent bench 8-bit: median gen 65.1, copy scenario 87.1, median TTFT 1.35 s; qh e2e PASS in 20 s.
+  A: 8-bit, temp 0.7, spec_check: p2 43.0 tok/s; long32k 31.2 (plain step 31.8 ms, T=2 37.1, T=4 50.2, prefill
+  489 tok/s); long64k 26.7 (prefill 436).
+  B: fused decode ops finally wired (FUSE2): tokens identical, 43.5 vs 42.9 tok/s on 8-bit (+1.4%) -> default;
+  2-row matvec kernels: T=2 verify 29.2 vs 32.8 ms, 49.4 vs 45.3 tok/s -> kept; INK_BUSY background load: no
+  effect at any level (the "GPU performance state" hypothesis for the 3x in-model dense gap is refuted).
