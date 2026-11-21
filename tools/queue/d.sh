@@ -1,14 +1,29 @@
-# D: 8-bit build with the q8 one-pass matvec for 5..16 rows, on and off (INK_MR=0 also turns the bf16 one off).
+# D: long-context attention. Two-pass global attention without staging (INK_GA=1) vs the split kernels.
+B=./build/gpu
 SC=./build/src/gpu/spec_check
-M8=~/llm/mlx-models/Inkling-2-Mini-MLX-8bit
-for ids in copy p2; do
-  for v in "" "INK_MR=0"; do
-    echo "-- 8-bit build, $ids greedy, block 8, lookup max 15, ${v:-q8 multi-row on}"
-    env INK_MODEL=$M8 INK_Q8_KERNELS=1 INK_SPEC_STATS=1 INK_LOOKUP_MAX=15 $v $SC dspark ref_data/$ids.ids 400 8 $OUT/d-q8-$ids${v:+-old}.i32 2>&1 | grep -E "tok/s|dspark:|lookup:|verify"
+echo "-- op_diff with INK_GA=1 (attention vs CPU, verify==decode through the new kernels)"
+INK_GA=1 $B/op_diff 2>&1 | grep -E "attention|verify==decode|FAIL|ALL"
+echo "-- bench_mrattn, split kernels (current default)"; $B/bench_mrattn 1 2 4 8 16 | grep -v local
+echo "-- bench_mrattn, INK_GA=1"; INK_GA=1 $B/bench_mrattn 1 2 4 8 16 | grep -v local
+echo "-- bench_mrattn, INK_GA=1, K pass only (INK_GA_NOPV=1)"; INK_GA=1 INK_GA_NOPV=1 $B/bench_mrattn 1 4 16 | grep -v local
+if [ -f ref_data/long32k.ids ]; then
+  for v in "" "INK_GA=1"; do
+    for mode in plain dspark; do
+      echo "-- long32k greedy $mode ${v:-split kernels}"
+      env INK_SPEC_STATS=1 $v $SC $mode ref_data/long32k.ids 200 8 $OUT/d-l32-$mode${v:+-ga}.i32 2>&1 | grep -E "tok/s|dspark:|verify"
+    done
+    cmp -s $OUT/d-l32-plain${v:+-ga}.i32 $OUT/d-l32-dspark${v:+-ga}.i32 && echo "long32k ${v:-split}: dspark token-identical to plain" || echo "long32k ${v:-split}: dspark DIFFERS from plain"
   done
-  cmp -s $OUT/d-q8-$ids.i32 $OUT/d-q8-$ids-old.i32 && echo "8-bit $ids: q8 multi-row token-identical to passes of 4" || echo "8-bit $ids: q8 multi-row DIFFERS from passes of 4"
+  cmp -s $OUT/d-l32-plain.i32 $OUT/d-l32-plain-ga.i32 && echo "long32k: INK_GA=1 same tokens as the split kernels" || echo "long32k: INK_GA=1 tokens differ from the split kernels (other summation order; check it is a near-tie)"
+fi
+echo "-- bench_mrattn, INK_GA=1, groups of 2 tokens (INK_GA_TOK=2)"; INK_GA=1 INK_GA_TOK=2 $B/bench_mrattn 4 8 | grep -v local
+# Prefill-only sizes T = 17..63 (prompt tails, small agent turns): current paths vs the verify kernels in passes
+for v in "" "INK_MR_MAX=64"; do
+  echo "-- T = 20 32 48 63, ${v:-current paths (GEMMs, attn_prefill, moe_prefill)}"
+  env $v $B/bench_dense 16 20 32 48 63
+  env $v $B/bench_mrattn 20 32 48 63 | grep -E "len=(2048|32768) "
+  for T in 20 32 48 63; do env $v $B/bench_moe $T | grep layer; done
 done
-echo "-- lossless, p2, block 8, per-kernel GPU time (drafter kernels and verify at T = 8)"
-env INK_PROFILE=1 INK_SPEC_STATS=1 INK_NO_LOOKUP=1 $SC dspark ref_data/p2.ids 100 8 $OUT/d-prof.i32 2>&1 | grep -E "tok/s|dspark:|kernel profile|us/call" | head -45
-echo "-- 8-bit, copy, lookup 15, per-kernel GPU time (is q8 linear_multi above 4 rows worth one dispatch?)"
-env INK_MODEL=$M8 INK_Q8_KERNELS=1 INK_PROFILE=1 INK_SPEC_STATS=1 INK_LOOKUP_MAX=15 $SC dspark ref_data/copy.ids 100 8 $OUT/d-prof8.i32 2>&1 | grep -E "kernel profile|us/call" | head -30
+echo "-- T = 20 32 48 63 attention: INK_GA=1 INK_MR_MAX=64, and attn_gemm from 17 rows (INK_AG_MIN_T=17)"
+INK_GA=1 INK_MR_MAX=64 $B/bench_mrattn 20 32 48 63 | grep -E "len=(2048|32768) .*global"
+INK_AG_MIN_T=17 $B/bench_mrattn 20 32 48 63 | grep -E "len=(2048|32768) "

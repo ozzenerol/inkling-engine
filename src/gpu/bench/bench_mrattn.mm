@@ -1,6 +1,7 @@
 // Attention at verify sizes (T = 1..16) through MetalBackend::attention. Owner: D.
 //   bench_mrattn                 multi-row kernel for T = 5..16
 //   INK_MR_ATTN=0 bench_mrattn   previous path (attn_prefill) for T = 5..16
+//   INK_GA=1 bench_mrattn        two-pass global attention without staging (INK_GA_NOPV=1: K pass only)
 //   INK_MR_ABL=1|2|4|7 bench_mrattn 16   timing ablations of the 16-row kernel (no rel bias / no PV / no exp)
 #include <algorithm>
 #include <cstdio>
@@ -21,7 +22,7 @@ int main(int argc, char** argv) {
   for (int i = 1; i < argc; i++) Ts.push_back(atoll(argv[i]));
   if (Ts.empty()) Ts = {1, 4, 5, 8, 12, 16};
   struct Case { int64_t len; int window; };
-  for (Case c : {Case{2048, 0}, Case{32768, 0}, Case{131072, 0}, Case{131072, 1024}})
+  for (Case c : {Case{2048, 0}, Case{32768, 0}, Case{65536, 0}, Case{131072, 0}, Case{131072, 1024}})
     for (int64_t T : Ts) {
       Tensor q = be->alloc(DType::BF16, {T, 24, 128}, "q"), kn = be->alloc(DType::BF16, {T, 8, 128}, "kn"),
              vn = be->alloc(DType::BF16, {T, 8, 128}, "vn"), r = be->alloc(DType::BF16, {T, 24, 16}, "r"),
