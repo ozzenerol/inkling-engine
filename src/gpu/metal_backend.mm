@@ -365,6 +365,21 @@ class MetalBackend final : public Backend {
   }
   void linear_q8(const Tensor& x, const Tensor& w, Tensor& out, uint32_t T, uint32_t N, uint32_t K) {
     auto& sb = affine_of(w);
+    if (T > 4 && T <= 16 && mr_ && K % 64 == 0) {
+      // D: one pass over the codes for 5..16 rows; every row equals the 1-row q8 matvec bit for bit
+      const uint32_t R = mr_q8_r_ ? mr_q8_r_ : (T <= 8 ? 2u : 4u);  // INK_MR_Q8_R: bench only
+      Q8Params qp{N, K, T, K, N};
+      pipe(std::string("mr_matvec_q8_") + dtn(x.dtype) + "_" + dtn(out.dtype) + (T <= 8 ? "_t8_r" : "_t16_r") +
+           std::to_string(R) + "_s2");
+      bind(0, w);
+      bind(1, sb.first);
+      bind(2, sb.second);
+      bind(3, x);
+      bind(4, out);
+      g_.set_value(5, qp);
+      g_.dispatch({cdiv(N, 2 * R), 1, 1}, {64, 1, 1});
+      return;
+    }
     if (T <= 16) {
       for (uint32_t t0 = 0; t0 < T; t0 += 4) {
         uint32_t tt = std::min<uint32_t>(4, T - t0);
@@ -1384,6 +1399,7 @@ class MetalBackend final : public Backend {
   // D: expert-union MoE from this many rows (INK_MR_MOE=0 off, INK_MR_MOE_MIN=n). With random routes (almost no
   // sharing below 8 rows) it costs ~22 us more per call at T = 2 and breaks even at 4; real rows share 21% of the
   // routes at T = 2 and 33-41% at T = 3-4 (INK_MOE_STATS), so 3 until T = 2 is measured with the model.
+  uint32_t mr_q8_r_ = getenv("INK_MR_Q8_R") ? uint32_t(atoi(getenv("INK_MR_Q8_R"))) : 0;
   bool mr_moe_ = !(getenv("INK_MR_MOE") && getenv("INK_MR_MOE")[0] == '0');
   uint32_t mr_moe_min_ = getenv("INK_MR_MOE_MIN") ? uint32_t(atoi(getenv("INK_MR_MOE_MIN"))) : 3;
   bool moe_stats_ = getenv("INK_MOE_STATS") != nullptr;

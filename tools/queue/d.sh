@@ -14,3 +14,13 @@ env INK_PROFILE=1 INK_SPEC_STATS=1 INK_NO_LOOKUP=1 $SC dspark ref_data/p2.ids 10
 for T in 2 3 4 8 16; do
   echo "-- bench_moe T=$T union from 2 / per route (random routes)"; INK_MR_MOE_MIN=2 ./build/gpu/bench_moe $T | grep layer; INK_MR_MOE=0 ./build/gpu/bench_moe $T | grep layer
 done
+# q8 one-pass matvec for 5..16 rows (8-bit build): bench_q8 new (2 or 4 rows per simdgroup) vs passes of 4
+for T in 4 5 8 16; do
+  for v in "INK_MR_Q8_R=2" "INK_MR_Q8_R=4" "INK_MR=0"; do echo "-- bench_q8 T=$T $v"; env INK_Q8_KERNELS=1 $v ./build/gpu/bench_q8 $T; done
+done
+M8=~/llm/mlx-models/Inkling-2-Mini-MLX-8bit
+for v in "" "INK_MR=0"; do
+  echo "-- 8-bit build, copy greedy, block 8, lookup max 15, ${v:-q8 multi-row on}"
+  env MODEL=$M8 INK_MODEL=$M8 INK_Q8_KERNELS=1 INK_SPEC_STATS=1 INK_LOOKUP_MAX=15 $v $SC dspark ref_data/copy.ids 400 8 $OUT/d-q8${v:+-old}.i32 2>&1 | grep -E "tok/s|dspark:|lookup:|verify"
+done
+cmp -s $OUT/d-q8.i32 $OUT/d-q8-old.i32 && echo "8-bit: multi-row q8 token-identical to passes of 4" || echo "8-bit: multi-row q8 DIFFERS from passes of 4 (or the model path variable is not the one spec_check reads)"
