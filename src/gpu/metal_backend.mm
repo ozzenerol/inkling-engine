@@ -1307,9 +1307,11 @@ class MetalBackend final : public Backend {
   // rows from which the multi-row attention kernel is used. 3: it is bit-identical to attn_decode_split and at
   // T = 3, 4 faster (32k global: 1.11 ms vs 1.94; 128k: 3.8 vs 6.8), at T <= 2 equal.
   uint32_t mr_attn_min_ = getenv("INK_MR_ATTN_MIN") ? uint32_t(atoi(getenv("INK_MR_ATTN_MIN"))) : 3;
-  // D: expert-union MoE from this many rows (INK_MR_MOE=0 off, INK_MR_MOE_MIN=n)
+  // D: expert-union MoE from this many rows (INK_MR_MOE=0 off, INK_MR_MOE_MIN=n). With random routes (almost no
+  // sharing below 8 rows) it costs ~22 us more per call at T = 2 and breaks even at 4; real rows share 21% of the
+  // routes at T = 2 and 33-41% at T = 3-4 (INK_MOE_STATS), so 3 until T = 2 is measured with the model.
   bool mr_moe_ = !(getenv("INK_MR_MOE") && getenv("INK_MR_MOE")[0] == '0');
-  uint32_t mr_moe_min_ = getenv("INK_MR_MOE_MIN") ? uint32_t(atoi(getenv("INK_MR_MOE_MIN"))) : 5;
+  uint32_t mr_moe_min_ = getenv("INK_MR_MOE_MIN") ? uint32_t(atoi(getenv("INK_MR_MOE_MIN"))) : 3;
   bool moe_stats_ = getenv("INK_MOE_STATS") != nullptr;
   long moe_calls_[17] = {}, moe_routes_[17] = {}, moe_uniq_[17] = {};
   bool mr_attn_ = !(getenv("INK_MR_ATTN") && getenv("INK_MR_ATTN")[0] == '0');  // D: 5..16-row attention

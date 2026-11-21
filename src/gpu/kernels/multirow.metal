@@ -419,6 +419,22 @@ inline float mr_dot_fp4_32(uint4 w, thread const float* x, float s0, float s1) {
     for (uint i = 0; i < 8; i++) b = fma(x[j * 8 + i], fp4h((ws[j] >> (4 * i)) & 15u), b);
   return a * s0 + b * s1;
 }
+// The same dot with the 32 codes already decoded (fp4h values as half): a row that shares the expert with an
+// earlier row costs 32 fma instead of 32 decodes + 32 fma. Same values, same order as mr_dot_fp4_32.
+inline void mr_dec_fp4_32(uint4 w, thread half* h) {
+  uint ws[4] = {w.x, w.y, w.z, w.w};
+  for (uint j = 0; j < 4; j++)
+    for (uint i = 0; i < 8; i++) {
+      uint nib = (ws[j] >> (4 * i)) & 15u;
+      h[j * 8 + i] = as_type<half>(ushort(((nib & 8u) << 12) | ((nib & 7u) << 9)));
+    }
+}
+inline float mr_dot_h32(thread const half* h, thread const float* x, float s0, float s1) {
+  float a = 0, b = 0;
+  for (uint i = 0; i < 16; i++) a = fma(x[i], float(h[i]), a);
+  for (uint i = 16; i < 32; i++) b = fma(x[i], float(h[i]), b);
+  return a * s0 + b * s1;
+}
 inline float mr_dot_fp8_16(uint4 w, thread const float* x) {
   float a = 0;
   uint ws[4] = {w.x, w.y, w.z, w.w};
@@ -465,11 +481,14 @@ kernel void mr_moe_gateup(device const uint4* gw [[buffer(0)]], device const uch
         const uint4 gwc = gr[c], uwc = ur[c];
         const float gs0 = e4m3_scale(gsc & 255u), gs1 = e4m3_scale(gsc >> 8);
         const float us0 = e4m3_scale(usc & 255u), us1 = e4m3_scale(usc >> 8);
+        half hg[32], hu[32];
+        mr_dec_fp4_32(gwc, hg);
+        mr_dec_fp4_32(uwc, hu);
         for (uint q = 0; q < nr; q++) {
           float xv[32];
           mr_ldbf32(x + (rt[q] / p.topk) * p.K + c * 32, xv);
-          g[q] += mr_dot_fp4_32(gwc, xv, gs0, gs1);
-          u[q] += mr_dot_fp4_32(uwc, xv, us0, us1);
+          g[q] += mr_dot_h32(hg, xv, gs0, gs1);
+          u[q] += mr_dot_h32(hu, xv, us0, us1);
         }
       }
     } else {
@@ -546,10 +565,12 @@ kernel void mr_moe_down(device const uint4* dw [[buffer(0)]], device const uchar
         const uint sc = sr[c];
         const uint4 wc = wr[c];
         const float s0 = e4m3_scale(sc & 255u), s1 = e4m3_scale(sc >> 8);
+        half hw[32];
+        mr_dec_fp4_32(wc, hw);
         for (uint q = 0; q < nr; q++) {
           float xv[32];
           mr_ldbf32(a + size_t(rt[q]) * p.K + c * 32, xv);
-          d[q] += mr_dot_fp4_32(wc, xv, s0, s1);
+          d[q] += mr_dot_h32(hw, xv, s0, s1);
         }
       }
     } else {
