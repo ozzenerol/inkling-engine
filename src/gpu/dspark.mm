@@ -7,6 +7,7 @@
 #include <cstdio>
 #include <cstring>
 #include <stdexcept>
+#include <unistd.h>
 
 #include "core/bf16.h"
 #include "core/safetensors.h"
@@ -144,8 +145,25 @@ DSpark::DSpark(Backend& be, const std::string& dir, const Tensor& embed, const T
   auto& m = *impl_;
   m.max_ctx = max_ctx;
   m.max_rows = max_rows;
+  // mtp.safetensors next to the model; the 8-bit build ships without it, so fall back to INK_MTP_DIR or the
+  // sibling 4-8bit build (the drafter is bf16 and identical across builds).
+  std::string mtp = dir + "/mtp.safetensors";
+  auto exists = [](const std::string& f) { return access(f.c_str(), R_OK) == 0; };
+  if (!exists(mtp)) {
+    std::vector<std::string> alts;
+    if (const char* e = getenv("INK_MTP_DIR")) alts.push_back(std::string(e) + "/mtp.safetensors");
+    std::string parent = dir.substr(0, dir.find_last_of('/'));
+    alts.push_back(parent + "/Inkling-2-Mini-MLX-4-8bit/mtp.safetensors");
+    for (auto& a : alts)
+      if (exists(a)) {
+        mtp = a;
+        break;
+      }
+    if (!exists(mtp)) throw std::runtime_error("no mtp.safetensors (set INK_MTP_DIR)");
+    fprintf(stderr, "dspark: using %s\n", mtp.c_str());
+  }
   SafeTensors st;
-  st.add_file(dir + "/mtp.safetensors");
+  st.add_file(mtp);
   auto W = [&](const std::string& n) { return be.load_weight(st.at(n)); };
   const int nl = 3;
   const bool local[3] = {true, false, true};  // mtp_config.local_layer_ids = [0, 2]
