@@ -52,3 +52,9 @@ if(EXISTS ${INK_CPU_BACKEND})
   target_compile_options(op_diff PRIVATE $<$<COMPILE_LANGUAGE:OBJCXX>:-fobjc-arc>)
   set_target_properties(op_diff PROPERTIES OBJCXX_STANDARD 20 CXX_STANDARD 20)
 endif()
+
+# spec_check needs the engine (top-level build only).
+if(NOT INK_GPU_STANDALONE)
+  add_executable(spec_check test/spec_check.cpp)
+  target_link_libraries(spec_check PRIVATE inkcore)
+endif()
