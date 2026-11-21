@@ -206,7 +206,8 @@ int main(int argc, char** argv) {
   struct AttnCase { int local; int64_t T, cap, len; };
   for (AttnCase cs : {AttnCase{0, 3, 4096, 1500}, AttnCase{1, 2, 1536, 2000}, AttnCase{0, 1, 4096, 0},
                       AttnCase{0, 1, 40000, 37000}, AttnCase{1, 1, 1536, 700}, AttnCase{1, 4, 1536, 1030},
-                      AttnCase{0, 9, 4096, 3000}, AttnCase{1, 40, 1536, 1500}}) {
+                      AttnCase{0, 9, 4096, 3000}, AttnCase{1, 40, 1536, 1500}, AttnCase{0, 77, 4096, 0},
+                      AttnCase{0, 300, 8192, 5000}, AttnCase{1, 300, 1536, 2100}, AttnCase{1, 1100, 1536, 0}}) {
     int local = cs.local;
     int64_t T = cs.T, cap = cs.cap, len = cs.len;
     auto q = make(DType::BF16, {T, 24, 128}, 0.5f), kn = make(DType::BF16, {T, 8, 128}, 0.5f),

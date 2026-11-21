@@ -380,6 +380,21 @@ class MetalBackend final : public Backend {
     }
     AttnParams p{T, H, KVH, uint32_t(a.kv.cap), uint32_t(a.kv.len), a.kv.ring ? 1u : 0u, uint32_t(a.window),
                  uint32_t(a.rel_proj.dim(1))};
+    if (H == 3 * KVH && !getenv("INK_ATTN_SLOW")) {
+      pipe("attn_prefill");
+      bind(0, a.q);
+      bind(1, a.k_new);
+      bind(2, a.v_new);
+      bind(3, a.r);
+      bind(4, a.rel_proj);
+      bind(5, a.sink);
+      bind(6, a.kv.k.valid() ? a.kv.k : a.k_new);
+      bind(7, a.kv.v.valid() ? a.kv.v : a.v_new);
+      bind(8, out);
+      g_.set_value(9, p);  // same layout as AttnPreParams
+      g_.dispatch({cdiv(T, 32), KVH, 1}, {384, 1, 1});
+      return;
+    }
     pipe("attention_generic");
     bind(0, a.q);
     bind(1, a.k_new);
