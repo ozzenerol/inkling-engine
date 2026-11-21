@@ -26,6 +26,36 @@ inline float dot_fp4_32(uint4 w, threadgroup const float* x, float s0, float s1)
     for (uint i = 0; i < 8; i++) b = fma(x[j * 8 + i], fp4h((ws[j] >> (4 * i)) & 15u), b);
   return a * s0 + b * s1;
 }
+// Same values and the same fma order as dot_fp4_32, but the 4 codes of each 16-bit piece are decoded with vector
+// ops (one half4 -> float4 conversion per 4 codes). Bit-identical result; measured variant (INK_FP4_VEC).
+inline float4 fp4h4(uint piece) {  // 4 nibbles (low first) of a 16-bit piece -> values * 2^-14
+  uint4 n = (uint4(piece) >> uint4(0, 4, 8, 12)) & 15u;
+  ushort4 hb = ushort4(((n & 8u) << 12) | ((n & 7u) << 9));
+  return float4(as_type<half4>(hb));
+}
+inline float dot_fp4_32_vec(uint4 w, threadgroup const float* x, float s0, float s1) {
+  float a = 0, b = 0;
+  uint ws[4] = {w.x, w.y, w.z, w.w};
+  for (uint j = 0; j < 2; j++)
+    for (uint h = 0; h < 2; h++) {
+      float4 f = fp4h4(ws[j] >> (16 * h));
+      threadgroup const float* xp = x + j * 8 + h * 4;
+      a = fma(xp[0], f.x, a);
+      a = fma(xp[1], f.y, a);
+      a = fma(xp[2], f.z, a);
+      a = fma(xp[3], f.w, a);
+    }
+  for (uint j = 2; j < 4; j++)
+    for (uint h = 0; h < 2; h++) {
+      float4 f = fp4h4(ws[j] >> (16 * h));
+      threadgroup const float* xp = x + j * 8 + h * 4;
+      b = fma(xp[0], f.x, b);
+      b = fma(xp[1], f.y, b);
+      b = fma(xp[2], f.z, b);
+      b = fma(xp[3], f.w, b);
+    }
+  return a * s0 + b * s1;
+}
 // dot of 16 e4m3 codes with x[0..15]
 inline float dot_fp8_16(uint4 w, threadgroup const float* x) {
   float a = 0;
@@ -64,7 +94,7 @@ constant uint GU_SIMDS = 4;  // simdgroups per threadgroup in gate/up (4 rows ea
 // MODE 0 = NVFP4, 1 = MXFP8. Grid: (ceil(N / (4*GU_SIMDS)), routes). x bf16 [T, K]; a bf16 [routes, N].
 // RPS rows per simdgroup (32 / RPS lanes per row). RPS = 4 is the default layout; 2 and 1 are measured variants
 // (a different lane layout sums in a different order: decode and verify kernels must use the same one).
-template <uint MODE, uint RPS = 4>
+template <uint MODE, uint RPS = 4, bool VEC = false>
 kernel void moe_gateup(device const uint4* gw [[buffer(0)]], device const uchar* gs [[buffer(1)]],
                        device const float* gg [[buffer(2)]], device const uint4* uw [[buffer(3)]],
                        device const uchar* us [[buffer(4)]], device const float* ug [[buffer(5)]],
@@ -95,8 +125,13 @@ kernel void moe_gateup(device const uint4* gw [[buffer(0)]], device const uchar*
     for (uint c = sub; c < chunks; c += LPR) {
       uint gsc = gsr[c], usc = usr[c];
       threadgroup const float* xc = xs + c * 33;
-      g += dot_fp4_32(gr[c], xc, e4m3_scale(gsc & 255u), e4m3_scale(gsc >> 8));
-      u += dot_fp4_32(ur[c], xc, e4m3_scale(usc & 255u), e4m3_scale(usc >> 8));
+      if (VEC) {
+        g += dot_fp4_32_vec(gr[c], xc, e4m3_scale(gsc & 255u), e4m3_scale(gsc >> 8));
+        u += dot_fp4_32_vec(ur[c], xc, e4m3_scale(usc & 255u), e4m3_scale(usc >> 8));
+      } else {
+        g += dot_fp4_32(gr[c], xc, e4m3_scale(gsc & 255u), e4m3_scale(gsc >> 8));
+        u += dot_fp4_32(ur[c], xc, e4m3_scale(usc & 255u), e4m3_scale(usc >> 8));
+      }
     }
   } else {
     uint chunks = p.K / 16;
@@ -177,17 +212,18 @@ kernel void moe_down(device const uint4* dw [[buffer(0)]], device const uchar* d
   if (lane == 0) out[size_t(t) * p.N + n] = f2bf(s);
 }
 
-#define GU_INST(NAME, M, R)                                                                                    \
-  template [[host_name(NAME)]] kernel void moe_gateup<M, R>(                                                   \
+#define GU_INST(NAME, M, R, V)                                                                                 \
+  template [[host_name(NAME)]] kernel void moe_gateup<M, R, V>(                                                   \
       device const uint4*, device const uchar*, device const float*, device const uint4*, device const uchar*, \
       device const float*, device const ushort*, device const int*, device ushort*, constant MoeFastParams&,   \
       uint2, uint, uint, uint);
-GU_INST("moe_gateup_nvfp4", 0, 4)
-GU_INST("moe_gateup_mxfp8", 1, 4)
-GU_INST("moe_gateup_nvfp4_r2", 0, 2)
-GU_INST("moe_gateup_mxfp8_r2", 1, 2)
-GU_INST("moe_gateup_nvfp4_r1", 0, 1)
-GU_INST("moe_gateup_mxfp8_r1", 1, 1)
+GU_INST("moe_gateup_nvfp4", 0, 4, false)
+GU_INST("moe_gateup_nvfp4_vec", 0, 4, true)
+GU_INST("moe_gateup_mxfp8", 1, 4, false)
+GU_INST("moe_gateup_nvfp4_r2", 0, 2, false)
+GU_INST("moe_gateup_mxfp8_r2", 1, 2, false)
+GU_INST("moe_gateup_nvfp4_r1", 0, 1, false)
+GU_INST("moe_gateup_mxfp8_r1", 1, 1, false)
 template [[host_name("moe_down_nvfp4")]] kernel void moe_down<0>(device const uint4*, device const uchar*,
                                                                   device const float*, device const ushort*,
                                                                   device const int*, device const float*,
