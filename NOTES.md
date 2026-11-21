@@ -453,3 +453,27 @@ head 0.93 -> 0.48). Check script: tests/ref/check_8bit_layout.py (tensor-by-tens
   so all four are in one accuracy class; GEMM vs flash attention shows no systematic difference (same median),
   and the 8-bit build is not measurably worse than the lossless one on this set. Prefill of the 6224-token prompt:
   8.5 s (731 tok/s).
+
+## D: multi-row forwards, T = 5..16 (2026-11-21 night, model-free benches, one run each)
+
+- **Where the T >= 5 cliff was**: above 4 rows attention went to `attn_prefill`, 8 threadgroups for the whole
+  context: 2.16 ms per call at 2k global (T = 8 or 16), 32 ms at 32k. Dense: passes of 4 rows, W reread per pass.
+- **Attention** (`mr_attn_split` / `mr_attn_combine`, kernels/multirow.metal): B's splits, block walk and per-row
+  arithmetic; one simdgroup per (8-row group, block parity), K/V tile staged once per parity for all rows.
+  Per call, new vs old: 2k global T=8 0.226 ms vs 2.164, T=16 0.248 vs 2.166; 32k global T=5 1.12, T=8 1.43 vs 32.2,
+  T=16 3.07 vs 32.4; 128k global T=8 5.2, T=16 11.8; local T=16 0.229. Also faster than `attn_decode_split` at 3-4
+  rows (32k: 1.11 vs 1.94 ms; 128k: 3.81 vs 6.8) and equal at 1-2, so it is the default from 3 rows
+  (INK_MR_ATTN_MIN, INK_MR_ATTN=0 = off).
+- **Dense** (`mr_matvec`, one pass over W, x rows walked one at a time with the weight chunks held): 2.58 GB of
+  attention projections: T=5 9.7 ms, T=8 10.1, T=16 18.1 (passes of 4: 12.6 / 12.9 / 20.8; 1 row 7.8). Output head
+  0.92 GB: T=5 2.37 ms, T=8 2.65, T=16 4.24 (passes of 4: 4.70 / 4.73 / 9.54). Best layout: 2 output rows per
+  simdgroup up to 8 rows, 4 above. A loop over only the rows present (no unrolling) is slower (22-32 ms at 16).
+  Above 8 rows it is compute bound. Not better: skinny2 21.2 ms at 8 rows, 28.0 at 16; t8tg 81 ms at 8 rows.
+  `mr_matvec_multi` (linear_multi, controller_multi) uses 4 rows per simdgroup for both sizes; unmeasured.
+- **Bit identity** (op_diff): "linear rows==T1" (linear, linear_multi, bf16/f32 in and out) and "verify==decode"
+  (global, local ring) at T = 4, 5, 8, 11, 16: all rows equal. Fused mix+norm, wide mix and controller_multi now run
+  up to 16 rows (the 256-thread mix reduces in another order than the 1024-thread one used for decode).
+- **MoE**: not touched. Cost is per route (T=4 449 us per call vs 136 at T=1, B), so a T-row verify costs at least
+  plain + (T-1) x ~6.8 ms unless rows share experts.
+- Switches: INK_MR=0 (dense passes of 4), INK_MR_ATTN=0, INK_MR_ATTN_MIN=n.
+- Open: forward times per T with the model (queue d), drafter 8 ms -> 3 ms, a 12-row dense variant, q8 multi-row.
