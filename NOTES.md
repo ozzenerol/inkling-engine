@@ -579,3 +579,13 @@ mix+norm); the op_diff "prep" / "conv_add" cases compared primitives with primit
 the unfused paths. The overrides now exist behind INK_FUSE2=1 and are unmeasured until a batch runs
 tools/queue/b.sh (exact op_diff cases, attention_gated identity, decode off vs on, DSpark identity).
 Also: batch 5's "q8 matvec 795 GB/s" came from zero-filled weights in bench_q8 and is not a read measurement.
+- **Batch 6** (main 73d0183, 20:45-21:05; stopped by A during C's full sweep): gates pass. D's q8 multi-row: 8-bit
+  copy 119-129 tok/s (118.8 without), token-identical. Parallel target sampling of verify rows in. C's cold sweep,
+  lossless build, temp 0.7 (prefill / gen tok/s): 1.2k 749 / 34.8, 9.5k 815 / 32.9, 18.9k 782 / 31.5, 38.6k
+  710 / 29.2, 78k 593 / 23.8 (MLX: 565 / 23.1, 602 / 24.2, 571 / 23.3, 495 / 22.0, 385 / 16.5).
+  B's 8-bit plain-step ablation (23.6 ms): MoE 7.5, dense 6.2, small ops 4.7, attention 3.0, mix 2.5, controllers
+  2.5, router 2.0, logits 1.5 ms; ~1200 dependent barriers per 1560 dispatches per token. The same q8 dense bytes
+  take 1.8 ms model-free (random codes): in-model they are 3x slower, cause open (dispatch gaps / GPU performance
+  state: B tests INTERLEAVE and INK_BUSY in batch 7). 8-bit verify: T=1 24.3 ms, T=2 33.3 (the 4-row matvec
+  template computed 4 rows at T=2: B adds 2-row kernels), T=3 36.8, T=4 42.4.
+- **Target (user, 21:00): 60 tok/s at the start of the context, 40 tok/s at 128k.** See tools/WORKFLOW.md.
