@@ -103,10 +103,12 @@ kernel void dspark_markov_step(device ushort* state [[buffer(0)]], device ushort
 struct FoldParams {
   uint V, R;
   float cap;
+  uint write_z;  // also store z (f32, bf16-rounded) for sampling
 };
 kernel void dspark_fold_argmax(device const ushort* latent [[buffer(0)]], device const ushort* fw [[buffer(1)]],
                                device const ushort* fb [[buffer(2)]], device const ushort* base [[buffer(3)]],
                                device float2* part [[buffer(4)]], constant FoldParams& p [[buffer(5)]],
+                               device float* zout [[buffer(6)]],
                                uint tg [[threadgroup_position_in_grid]], uint lane [[thread_index_in_simdgroup]],
                                uint sg [[simdgroup_index_in_threadgroup]]) {
   threadgroup float bv[8];
@@ -126,6 +128,7 @@ kernel void dspark_fold_argmax(device const ushort* latent [[buffer(0)]], device
     float l = round_bf(a + bf2f(fb[v]));
     float z = round_bf(bf2f(base[v]) + l);
     z = round_bf(p.cap * precise::tanh(z / p.cap));
+    if (p.write_z && lane == 0) zout[v] = z;
     if (z > best) {
       best = z;
       besti = v;
@@ -201,4 +204,75 @@ kernel void dspark_capture(device const void* src [[buffer(0)]], device ushort* 
   if (i >= p.D || t >= p.T) return;
   float v = p.dt_src == 0 ? ((device const float*)src)[t * p.D + i] : bf2f(((device const ushort*)src)[t * p.D + i]);
   dst[(size_t(t) * 4 + p.slot) * p.D + i] = f2bf(v);
+}
+
+// Sample one draft token from q = softmax(z / temp) over z[0..V) by inverse CDF with uniform u (one threadgroup of
+// 1024; thread i owns the contiguous chunk [i*C, (i+1)*C)). Writes tokens[out_index], stats[step] = (max, sum,
+// q(token)). Deterministic for a given u.
+struct SampleParams {
+  uint V, nparts, out_index, step;
+  float inv_temp, u;
+};
+kernel void dspark_sample_final(device const float* z [[buffer(0)]], device const float2* part [[buffer(1)]],
+                                device int* tokens [[buffer(2)]], device float* stats [[buffer(3)]],
+                                constant SampleParams& p [[buffer(4)]], uint tid [[thread_index_in_threadgroup]],
+                                uint lane [[thread_index_in_simdgroup]], uint sg [[simdgroup_index_in_threadgroup]]) {
+  threadgroup float red[32];
+  threadgroup float cum[1024];
+  threadgroup float M_tg;
+  // max from the fold partials
+  float m = -INFINITY;
+  for (uint i = tid; i < p.nparts; i += 1024) m = max(m, part[i].x);
+  m = simd_max(m);
+  if (lane == 0) red[sg] = m;
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (tid == 0) {
+    float mm = -INFINITY;
+    for (uint i = 0; i < 32; i++) mm = max(mm, red[i]);
+    M_tg = mm;
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  float M = M_tg;
+  uint C = (p.V + 1023) / 1024;
+  uint lo = tid * C, hi = min(lo + C, p.V);
+  float s = 0;
+  for (uint v = lo; v < hi; v++) s += exp((z[v] - M) * p.inv_temp);
+  cum[tid] = s;
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (tid == 0) {  // sequential prefix (1024 adds), deterministic
+    float a = 0;
+    for (uint i = 0; i < 1024; i++) {
+      a += cum[i];
+      cum[i] = a;
+    }
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  float total = cum[1023];
+  float target = p.u * total;
+  float before = tid == 0 ? 0.0f : cum[tid - 1];
+  bool mine = (target >= before && target < cum[tid]) || (tid == 1023 && target >= cum[1023]);
+  if (mine && hi > lo) {
+    float a = before;
+    uint tok = hi - 1;
+    for (uint v = lo; v < hi; v++) {
+      a += exp((z[v] - M) * p.inv_temp);
+      if (a > target) {
+        tok = v;
+        break;
+      }
+    }
+    tokens[p.out_index] = int(tok);
+    stats[p.step * 4 + 0] = M;
+    stats[p.step * 4 + 1] = total;
+    stats[p.step * 4 + 2] = exp((z[tok] - M) * p.inv_temp) / total;
+  }
+}
+
+// q row on the GPU with the exact arithmetic of dspark_sample_final: q[v] = exp((z[v] - M) * inv_temp) / S.
+kernel void dspark_qrow(device const float* z [[buffer(0)]], device const float* stats [[buffer(1)]],
+                        device float* q [[buffer(2)]], constant SampleParams& p [[buffer(3)]],
+                        uint v [[thread_position_in_grid]]) {
+  if (v >= p.V) return;
+  float M = stats[p.step * 4 + 0], S = stats[p.step * 4 + 1];
+  q[v] = exp((z[v] - M) * p.inv_temp) / S;
 }

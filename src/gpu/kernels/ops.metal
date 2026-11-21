@@ -830,3 +830,14 @@ kernel void short_conv4_par(device const ushort* x [[buffer(0)]], device const u
   }
   if (t + 3 >= p.T) state_out[(t + 3 - p.T) * p.C + c] = xv;  // last 3 inputs; T >= 3 guaranteed by the host
 }
+
+// Prefill controller output from GEMM results: out = (1 - tanh(F)) * x + tanh(G) * m, F/G f32 [T, D].
+kernel void ctrl_combine(device const float* x [[buffer(0)]], device const float* m [[buffer(1)]],
+                         device const float* F [[buffer(2)]], device const float* G [[buffer(3)]],
+                         device float* out [[buffer(4)]], constant CtrlParams& p [[buffer(5)]],
+                         uint i [[thread_position_in_grid]]) {
+  if (i >= p.T * p.D) return;
+  uint t = i / p.D, d = i % p.D;
+  float f = precise::tanh(F[i]), g = precise::tanh(G[i]);
+  out[i] = (1 - f) * x[i] + g * m[t * p.m_stride + d];
+}

@@ -67,3 +67,8 @@ inline void stv(device void* p, uint dt, uint i, float v) {
   else ((device ushort*)p)[i] = f2bf(v);
 }
 
+
+// Keep-warm tick (a few idle seconds make the next first dispatch wait ~270 ms; see saetta docs/BENCHMARK.md).
+kernel void warm_tick(device uint* x [[buffer(0)]], uint i [[thread_position_in_grid]]) {
+  if (i == 0) x[0] += 1;
+}

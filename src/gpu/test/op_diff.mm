@@ -168,8 +168,7 @@ int main(int argc, char** argv) {
     printf("%-28s %s\n", "mix+norm fused == separate", same ? "ok" : "FAIL");
     if (!same) fails++;
   }
-  {  // controller
-    int64_t T = 2;
+  for (int64_t T : {2, 40}) {  // controller (T = 40: prefill GEMM path)
     auto x = make(DType::F32, {T, D}), m = make(DType::F32, {4, T, D});
     auto dn = make(DType::BF16, {64, 2 * D}, 0.02f), fg = make(DType::BF16, {D, 64}, 0.1f),
          gn = make(DType::BF16, {D, 64}, 0.1f);

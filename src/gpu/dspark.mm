@@ -46,6 +46,11 @@ struct MarkovParams {
 struct FoldParams {
   uint32_t V, R;
   float cap;
+  uint32_t write_z;
+};
+struct SampleParams {
+  uint32_t V, nparts, out_index, step;
+  float inv_temp, u;
 };
 struct ArgmaxParams {
   uint32_t n, out_index;
@@ -79,7 +84,8 @@ struct DSpark::Impl {
   const Tensor &embed, &embed_norm, &head;
   // workspace
   Tensor mixed, kx, vx, tokens, e0, e1, x, xin, q, kb, vb, at, o, summed, res, post, gt, ut, a, h, base, frnn, cat,
-      ctxm, state, zero_state, latent, part, last_feat, apart;
+      ctxm, state, zero_state, latent, part, last_feat, apart, zbuf, stats, qbuf;
+  float last_temp = 0;
 
   Impl(Backend& b, const Tensor& em, const Tensor& en, const Tensor& hd) : be(b), embed(em), embed_norm(en), head(hd) {}
 
@@ -276,6 +282,8 @@ DSpark::DSpark(Backend& be, const std::string& dir, const Tensor& embed, const T
   m.latent = be.alloc(DType::BF16, {m.R}, "dspark.latent");
   m.part = be.alloc(DType::F32, {int64_t(cdiv(m.V, 32)), 2}, "dspark.part");
   m.last_feat = be.alloc(DType::BF16, {1, 4 * m.D}, "dspark.last");
+  m.zbuf = be.alloc(DType::F32, {B, m.Vu}, "dspark.z");
+  m.stats = be.alloc(DType::F32, {B, 4}, "dspark.stats");
   cap_ = be.alloc(DType::BF16, {rows, 4, m.D}, "dspark.capture");
 }
 
@@ -331,8 +339,37 @@ void DSpark::ingest(int64_t n) {
   ctx_len_ += n;
 }
 
-std::vector<int32_t> DSpark::draft(int32_t anchor, int count) {
+std::vector<int32_t> DSpark::draft(int32_t anchor, int count) { return run(anchor, count, 0.0f, nullptr, nullptr); }
+
+std::vector<int32_t> DSpark::draft_sample(int32_t anchor, int count, float temperature, const float* uniforms,
+                                          std::vector<float>* q_tok) {
+  return run(anchor, count, temperature, uniforms, q_tok);
+}
+
+int64_t DSpark::vocab() const { return impl_->Vu; }
+
+const std::vector<float>& DSpark::q_row(int j) {
   auto& m = *impl_;
+  if (!m.qbuf.valid()) m.qbuf = m.be.alloc(DType::F32, {m.Vu}, "dspark.q");
+  SampleParams sp{uint32_t(m.Vu), 0, 0, uint32_t(j), 1.0f / m.last_temp, 0};
+  Tensor zr = m.zbuf;
+  zr.offset += size_t(j) * m.Vu * 4;
+  m.pipe("dspark_qrow");
+  m.bind(0, zr);
+  m.bind(1, m.stats);
+  m.bind(2, m.qbuf);
+  m.g.set_value(3, sp);
+  m.g.dispatch({cdiv(m.Vu, 256), 1, 1}, {256, 1, 1});
+  m.be.sync();
+  qrow_.assign(m.qbuf.data<float>(), m.qbuf.data<float>() + m.Vu);
+  return qrow_;
+}
+
+std::vector<int32_t> DSpark::run(int32_t anchor, int count, float temperature, const float* uniforms,
+                                 std::vector<float>* q_tok) {
+  auto& m = *impl_;
+  const bool sampled = temperature > 0.0f && uniforms;
+  m.last_temp = temperature;
   count = std::min(count, block_ - 1);
   const int64_t B = block_;
   m.be.write(m.tokens, &anchor, 4);
@@ -423,7 +460,7 @@ std::vector<int32_t> DSpark::draft(int32_t anchor, int count) {
     m.g.set_value(6, mp);
     m.bind(7, m.rnn_b);
     m.g.dispatch({1, 1, 1}, {256, 1, 1});
-    FoldParams fp{uint32_t(m.Vu), uint32_t(m.R), m.cap};
+    FoldParams fp{uint32_t(m.Vu), uint32_t(m.R), m.cap, sampled ? 1u : 0u};
     m.pipe("dspark_fold_argmax");
     m.bind(0, m.latent);
     m.bind(1, m.fold_w);
@@ -433,18 +470,36 @@ std::vector<int32_t> DSpark::draft(int32_t anchor, int count) {
     m.bind(3, br);
     m.bind(4, m.part);
     m.g.set_value(5, fp);
+    Tensor zr = m.zbuf;
+    zr.offset += size_t(i) * m.Vu * 4;
+    m.bind(6, zr);
     m.g.dispatch({nparts, 1, 1}, {256, 1, 1});
-    ArgmaxParams ap{nparts, uint32_t(i + 1)};
-    m.pipe("dspark_argmax_final");
-    m.bind(0, m.part);
-    m.bind(1, m.tokens);
-    m.g.set_value(2, ap);
-    m.g.dispatch({1, 1, 1}, {1024, 1, 1});
+    if (sampled) {
+      SampleParams sp{uint32_t(m.Vu), nparts, uint32_t(i + 1), uint32_t(i), 1.0f / temperature, uniforms[i]};
+      m.pipe("dspark_sample_final");
+      m.bind(0, zr);
+      m.bind(1, m.part);
+      m.bind(2, m.tokens);
+      m.bind(3, m.stats);
+      m.g.set_value(4, sp);
+      m.g.dispatch({1, 1, 1}, {1024, 1, 1});
+    } else {
+      ArgmaxParams ap{nparts, uint32_t(i + 1)};
+      m.pipe("dspark_argmax_final");
+      m.bind(0, m.part);
+      m.bind(1, m.tokens);
+      m.g.set_value(2, ap);
+      m.g.dispatch({1, 1, 1}, {1024, 1, 1});
+    }
   }
   m.be.sync();
   std::vector<int32_t> out(size_t(count + 1));
   memcpy(out.data(), m.tokens.data<int32_t>(), out.size() * 4);
   out.erase(out.begin());
+  if (sampled && q_tok) {
+    q_tok->resize(size_t(count));
+    for (int i = 0; i < count; i++) (*q_tok)[i] = m.stats.data<float>()[i * 4 + 2];
+  }
   return out;
 }
 

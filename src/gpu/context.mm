@@ -8,6 +8,7 @@
 #include <unistd.h>
 
 #include <atomic>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <map>
@@ -21,6 +22,10 @@ namespace ink::gpu {
 [[noreturn]] static void die(const std::string& msg) {
   fprintf(stderr, "gpu: %s\n", msg.c_str());
   abort();
+}
+
+static double now_s() {
+  return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
 }
 
 static struct BarrierReport {
@@ -42,6 +47,13 @@ struct Context::Impl {
   id<MTLCommandBuffer> last = nil;
   std::map<std::string, size_t> by_tag;
   std::vector<id<MTLCommandBuffer>> pending;  // committed early, not yet waited
+  // keep-warm: a one-thread kernel on its own queue every 0.5 s for warm_secs after the last wait()
+  id<MTLCommandQueue> warm_queue = nil;
+  id<MTLComputePipelineState> warm_pipe = nil;
+  id<MTLBuffer> warm_buf = nil;
+  std::atomic<double> last_activity{0};
+  double warm_secs = 300;
+  std::thread warm_thread;
   int since_commit = 0;
   int commit_every = 128;
   bool concurrent = false;
@@ -84,6 +96,7 @@ Context::Context() : impl_(new Impl) {
     std::string all;
     for (auto& [name, src] : embedded_kernels()) all += "// ---- " + name + "\n" + src + "\n";
     if (const char* ce = getenv("INK_COMMIT_EVERY")) impl_->commit_every = atoi(ce);
+    if (const char* ws = getenv("INK_WARM_SECS")) impl_->warm_secs = atof(ws);
     impl_->concurrent = getenv("INK_CONCURRENT") != nullptr;
     impl_->smart = getenv("INK_SERIAL") == nullptr && !impl_->concurrent;
     g_barrier_report.b = &impl_->barriers;
@@ -395,6 +408,7 @@ void Context::wait() {
   if (impl_->last.status == MTLCommandBufferStatusError)
     die(std::string("command buffer failed: ") + [[impl_->last.error description] UTF8String]);
   last_gpu_ms_ = (impl_->last.GPUEndTime - first) * 1e3;  // wall time on the GPU across the pieces
+  impl_->last_activity = now_s();
   impl_->pending.clear();
   impl_->last = nil;
 }
@@ -402,6 +416,31 @@ void Context::wait() {
 void Context::commit_and_wait() {
   commit();
   wait();
+}
+
+void Context::keep_warm() {
+  impl_->last_activity = now_s();
+  if (impl_->warm_secs <= 0 || impl_->warm_queue) return;
+  impl_->warm_queue = [impl_->device newCommandQueue];
+  impl_->warm_pipe = (__bridge id<MTLComputePipelineState>)pipeline("warm_tick");
+  impl_->warm_buf = [impl_->device newBufferWithLength:16 options:MTLResourceStorageModeShared];
+  Impl* im = impl_;
+  im->warm_thread = std::thread([im] {
+    while (true) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(500));
+      if (now_s() - im->last_activity.load() > im->warm_secs) continue;
+      @autoreleasepool {
+        id<MTLCommandBuffer> cb = [im->warm_queue commandBuffer];
+        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+        [enc setComputePipelineState:im->warm_pipe];
+        [enc setBuffer:im->warm_buf offset:0 atIndex:0];
+        [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
+        [enc endEncoding];
+        [cb commit];
+      }
+    }
+  });
+  im->warm_thread.detach();
 }
 
 }  // namespace ink::gpu

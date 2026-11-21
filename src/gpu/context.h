@@ -65,6 +65,9 @@ class Context {
   void commit();            // submit, don't wait
   void wait();              // wait for last committed
   void commit_and_wait();   // both
+  // Keep the GPU clocked for INK_WARM_SECS (default 300) after the last wait(): a one-thread kernel on a separate
+  // queue every 0.5 s. Call once (e.g. when a server starts); idle GPUs otherwise add ~270 ms to the next request.
+  void keep_warm();
   double last_gpu_ms() const { return last_gpu_ms_; }  // GPU time of the last waited command buffer
 
   const std::string& device_name() const { return device_name_; }

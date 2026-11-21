@@ -154,3 +154,103 @@ kernel void moe_gemm(device const uint4* w [[buffer(0)]], device const uchar* sc
       uint2, uint, uint, uint);
 MG_INST(0, "moe_gemm_nvfp4")
 MG_INST(1, "moe_gemm_mxfp8")
+
+// v2: K steps of 64; the weight tile (64 rows x 64 values) is dequantized by all 128 threads (half a row each:
+// NVFP4 one uint4 = 32 codes + 2 scales; MXFP8 two uint4 = 32 codes + 1 scale); the A tile is 4 uint4 per thread.
+template <uint MODE>
+kernel void moe_gemm2(device const uint4* w [[buffer(0)]], device const uchar* sc [[buffer(1)]],
+                      device const float* gs [[buffer(2)]], device const ushort* a [[buffer(3)]],
+                      device const int* perm [[buffer(4)]], device const int* offsets [[buffer(5)]],
+                      device const uint2* tiles [[buffer(6)]], device const uint* tiles_n [[buffer(7)]],
+                      device ushort* out [[buffer(8)]], constant MoeGemmParams& p [[buffer(9)]],
+                      uint2 tg [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
+                      uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {
+  if (tg.y >= tiles_n[0]) return;
+  uint2 tile = tiles[tg.y];
+  uint e = tile.x, r0 = tile.y;
+  uint rend = uint(offsets[e + 1]);
+  uint n0 = tg.x * MG_N;
+  constexpr uint KS = 64, LDS = KS + 8;
+  threadgroup bfloat As[MG_M * LDS];
+  threadgroup bfloat Bs[MG_N * LDS];
+  threadgroup int arow[MG_M];
+  if (tid < MG_M) {
+    uint i = r0 + tid;
+    int src = -1;
+    if (i < rend) src = p.gather_a ? perm[i] / int(p.topk) : int(i);
+    arow[tid] = src;
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  uint sm = (sg / 2) * 32, sn = (sg % 2) * 32;
+  simdgroup_float8x8 acc[4][4];
+  for (uint i = 0; i < 4; i++)
+    for (uint j = 0; j < 4; j++) acc[i][j] = simdgroup_float8x8(0);
+  const uint rowbytes_q = MODE == 0 ? p.K / 2 : p.K;
+  // this thread's weight half-row
+  uint brow = tid / 2, bhalf = tid % 2;
+  uint bn = n0 + brow;
+  size_t wrow = size_t(e) * p.N + min(bn, p.N - 1);
+  for (uint k0 = 0; k0 < p.K; k0 += KS) {
+    for (uint i = tid; i < MG_M * KS / 8; i += 128) {
+      uint r = i / 8, c8 = (i % 8) * 8;
+      int src = arow[r];
+      uint4 v = uint4(0);
+      if (src >= 0) v = *(device const uint4*)(a + size_t(src) * p.K + k0 + c8);
+      *(threadgroup uint4*)(As + r * LDS + c8) = v;
+    }
+    {
+      uint kb = k0 + bhalf * 32;  // first of this thread's 32 values
+      threadgroup bfloat* dst = Bs + brow * LDS + bhalf * 32;
+      if (MODE == 0) {
+        uint4 q = w[(wrow * rowbytes_q + kb / 2) / 16];
+        ushort s2 = *(device const ushort*)(sc + wrow * (p.K / 16) + kb / 16);
+        float s0 = e4m3_to_f(s2 & 255u) * 16384.0f, s1 = e4m3_to_f(s2 >> 8) * 16384.0f;
+        uint ws[4] = {q.x, q.y, q.z, q.w};
+        for (uint j = 0; j < 4; j++) {
+          float s = j < 2 ? s0 : s1;
+          for (uint i = 0; i < 8; i++) dst[j * 8 + i] = bfloat(fp4h((ws[j] >> (4 * i)) & 15u) * s);
+        }
+      } else {
+        float s = e8m0_to_f(sc[wrow * (p.K / 32) + kb / 32]) * 256.0f;
+        for (uint hh = 0; hh < 2; hh++) {
+          uint4 q = w[(wrow * rowbytes_q + kb + hh * 16) / 16];
+          uint ws[4] = {q.x, q.y, q.z, q.w};
+          for (uint j = 0; j < 4; j++)
+            for (uint i = 0; i < 4; i++) dst[hh * 16 + j * 4 + i] = bfloat(fp8h((ws[j] >> (8 * i)) & 255u) * s);
+        }
+      }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint kk = 0; kk < KS; kk += 8) {
+      simdgroup_bfloat8x8 af[4], bf[4];
+      for (uint i = 0; i < 4; i++) simdgroup_load(af[i], As + (sm + i * 8) * LDS + kk, LDS);
+      for (uint j = 0; j < 4; j++) simdgroup_load(bf[j], Bs + (sn + j * 8) * LDS + kk, LDS, ulong2(0, 0), true);
+      for (uint i = 0; i < 4; i++)
+        for (uint j = 0; j < 4; j++) simdgroup_multiply_accumulate(acc[i][j], af[i], bf[j], acc[i][j]);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+  }
+  float gscale = MODE == 0 ? gs[e] : 1.0f;
+  threadgroup float Cs[4][64];
+  for (uint i = 0; i < 4; i++)
+    for (uint j = 0; j < 4; j++) {
+      simdgroup_store(acc[i][j], Cs[sg], 8);
+      simdgroup_barrier(mem_flags::mem_threadgroup);
+      for (uint el = lane; el < 64; el += 32) {
+        uint r = sm + i * 8 + el / 8, c = sn + j * 8 + el % 8;
+        uint si = r0 + r, n = n0 + c;
+        if (si < rend && n < p.N) {
+          uint orow = p.scatter_out ? uint(perm[si]) : si;
+          out[size_t(orow) * p.N + n] = f2bf(Cs[sg][el] * gscale);
+        }
+      }
+      simdgroup_barrier(mem_flags::mem_threadgroup);
+    }
+}
+#define MG2_INST(M, NAME)                                                                                      \
+  template [[host_name(NAME)]] kernel void moe_gemm2<M>(                                                      \
+      device const uint4*, device const uchar*, device const float*, device const ushort*, device const int*, \
+      device const int*, device const uint2*, device const uint*, device ushort*, constant MoeGemmParams&,    \
+      uint2, uint, uint, uint);
+MG2_INST(0, "moe_gemm2_nvfp4")
+MG2_INST(1, "moe_gemm2_mxfp8")

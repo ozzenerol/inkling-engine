@@ -12,6 +12,8 @@
 
 #include "core/tensor.h"
 
+#define INK_DSPARK_HAS_SAMPLE 1  // draft_sample() / q_row() exist
+
 namespace ink {
 
 class Backend;
@@ -38,11 +40,21 @@ class DSpark {
   void truncate(int64_t n);
   // Propose `count` (<= 7) tokens after `anchor`. Syncs the GPU and returns the tokens.
   std::vector<int32_t> draft(int32_t anchor, int count);
+  // Sampled drafts (speculative sampling): x_j ~ q_j = softmax(z_j / temperature) by inverse CDF with uniforms[j]
+  // (on the GPU); x_j feeds the next Markov step. Returns the tokens; q_tok[j] = q_j(x_j).
+  std::vector<int32_t> draft_sample(int32_t anchor, int count, float temperature, const float* uniforms,
+                                    std::vector<float>* q_tok);
+  // Full q_j row (vocab_unpadded floats) of the last draft_sample, computed on the host from the stored logits.
+  const std::vector<float>& q_row(int j);
+  int64_t vocab() const;
   int max_count() const { return block_ - 1; }
 
  private:
   struct Impl;
+  std::vector<int32_t> run(int32_t anchor, int count, float temperature, const float* uniforms,
+                           std::vector<float>* q_tok);
   std::unique_ptr<Impl> impl_;
+  std::vector<float> qrow_;
   Tensor cap_;
   int64_t ctx_len_ = 0;
   int block_ = 8;
