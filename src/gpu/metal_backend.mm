@@ -1495,7 +1495,7 @@ class MetalBackend final : public Backend {
   // slice of the GPU, so the router and controller matvecs inside it cost far more than the ~7.5 us per
   // dependent dispatch they save.
   bool chain_ = getenv("INK_CHAIN") != nullptr;
-  uint32_t ag_min_t_ = getenv("INK_AG_MIN_T") ? uint32_t(atoi(getenv("INK_AG_MIN_T"))) : 64;  // GEMM attention from this T
+  uint32_t ag_min_t_ = getenv("INK_AG_MIN_T") ? uint32_t(atoi(getenv("INK_AG_MIN_T"))) : 17;  // GEMM attention from this T (3..16 rows: multi-row split kernels)
   std::string cur_;
   std::map<std::string, std::pair<double, long>> prof_;
   std::unordered_map<void*, size_t> sizes_;
