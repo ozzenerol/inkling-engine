@@ -776,8 +776,9 @@ class MetalBackend final : public Backend {
       uint32_t nsplit = cdiv(len + T, split_keys) - first / split_keys;
       uint32_t nfg = cdiv(3 * T, 8);
       MrAttnParams p{T, H, KVH, uint32_t(a.kv.cap), len, a.kv.ring ? 1u : 0u, window, uint32_t(a.rel_proj.dim(1)),
-                     split_keys, nsplit, 1u, first, 1u, gate ? 1u : 0u, 3 * T};
-      Tensor part = scratch("mr-attn-part", DType::F32, {KVH * nsplit * p.prow, 132});
+                     split_keys, nsplit, 1u, first, 1u, gate ? 1u : 0u, 48u};
+      // sized for 16 rows and nsplit rounded up, so the scratch is not regrown (a sync) as T or the context grows
+      Tensor part = scratch("mr-attn-part", DType::F32, {KVH * cdiv(nsplit, 64) * 64 * p.prow, 132});
       std::string nm = "mr_attn_split_g" + std::to_string(nfg);
       if (const char* ab = getenv("INK_MR_ABL")) nm = std::string("mr_attn_split_g6_abl") + ab;  // bench only
       pipe(nm);
