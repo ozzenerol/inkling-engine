@@ -7,7 +7,10 @@ for ids in p2 long32k long64k long128k; do
   INK_MODEL=$M8 INK_SPEC_STATS=1 ./build/src/gpu/spec_check dspark ref_data/$ids.ids 300 8 $OUT/a-$ids-t07.i32 0.7 2>&1 | grep -E "tok/s|dspark:|lookup:|adaptive"
 done
 echo "-- 8-bit long128k temp 0.7, plain"
-INK_MODEL=$M8 ./build/src/gpu/spec_check plain ref_data/long128k.ids 100 8 $OUT/a-long128k-plain.i32 0.7 2>&1 | grep -E "tok/s"
+INK_AG_STATS=1 INK_MODEL=$M8 ./build/src/gpu/spec_check plain ref_data/long128k.ids 100 8 $OUT/a-long128k-plain.i32 0.7 > $OUT/a-long128k-plain.log 2>&1
+grep -E "tok/s" $OUT/a-long128k-plain.log
+echo "-- attention sparsity at 126k (prefill of the last chunk, global layers; first and last key block)"
+grep "ag stats len 12[0-9]* window 0" $OUT/a-long128k-plain.log | sed 's/ag stats //' | sort | uniq -c | sort -rn | head -12
 # copy-heavy and code prompts: regression check of the drafting defaults (greedy must equal plain)
 for ids in copy p0; do
   INK_MODEL=$M8 ./build/src/gpu/spec_check plain ref_data/$ids.ids 400 8 $OUT/a-$ids-plain.i32 2>&1 | grep -E "tok/s"
