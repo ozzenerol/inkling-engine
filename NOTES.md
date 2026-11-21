@@ -555,3 +555,14 @@ head 0.93 -> 0.48). Check script: tests/ref/check_8bit_layout.py (tensor-by-tens
   B: q8 matvec model-free 795 GB/s of codes at T=1 (dense reads of the 8-bit build: 1.7 ms against 8.1 ms bf16),
   so the 8-bit plain step (23.7 ms) is now almost all MoE + head + small-dispatch latency; q8 linear_multi and
   conv_mix: no gain; MoE gate/up with 2 or 1 rows per simdgroup: slower (249 / 237 vs 262 GB/s).
+
+## B: correction (fused decode ops were not wired)
+
+The Metal overrides for `attn_prep_local`, `attention_gated` and `conv_add` were missing from metal_backend.mm from
+5f0fe21 until b/work ab13ba8: the edit that inserted them did not apply, so the Backend defaults (primitive
+sequences) ran. Consequences: the "fused attn_prep_local / attention_gated / conv_add" item in "B: decode speed
+work" contributed nothing to 31.8 -> 36.7 tok/s (that came from the wide mix, router matvec, concurrent encoder and
+mix+norm); the op_diff "prep" / "conv_add" cases compared primitives with primitives; the INK_SKIP numbers were on
+the unfused paths. The overrides now exist behind INK_FUSE2=1 and are unmeasured until a batch runs
+tools/queue/b.sh (exact op_diff cases, attention_gated identity, decode off vs on, DSpark identity).
+Also: batch 5's "q8 matvec 795 GB/s" came from zero-filled weights in bench_q8 and is not a read measurement.
