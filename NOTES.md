@@ -15,7 +15,7 @@ Append-only log plus the agreed layout. Read before each chunk of work.
 One model on the GPU at a time. Before loading weights: add a line here AND message the others.
 Format: `LOCK <agent> <what> <start time>` / `UNLOCK <agent> <time>`.
 
-(none held)
+(none held)  [A ran the MLX reference dump 17:22, done]
 
 ## Module layout and file ownership
 
@@ -197,3 +197,39 @@ Notes:
      logits for all T rows) and the KV truncate above. A: please keep `Model::forward(ids, T, captures*, logits_all)`.
 - Order of work (B): context + buffers + resident loader -> bf16 matvec at 366 GB/s -> NVFP4/MXFP8 MoE matvec ->
   attention decode -> decode path end to end vs A's ref -> prefill GEMMs -> DSpark -> long context.
+
+## C: server + agentic (ozzenerol-aa)
+
+Files: src/tokenizer/ (inktok), src/server/ (inkserver, inkling-server), tests/server/. Build:
+`cmake -S . -B build-c && cmake --build build-c --target inkling-server` (links the real engine only once
+src/engine/engine.cpp exists; `-DINK_SERVER_ENGINE=OFF` forces stub-only).
+
+- **Chat template**: hand translation of chat_template.jinja (src/server/chat_template.cpp), with a Python-exact
+  json.dumps (src/server/json.cpp: key order kept, float repr, ensure_ascii=False, sort_keys). Checked against
+  transformers apply_chat_template: 3011/3011 random+edge cases identical incl. the 159 that must raise
+  (tests/server/template_check.py). Tool-call `arguments` strings are json-parsed first (invalid -> {}), as
+  mlx_vlm request_normalization does.
+- **Tokenizer**: tokenizer.json BPE, pcre2 (UTF+UCP, JIT) for the split regex, ignore_merges, specials split first
+  (leftmost-longest). Matches HF tokenizers on 3119 texts / 454k tokens and A's 4 ref prompts
+  (tests/server/tok_check.py). Load 250 ms, encode ~5M tok/s (one run).
+- **Output**: parsed at token-id level (src/server/output_parser.cpp): content_thinking -> reasoning_content,
+  content_text -> content, content_invoke_tool_json -> tool_calls (inkling.py port: name from JSON, args from
+  "args"|"arguments", arguments string = compact JSON in the model's key order). Invalid tool JSON is returned as
+  content. Stops: <|content_model_end_sampling|> (200006), and <|message_user|>/<|message_system|>/<|message_tool|>/
+  <|endoftext|>.
+- **Effort**: chat_template_kwargs.reasoning_effort > body.reasoning_effort > server --effort; if none of those and
+  chat_template_kwargs.enable_thinking == false (qh, saetta bench.py) -> "none". Otherwise the template default 0.9.
+- **Prefix cache** (src/server/prompt_cache.cpp): LCP of new prompt vs cached ids; then nothing / Engine::rewind /
+  restore best checkpoint <= LCP / reset, then prefill the rest. Checkpoints at end of prompt and end of each
+  finished turn, 4 kept (LRU). **Turn splicing (decision)**: when a request contains an assistant message whose
+  (trimmed reasoning, trimmed content, tool calls with canonical args) equals a turn this server generated, that
+  span is fed as the exact generated token ids instead of the re-rendered text. Without it every agent turn
+  diverges inside the previous answer (qh trims reasoning; the template re-serializes tool args compact+sorted)
+  and re-prefills all its thinking. The model sees exactly what it wrote. `--no-splice` restores pure template text.
+- **API**: /v1/chat/completions (stream + non-stream, usage with prompt_tokens_details.cached_tokens, plus a
+  llama.cpp-style `timings` object), /v1/models (id = model dir path, which qh picks), /health, /tokenize, /v1/cache.
+  SSE `: prefill n/total` comments every 2 s during long prefills. One generation at a time (mutex).
+  Not done: `stop` strings, n>1, logprobs, images (no vision tower), tool_choice (ignored).
+- **Tests**: tests/server/api_test.py runs the server with `--stub` (scripted engine with the real cache contract:
+  slack 512, checkpoint prefixes checked) — 30/30 pass: streaming, tool calls, 3-turn agent loop (turn 2 prefills
+  13 tokens, turn 3 8 tokens), divergence + checkpoint restore, disconnect, length, errors.
