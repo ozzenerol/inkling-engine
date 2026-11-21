@@ -42,6 +42,9 @@ if runs:
                 except Exception:
                     cells.append("-")
         print(f"| {ctx / 1000:.1f}k | " + " | ".join(cells) + " |")
+    if any("8bit" in l for l in labels):
+        print("\ninkling-8bit = the 8-bit build (Inkling-2-Mini-MLX-8bit); its ratios are against MLX on the 4-8bit "
+              "build (no MLX 8-bit baseline measured).")
     if any(r.get("source") == "BRIEF" for l in labels for r in runs[l]):
         print("\n\\* from BRIEF.md's MLX table (same script and settings, not re-measured today)")
     print()
