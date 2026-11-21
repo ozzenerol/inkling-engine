@@ -33,6 +33,9 @@ struct Spec {
   double arm_rate[9] = {0, 0, 0, 0, 0, 0, 0, 0, 0};  // tokens per ms delivered by draft count k (EMA)
   long arm_n[9] = {0, 0, 0, 0, 0, 0, 0, 0, 0};
   int since_probe = 0, probe = 0;
+  int k_cur = 3, rest = 0;
+  double draft_rate = 0;
+  long draft_n = 0;
   // Prompt-lookup drafts (A): trigram -> position after its latest occurrence in the cached tokens.
   std::unordered_map<uint64_t, std::array<int32_t, 4>> tri;
   int lk_match = 0;
@@ -127,28 +130,33 @@ bool speculative_generate(Engine& e, Model& m, const SamplingParams& p, int max_
   // exact target sample whatever k is, so the choice changes speed only. Unmeasured costs are extrapolated from
   // the plain step (+25% per extra row); a full-length round and a plain step are retried now and then so the
   // estimates follow the text (acceptance at temperature 0.7 is far lower than greedy).
-  // Draft count per round as a bandit over the arms k = 0 (plain step) .. kmax: each arm keeps an EMA of the
-  // tokens per ms it actually delivered; the best arm runs, every arm is tried 3 times first and a non-best arm
-  // is probed every 24 rounds. Measured speed only, no acceptance model: an earlier model-based version stopped
-  // drafting after a few rejections and never learned that drafting had become good again.
+  // Draft count per round. Two modes compared by the tokens per ms they actually deliver (EMAs): plain steps
+  // (k = 0) and drafting, where k follows the text: it doubles (2k + 1) after a fully accepted round and drops to
+  // the accepted count + 1 after a rejection. Drafting starts; plain is measured with 2 steps after the first 6
+  // rounds; when drafting falls below plain it rests for 16 plain steps and is tried again. (An 8-arm bandit over
+  // k needed 24 rounds of exploration, more than a short answer has: 34 tok/s on p2 against 41 with block 4.)
   auto choose_k = [&](int kmax) {
     if (!adaptive) return kmax;
-    for (int k = kmax; k >= 0; k--)
-      if (s.arm_n[k] < 3) return k;
-    int best = 0;
-    for (int k = 1; k <= kmax; k++)
-      if (s.arm_rate[k] > s.arm_rate[best]) best = k;
-    if (++s.since_probe >= 24) {
-      s.since_probe = 0;
-      s.probe = (s.probe + 1) % (kmax + 1);
-      if (s.probe == best) s.probe = (s.probe + 1) % (kmax + 1);
-      return s.probe;
+    if (s.rest > 0) {
+      s.rest--;
+      return 0;
     }
-    return best;
+    if (s.rounds >= 6 && s.arm_n[0] < 2) return 0;
+    if (s.arm_n[0] >= 2 && s.draft_n >= 6 && s.draft_rate < 0.97 * s.arm_rate[0]) {
+      s.rest = 16;
+      s.draft_n = 3;  // a few fresh rounds decide again after the rest
+      return 0;
+    }
+    return std::max(1, std::min(kmax, s.k_cur));
   };
   auto arm_update = [&](int k, int tokens, double ms) {
     ema(s.arm_rate[k], tokens / ms, 0.15);
     s.arm_n[k]++;
+    if (k > 0) {
+      ema(s.draft_rate, tokens / ms, 0.15);
+      s.draft_n++;
+      s.k_cur = tokens - 1 == k ? 2 * k + 1 : std::max(1, tokens);  // tokens - 1 = accepted drafts
+    }
   };
   // Prompt lookup: agents copy a lot from their context (file contents, paths, tool-call boilerplate). When the
   // last three tokens occurred before, the tokens that followed are the draft: no drafter cost, and blocks of up
@@ -212,9 +220,8 @@ bool speculative_generate(Engine& e, Model& m, const SamplingParams& p, int max_
       if (s.lk_skip > 0) {
         s.lk_skip--;
       } else {
-        // Blocks above 3 drafts need forwards of more than 4 rows, which are slow until D's multi-row work lands
-        // (measured T = 5: 118 ms against 53 ms for T = 4), so the default cap is 3; INK_LOOKUP_MAX raises it.
-        static const int lk_max = getenv("INK_LOOKUP_MAX") ? std::max(1, std::min(15, atoi(getenv("INK_LOOKUP_MAX")))) : 3;
+        // Up to 15 drafts (a 16-row forward: 8 rows cost 73 ms against 30 for one); INK_LOOKUP_MAX lowers it.
+        static const int lk_max = getenv("INK_LOOKUP_MAX") ? std::max(1, std::min(15, atoi(getenv("INK_LOOKUP_MAX")))) : 15;
         lookup(b, std::min({s.lk_k, lk_max, max_tokens - emitted}), lk);
         double best = 0;
         for (int j = 0; j <= count_max; j++) best = std::max(best, s.arm_rate[j]);
