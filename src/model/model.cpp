@@ -321,6 +321,7 @@ Tensor Model::row_view(const Tensor& t, int64_t first, std::initializer_list<int
 
 void Model::reset() {
   len_ = 0;
+  toks_.clear();
   for (auto& s : vs_) {
     s.kv.len = 0;
     for (auto& c : s.conv) {
@@ -332,6 +333,7 @@ void Model::reset() {
 
 void Model::set_len(int64_t n) {
   len_ = n;
+  toks_.resize(static_cast<size_t>(n), -1);
   for (auto& s : vs_) s.kv.len = n;
 }
 
@@ -677,6 +679,8 @@ void Model::forward(const int32_t* ids, int64_t T, bool all_logits, bool keep_hi
   logits_.resize(static_cast<size_t>(rows * V));
   be_.read(lg, logits_.data(), logits_.size() * 4);
   logit_rows_ = rows;
+  toks_.resize(static_cast<size_t>(len_), -1);
+  toks_.insert(toks_.end(), ids, ids + T);
   len_ += T;
   keep_hist_ = false;
 }
