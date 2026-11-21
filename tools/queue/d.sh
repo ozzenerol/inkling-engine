@@ -16,3 +16,4 @@ if [ -f ref_data/long32k.ids ]; then
   done
   cmp -s $OUT/d-l32-plain.i32 $OUT/d-l32-plain-ga.i32 && echo "long32k: INK_GA=1 same tokens as the split kernels" || echo "long32k: INK_GA=1 tokens differ from the split kernels (other summation order; check it is a near-tie)"
 fi
+echo "-- bench_mrattn, INK_GA=1, groups of 2 tokens (INK_GA_TOK=2)"; INK_GA=1 INK_GA_TOK=2 $B/bench_mrattn 4 8 | grep -v local
