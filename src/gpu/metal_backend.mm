@@ -859,8 +859,9 @@ class MetalBackend final : public Backend {
       // D: global attention read straight from device memory, two passes (kernels/multirow_ga.metal). One
       // arithmetic for every T, so verify rows equal decode rows.
       const uint32_t len = uint32_t(a.kv.len), nkeys = len + T;
-      // tokens per row group (3 rows each); INK_GA_TOK=1|2 forces smaller groups (bench: K/V are then re-read)
-      const uint32_t tok = std::min<uint32_t>(ga_tok_, T == 1 ? 1 : T == 2 ? 2 : 4);
+      // tokens (simdgroups) per threadgroup, all on the same keys; INK_GA_TOK=n caps it (bench: more groups, each
+      // reading K / V again)
+      const uint32_t tok = std::min<uint32_t>(ga_tok_, T == 1 ? 1 : T == 2 ? 2 : T <= 4 ? 4 : T <= 8 ? 8 : 16);
       const uint32_t groups = cdiv(T, tok), sr = 3 * T;
       GaParams p{T, H, KVH, uint32_t(a.kv.cap), len, uint32_t(a.rel_proj.dim(1)), sr, cdiv(nkeys, 64) * 64,
                  cdiv(nkeys, 64), cdiv(nkeys, 512), ga_thr_, 1u, gate ? 1u : 0u};
@@ -1492,7 +1493,7 @@ class MetalBackend final : public Backend {
   // exp(-x) of the row maximum are dropped and blocks with nothing above it are not read (default: nothing dropped).
   // INK_GA_MIN_LEN=n: only from n keys.
   bool ga_ = getenv("INK_GA") && getenv("INK_GA")[0] == '1';
-  uint32_t ga_tok_ = getenv("INK_GA_TOK") ? uint32_t(atoi(getenv("INK_GA_TOK"))) : 4;
+  uint32_t ga_tok_ = getenv("INK_GA_TOK") ? uint32_t(atoi(getenv("INK_GA_TOK"))) : 16;
   bool ga_no_pv_ = getenv("INK_GA_NOPV") != nullptr;
   float ga_thr_ = getenv("INK_GA_THR") ? float(atof(getenv("INK_GA_THR"))) : 1e30f;
   uint32_t ga_min_len_ = getenv("INK_GA_MIN_LEN") ? uint32_t(atoi(getenv("INK_GA_MIN_LEN"))) : 0;

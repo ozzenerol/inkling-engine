@@ -7,6 +7,12 @@ echo "-- bench_mrattn, split kernels (current default)"; $B/bench_mrattn 1 2 4 8
 echo "-- bench_mrattn, INK_GA=1"; INK_GA=1 $B/bench_mrattn 1 2 4 8 16 | grep -v local
 echo "-- bench_mrattn, INK_GA=1, K pass only (INK_GA_NOPV=1)"; INK_GA=1 INK_GA_NOPV=1 $B/bench_mrattn 1 4 16 | grep -v local
 if [ -f ref_data/long32k.ids ]; then
+  if [ -f ref_data/long128k.ids ]; then
+    for v in "" "INK_GA=1"; do
+      echo "-- long128k greedy dspark ${v:-split kernels}"
+      env INK_SPEC_STATS=1 $v $SC dspark ref_data/long128k.ids 150 8 $OUT/d-l128${v:+-ga}.i32 2>&1 | grep -E "tok/s|dspark:|verify"
+    done
+  fi
   for v in "" "INK_GA=1"; do
     for mode in plain dspark; do
       echo "-- long32k greedy $mode ${v:-split kernels}"
@@ -16,7 +22,7 @@ if [ -f ref_data/long32k.ids ]; then
   done
   cmp -s $OUT/d-l32-plain.i32 $OUT/d-l32-plain-ga.i32 && echo "long32k: INK_GA=1 same tokens as the split kernels" || echo "long32k: INK_GA=1 tokens differ from the split kernels (other summation order; check it is a near-tie)"
 fi
-echo "-- bench_mrattn, INK_GA=1, groups of 2 tokens (INK_GA_TOK=2)"; INK_GA=1 INK_GA_TOK=2 $B/bench_mrattn 4 8 | grep -v local
+echo "-- bench_mrattn, INK_GA=1, at most 4 tokens per threadgroup (INK_GA_TOK=4)"; INK_GA=1 INK_GA_TOK=4 $B/bench_mrattn 8 16 | grep -v local
 # Prefill-only sizes T = 17..63 (prompt tails, small agent turns): current paths vs the verify kernels in passes
 for v in "" "INK_MR_MAX=64"; do
   echo "-- T = 20 32 48 63, ${v:-current paths (GEMMs, attn_prefill, moe_prefill)}"
