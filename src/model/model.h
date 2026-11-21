@@ -63,6 +63,7 @@ class Model {
   std::function<void(int visit, const Tensor& x)> on_visit;
 
   std::vector<VisitState>& visits() { return vs_; }
+  bool alt_layout() const { return alt_layout_; }  // pipenetwork 8-bit checkpoint layout
   const Tensor& embed() const { return embed_; }            // bf16 [vocab, D]
   const Tensor& embed_norm() const { return embed_norm_; }  // bf16 [D]
   const Tensor& lm_head() const { return head_; }           // bf16 [vocab, D]
@@ -81,6 +82,8 @@ class Model {
   Tensor view(const Tensor& t, std::initializer_list<int64_t> shape) const;  // contiguous prefix view
   Tensor row_view(const Tensor& t, int64_t first, std::initializer_list<int64_t> shape) const;
 
+  std::vector<Tensor> owned_;   // weights converted at load (8-bit layout)
+  bool alt_layout_ = false;
   Backend& be_;
   ModelConfig cfg_;
   SafeTensors st_;

@@ -1,6 +1,11 @@
 // Owner: A. Forward pass of Inkling 2 Mini (mirrors mlx_vlm/models/inkling2/language.py).
 #include "model/model.h"
 
+#include <cstring>
+
+#include "core/bf16.h"
+#include "core/parallel.h"
+
 #include <cmath>
 #include <cstdio>
 #include <stdexcept>
@@ -19,6 +24,7 @@ Model::Model(Backend& be, const std::string& dir, int64_t max_context, int64_t m
 
 Model::~Model() {
   auto fr = [&](Tensor& t) { if (t.valid()) be_.free(t); };
+  for (auto& t : owned_) fr(t);
   for (auto& v : vs_) {
     fr(v.kv.k);
     fr(v.kv.v);
@@ -32,9 +38,110 @@ Model::~Model() {
     fr(*t);
 }
 
+// Two checkpoint layouts are supported:
+//  - netprojects 4-8bit (mlx-vlm names): dense weights bf16, experts gate_proj / up_proj / down_proj.
+//  - pipenetwork 8bit (mlx-lm names): dense weights MLX affine 8-bit (w = scale * q + bias per group of 64),
+//    experts gate_up_proj fused (rows interleaved gate, up, gate, ...), router and controller gates in f32.
+// Stage 1 for the 8-bit layout: everything is converted at load into the first layout's in-memory form (affine
+// dequantized to bf16, f32 -> bf16 where the values are bf16 anyway, experts split), so all kernels run as they
+// are. Stage 2 (B): kernels that read the 8-bit codes in place, which is where the speed comes from.
 void Model::load(const std::string&) {
-  auto W = [&](const std::string& n) { return be_.load_weight(st_.at(n)); };
-  auto Wopt = [&](const std::string& n) { auto* e = st_.find(n); return e ? be_.load_weight(*e) : Tensor{}; };
+  const bool alt = st_.find("model.language_model.embed_norm.weight") != nullptr;
+  alt_layout_ = alt;
+  auto rep = [](std::string& n, const std::string& a, const std::string& b) {
+    size_t at = n.find(a);
+    if (at != std::string::npos) n.replace(at, a.size(), b);
+  };
+  auto name = [&](std::string n) {
+    if (!alt) return n;
+    rep(n, "language_model.model.", "model.language_model.");
+    rep(n, "language_model.lm_head.", "lm_head.");
+    rep(n, "message_queries", "message_input.query");
+    rep(n, ".attn_sconv.conv.weight", ".post_attention_convolution.conv1d.weight");
+    rep(n, ".mlp_sconv.conv.weight", ".post_mlp_convolution.conv1d.weight");
+    rep(n, "_sconv.conv.weight", "_sconv.conv1d.weight");
+    rep(n, "self_attn.q_scale", "self_attn.q_l2_clip.scale");
+    rep(n, "self_attn.rel_scale", "self_attn.rel_l2_clip.scale");
+    rep(n, "self_attn.rel_proj", "self_attn.rel_logits_proj.proj");
+    rep(n, ".controllers.attn.", ".q_message_gate.");
+    rep(n, ".controllers.k.", ".k_message_gate.");
+    rep(n, ".controllers.v.", ".v_message_gate.");
+    rep(n, ".controllers.mlp.", ".mlp_message_gate.");
+    rep(n, "down_weight", "down_proj.weight");
+    rep(n, "forget_weight", "forget_gate_proj.weight");
+    rep(n, "gain_weight", "message_gate_proj.weight");
+    rep(n, "mlp.gate_weight", "mlp.gate.weight");
+    rep(n, "mlp.e_score_correction_bias", "mlp.gate.e_score_correction_bias");
+    return n;
+  };
+  auto own = [&](DType dt, std::initializer_list<int64_t> shape, const void* data, size_t bytes) {
+    Tensor t = be_.alloc(dt, shape, "weight");
+    be_.write(t, data, bytes);
+    owned_.push_back(t);
+    return t;
+  };
+  auto raw = [&](const SafeTensors::Entry& e) {
+    std::vector<uint8_t> v(e.bytes);
+    read_entry(e, v.data());
+    return v;
+  };
+  long inexact = 0;
+  // Dense weight in canonical form: bf16 [N,K] (or the stored dtype when it is not bf16-like).
+  auto W = [&](const std::string& canon) -> Tensor {
+    const std::string n = name(canon);
+    const auto& e = st_.at(n);
+    const std::string base = n.size() > 7 && n.compare(n.size() - 7, 7, ".weight") == 0 ? n.substr(0, n.size() - 7) : n;
+    const auto* es = st_.find(base + ".scales");
+    const auto* eb = st_.find(base + ".biases");
+    if (e.dtype == DType::U32 && es && eb && es->dtype == DType::BF16) {
+      // MLX affine 8-bit: 4 codes per u32 (low byte first), group 64.
+      const int64_t N = e.shape[0], K = e.shape[1] * 4, G = es->shape[1];
+      if (G * 64 != K) throw std::runtime_error("affine group size != 64: " + n);
+      auto codes = raw(e), sc = raw(*es), bi = raw(*eb);
+      std::vector<uint16_t> out(static_cast<size_t>(N * K));
+      const uint16_t* scp = reinterpret_cast<const uint16_t*>(sc.data());
+      const uint16_t* bip = reinterpret_cast<const uint16_t*>(bi.data());
+      parallel_for(N, [&](int64_t r0, int64_t r1) {
+        for (int64_t r = r0; r < r1; ++r)
+          for (int64_t g = 0; g < G; ++g) {
+            const float sv = bf16_to_f32(scp[r * G + g]), bv = bf16_to_f32(bip[r * G + g]);
+            const uint8_t* c = codes.data() + (r * K + g * 64);
+            uint16_t* o = out.data() + r * K + g * 64;
+            for (int j = 0; j < 64; ++j) o[j] = f32_to_bf16(sv * float(c[j]) + bv);
+          }
+      }, 16);
+      return own(DType::BF16, {N, K}, out.data(), out.size() * 2);
+    }
+    return be_.load_weight(e);
+  };
+  // Like W, but f32 storage is converted to bf16 (router and controller gates; the values are bf16 already).
+  auto Wbf = [&](const std::string& canon) -> Tensor {
+    const auto& e = st_.at(name(canon));
+    if (e.dtype != DType::F32) return W(canon);
+    auto v = raw(e);
+    const float* f = reinterpret_cast<const float*>(v.data());
+    const size_t n = v.size() / 4;
+    std::vector<uint16_t> out(n);
+    for (size_t i = 0; i < n; ++i) {
+      out[i] = f32_to_bf16(f[i]);
+      inexact += bf16_to_f32(out[i]) != f[i];
+    }
+    Tensor t = be_.alloc(DType::BF16, {e.shape[0], e.shape[1]}, "weight");
+    be_.write(t, out.data(), n * 2);
+    owned_.push_back(t);
+    return t;
+  };
+  // One half (part 0 = gate, 1 = up) of a fused, row-interleaved gate_up tensor [E, 2I, W] -> [E, I, W].
+  auto split = [&](const SafeTensors::Entry& e, int part) -> Tensor {
+    const int64_t E = e.shape[0], I2 = e.shape[1], Wd = e.shape[2];
+    const size_t rb = size_t(Wd) * dtype_size(e.dtype);
+    auto v = raw(e);
+    std::vector<uint8_t> out(size_t(E) * (I2 / 2) * rb);
+    for (int64_t x = 0; x < E; ++x)
+      for (int64_t i = 0; i < I2 / 2; ++i)
+        std::memcpy(&out[(x * (I2 / 2) + i) * rb], &v[(x * I2 + 2 * i + part) * rb], rb);
+    return own(e.dtype, {E, I2 / 2, Wd}, out.data(), out.size());
+  };
   embed_ = W(P + "embed_tokens.weight");
   embed_norm_ = W(P + "embed_norm.weight");
   final_query_ = W(P + "final_input.query");
@@ -84,30 +191,45 @@ void Model::load(const std::string&) {
       const char* names[4] = {"attn", "k", "v", "mlp"};
       for (int i = 0; i < 4; ++i) {
         const std::string c = p + "controllers." + names[i] + ".";
-        w.ctrl_down[i] = W(c + "down_weight");
-        w.ctrl_forget[i] = W(c + "forget_weight");
-        w.ctrl_gain[i] = W(c + "gain_weight");
+        w.ctrl_down[i] = Wbf(c + "down_weight");
+        w.ctrl_forget[i] = Wbf(c + "forget_weight");
+        w.ctrl_gain[i] = Wbf(c + "gain_weight");
       }
     }
     const std::string m = p + "mlp.";
-    w.moe.gate_w = W(m + "gate_weight");
+    w.moe.gate_w = Wbf(m + "gate_weight");
     w.moe.bias = W(m + "e_score_correction_bias");
     QuantProj* projs[3] = {&w.moe.gate, &w.moe.up, &w.moe.down};
     const char* pn[3] = {"gate_proj", "up_proj", "down_proj"};
     for (int i = 0; i < 3; ++i) {
-      const std::string q = m + "switch_mlp." + pn[i] + ".";
       QuantProj& qp = *projs[i];
-      qp.weight = W(q + "weight");
-      qp.scales = W(q + "scales");
-      qp.global = Wopt(q + "weight_scale_2");
+      if (alt) {
+        const std::string q = name(m) + "experts." + (i < 2 ? "gate_up_proj" : "down_proj") + ".";
+        const auto* eg = st_.find(q + "global_scale");
+        if (i < 2) {
+          qp.weight = split(st_.at(q + "weight"), i);
+          qp.scales = split(st_.at(q + "scales"), i);
+        } else {
+          qp.weight = be_.load_weight(st_.at(q + "weight"));
+          qp.scales = be_.load_weight(st_.at(q + "scales"));
+        }
+        if (eg) qp.global = be_.load_weight(*eg);
+      } else {
+        const std::string q = m + "switch_mlp." + pn[i] + ".";
+        qp.weight = be_.load_weight(st_.at(q + "weight"));
+        qp.scales = be_.load_weight(st_.at(q + "scales"));
+        if (auto* eg = st_.find(q + "weight_scale_2")) qp.global = be_.load_weight(*eg);
+      }
       qp.mode = qp.global.valid() ? QuantMode::NVFP4 : QuantMode::MXFP8;
       qp.n = qp.weight.dim(1);
       qp.k = qp.weight.dim(2) * (qp.mode == QuantMode::NVFP4 ? 8 : 4);
       int64_t group = qp.mode == QuantMode::NVFP4 ? 16 : 32;
-      if (qp.scales.dim(2) * group != qp.k) throw std::runtime_error("bad quant shapes " + q);
+      if (qp.scales.dim(2) * group != qp.k) throw std::runtime_error("bad quant shapes, layer " + std::to_string(L));
     }
     (void)D;
   }
+
+  if (inexact) std::fprintf(stderr, "[model] warning: %ld f32 weights were not exact in bf16\n", inexact);
 
   // Per-visit state.
   vs_.resize(cfg_.num_visits());
