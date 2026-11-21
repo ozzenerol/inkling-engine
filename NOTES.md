@@ -771,3 +771,35 @@ Things tried and dropped today: chain kernels (single-threadgroup megakernels: s
 sampling (no better than compare with this drafter), 8-arm bandit over draft counts, attention key pruning (not
 sparse), MoE tiles of 128 rows, FP4 LUT, conv+mix merge, q8 linear_multi, GPU "busy" load, 8-bit KV (on hold:
 INK_KV_Q8SIM in the CPU backend simulates it for an accuracy check that was not run).
+
+## C: state at end of 2026-11-21
+
+Branch c/work = main c618174 plus this section and docs/RESULTS.md (batch 9 is the reference table there).
+
+- **Server defaults** (`inkling-server`, port 8091, what batch 9 measured): model `Inkling-2-Mini-MLX-8bit`
+  (falls back to the 4-8bit dir), DSpark drafts on with draft block 8 (`--draft-block`, `--no-mtp`), prompt-lookup
+  drafts on (`INK_NO_LOOKUP=1` turns them off), prefill chunk 2048 with near-equal splitting, turn splicing on,
+  shared-prefix checkpoint for prefixes >= 256 tokens, context 131072, effort from the request (template default
+  0.9 when the request gives none).
+- **Reference table** (batch 9, 8-bit, one growing session, temp 0.7, 400 tokens, one run; batches 7 and 8 agree
+  within 1.1 s TTFT and 1.8 tok/s): read tok/s / TTFT / gen tok/s = 1.2k 729 / 1.64 s / 39.9; 9.6k 794 / 10.1 s /
+  38.1; 39.3k 658 / 44.5 s / 30.3; 78.6k 503 / 77.4 s / 27.2; 127.3k 381 / 127.0 s / 22.0. Relaxed target (40 at
+  the start, 20-30 at the end, read fast): end in range, start 38.1-39.9 over three batches (not met).
+- **Agent sessions** (batch 9): read, 10 turns: 88.1 s, median TTFT 1.35 s, 573 read tok/s, 64.6 gen tok/s (MLX
+  241.5 s, 13.5 s, 44.1); copy, 6 turns: 49.0 s, 1.08 s, 87.7 gen tok/s. qh end-to-end PASS, 28 s.
+- **TTFT breakdown** (`[ttft]` log lines): prefill is 93-99% of TTFT. A turn of 775 new tokens = 1.25-1.41 s, of
+  which prefill 1.20-1.32 s (645 -> 589 tok/s from 3k to 13k context), 50-100 ms the marker tokens before the
+  first visible delta, checkpoint 2-15 ms, tokenize + cache under 2 ms. Small chunks (552-790 tokens) run at
+  540-645 tok/s against 720-800 for chunks of 2000: that gap is in the engine's per-chunk cost.
+- **Not measured yet**: MLX on the copy scenario; the cold sweep (ctxbench) to 127.5k on the 8-bit build (and the
+  lossless 127.5k row); the 30k agent session since batch 3; a second session that HITS the pinned shared-prefix
+  checkpoint on the real engine (in batch 9 the copy session came after a session whose first prefill was split
+  1058+1059, so no checkpoint at 2045 existed and it prefilled 2643 tokens again; the pin was made then).
+- **Next 3 steps (tomorrow)**:
+  1. One `FULL=1 MLX=1` batch item: 8-bit cold sweep to 127.5k, 30k agent session, MLX copy baseline; store
+     `agent-mlx-copy.json` in tests/server/baseline and fill the gaps in docs/RESULTS.md.
+  2. Shared prefix on the first request: split the first prefill at the system+tools boundary (known from the
+     rendered prompt) instead of near-equal, so the pin exists from session 1; add a bench step with two sessions
+     and check `cache: ckpt` on the second.
+  3. With A/B: the per-chunk cost on short reads (775 tokens at 600 tok/s against 800 steady) and the 40 tok/s
+     line at the start; server side, send the first SSE byte before the marker tokens are generated.

@@ -7,23 +7,38 @@ DSpark draft (block 4). **Every number is one run.** `inkling-8bit` is the serve
 Target: each prompt is read fast; generation at least 40 tok/s at the start of the context and 20-30 tok/s at
 127.5k.
 
-Where the numbers come from: target table and 8-bit agent sessions = batch 7;
-lossless agent sessions and the 8-bit cold rows = batch 5; lossless cold sweep = batch 6, which was stopped
-after 78.1k (no 127.5k row, no 8-bit sweep); MLX = measured the same day (17:43 and 19:10), rows marked \* from
-BRIEF.md. Not measured: MLX on the copy scenario, MLX in a growing session, the 30k agent session after batch 3.
+Where the numbers come from: target table (the reference table), TTFT breakdown, the two 8-bit summary rows
+of the agent table and the qh run = batch 9 (main c618174, 22:37, server defaults: 8-bit model, draft block 8,
+lookup drafts on); per-turn 8-bit agent columns = batch 7 (batch 9 is within 0.1 s per turn); lossless agent
+sessions and the 8-bit cold rows = batch 5; lossless cold sweep = batch 6, which was stopped after 78.1k (no
+127.5k row, no 8-bit sweep); MLX = measured the same day (17:43 and 19:10), rows marked \* from BRIEF.md.
+Not measured: MLX on the copy scenario, the cold sweep to 127.5k on the 8-bit build, MLX in a growing session,
+the 30k agent session after batch 3.
 
 Target benchmark, inkling-8bit: read speed and gen tok/s by context depth (one growing session, essay prompt, temp 0.7, 400 tokens, one run)
 
 | context | new tokens read | read tok/s | TTFT s | gen tok/s | gen target | meets | MLX gen | vs MLX |
 |---|---|---|---|---|---|---|---|---|
-| 1.2k | 1194 | 723.6 | 1.65 | 39.0 | 40 | no | 23.1 | 1.69x |
-| 9.6k | 8013 | 791.9 | 10.12 | 38.8 | 39 | in range | 24.2 | 1.60x |
-| 39.3k | 29302 | 658.1 | 44.52 | 31.0 | 34-37 | no | 22.0 | 1.41x |
-| 78.6k | 38886 | 503.9 | 77.18 | 26.0 | 28-34 | no | 16.5* | 1.58x |
-| 127.3k | 48322 | 383.7 | 125.93 | 22.7 | 20-30 | in range | 13.8* | 1.64x |
+| 1.2k | 1194 | 729.1 | 1.64 | 39.9 | 40 | no | 23.1 | 1.73x |
+| 9.6k | 8013 | 793.6 | 10.1 | 38.1 | 39 | no | 24.2 | 1.57x |
+| 39.3k | 29302 | 658.4 | 44.51 | 30.3 | 34-37 | no | 22.0 | 1.38x |
+| 78.6k | 38886 | 502.5 | 77.39 | 27.2 | 28-34 | no | 16.5* | 1.65x |
+| 127.3k | 48322 | 380.5 | 126.99 | 22.0 | 20-30 | in range | 13.8* | 1.59x |
 
 read tok/s = new prompt tokens / time to first token (all-in). Gen target: >= 40 tok/s at the start, >= 20-30 at 127.5k.
 MLX gen: its ctxbench run at that prompt size (cold prompt, same essay task); \* = from BRIEF.md.
+
+Batches 7, 8 and 9 gave the same table within 1.1 s of TTFT and 1.8 tok/s of generation per row (three runs,
+three builds). Generation is 38.1-39.9 at the start (40 line not met) and inside 20-30 at the end; the middle
+rows are 4-7 tok/s under a straight line between the two.
+
+Where the time to first token goes (server log `[ttft]`, batch 9): prefill is 93-99% of it at every depth.
+An agent turn that reads 775 new tokens takes 1.25-1.41 s: prefill 1.20-1.32 s (645 tok/s at 3k context falling
+to 589 at 13k), checkpoint 2-15 ms, tokenize + cache lookup under 2 ms, and 50-100 ms for the marker tokens the
+model writes before the first visible delta. A chunk of 552-790 tokens runs at 540-645 tok/s where chunks of
+2000 run at 720-800: the cost per chunk, not the server, is what is left. Chunks sent: one chunk up to 2048 new
+tokens, otherwise near-equal chunks (2117 -> 1058+1059; 48322 -> 24 chunks of 2013-2014); no small tails,
+except after the 2045-token shared prefix (system prompt + tools), where the split is 2045 + rest on purpose.
 
 ctxbench (temp 0.7, 400 tokens), tok/s, one run each
 
@@ -45,8 +60,8 @@ agent_bench (qh system prompt + tools, ~800-token tool result per turn, temp 0, 
 | server | base ctx | turns | last prompt | total wall s | sum TTFT s | median TTFT after turn 1 s | median read tok/s after turn 1 | median gen tok/s | tokens out |
 |---|---|---|---|---|---|---|---|---|---|
 | inkling | 0 | 10 | 13345 | 74.0 | 15.3 | 1.36 | 581 | 88.6 | 4654 |
-| inkling-8bit | 0 | 10 | 13244 | 88.2 | 15.1 | 1.35 | 574 | 65.1 | 4639 |
-| inkling-8bit copy | 0 | 6 | 8350 | 49.3 | 8.9 | 1.08 | 509 | 87.1 | 3496 |
+| inkling-8bit | 0 | 10 | 13244 | 88.1 | 15.1 | 1.35 | 573 | 64.6 | 4639 |
+| inkling-8bit copy | 0 | 6 | 8350 | 49.0 | 8.9 | 1.08 | 513 | 87.7 | 3496 |
 | inkling copy | 0 | 6 | 8338 | 43.2 | 8.8 | 1.07 | 514 | 103.3 | 3484 |
 | mlx | 0 | 10 | 13369 | 241.5 | 128.6 | 13.52 | 603 | 44.1 | 4654 |
 | mlx | 30000 | 10 | 39152 | 742.8 | 691.5 | 70.05 | 506 | 34.9 | 1675 |
@@ -72,6 +87,8 @@ read tok/s = new prompt tokens (prompt - cached) / time to first token: what one
 
 | server | result | wall time |
 |---|---|---|
+| inkling-8bit (batch 9) | 5/5 tests pass | 28 s (4 steps, 1331 tokens out) |
+| inkling-8bit (batch 8) | 5/5 tests pass | 17 s (5 steps, 643 tokens out) |
 | inkling-8bit (batch 7) | 5/5 tests pass | 20 s |
 | inkling-8bit (batch 5) | 5/5 tests pass | 16 s |
 | MLX-VLM (two runs, 17:45) | 5/5 tests pass | 57 s, 40 s |
@@ -82,7 +99,7 @@ read tok/s = new prompt tokens (prompt - cached) / time to first token: what one
   are a straight line between them, drawn by us. "in range" = above the lower line, below the upper one.
 
 - **Read speed in the target table is at depth**: the tokens of each step are read on top of everything before
-  them, so the 127.3k row (384 tok/s) is the speed of reading tokens 79k-127k, not an average from zero. MLX's
+  them, so the 127.3k row (381 tok/s) is the speed of reading tokens 79k-127k, not an average from zero. MLX's
   prefill numbers in the cold sweep are averages over the whole prompt, so the two columns are not the same
   measurement; the cold sweep is the like-for-like one.
 - **Agent sessions**: MLX-VLM re-reads the whole prompt every turn (0 cached tokens), inkling-server reads only
