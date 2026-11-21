@@ -364,3 +364,6 @@ worse than MLX-bf16's.
 - acc_check (metal, after the above, 64 steps): p0 64/64 fp32-KL 1.7e-3; p1 63/64 1.7e-3; p2 63/64 8.3e-4;
   p3 62/64 fp32-KL 1.18e-2 with A's attention_gemm, **4.8e-3 with the flash prefill attention**
   (INK_AG_MIN_T=1000000), i.e. the GEMM attention costs accuracy on long prompts (MLX-bf16: 8.2e-3).
+- 2026-11-21 C: **caveat on my first real-engine numbers** (17:56 run): per B, that build had DSpark shadowed by
+  weak stubs (plain decode only) and a kv_append race for prefill chunks > the 1536-slot local ring, so prompts
+  > 2048 tokens ran on a partly wrong local KV. Treat those ctxbench/qh numbers as superseded; rerun on >= 5f0fe21.
