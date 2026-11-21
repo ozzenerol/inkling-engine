@@ -39,6 +39,7 @@ int main(int argc, char** argv) {
   int interleave = getenv("INTERLEAVE") ? atoi(getenv("INTERLEAVE")) : 0;
   Tensor tmp = be->alloc(DType::BF16, {T, 2304}, "tmp");
   bool indep = getenv("INTERLEAVE_INDEP") != nullptr;
+  bool dep = getenv("DEP") != nullptr;
   std::vector<std::pair<Tensor, Tensor>> pool;
   size_t pool_i = 0;
   if (indep)
@@ -47,8 +48,12 @@ int main(int argc, char** argv) {
   std::vector<double> t, tw;
   for (int r = 0; r < 8; r++) {
     auto w0 = std::chrono::steady_clock::now();
+    const Tensor* prev = nullptr;
     for (auto& m : ms) {
-      be->linear(m.w.dim(1) * 4 == 2304 ? x23 : x30, m.w, m.y);
+      // DEP=1: a matvec reads the previous one's output when the sizes fit (a chain, as in the model)
+      const Tensor& in = (dep && prev && prev->dim(1) == m.w.dim(1) * 4) ? *prev : (m.w.dim(1) * 4 == 2304 ? x23 : x30);
+      be->linear(in, m.w, m.y);
+      prev = &m.y;
       // INTERLEAVE=n: n tiny dependent dispatches after each matvec, as in a decode step (tests whether the gaps
       // between big reads, not the reads, make the in-model dense cost 3x this bench)
       for (int i = 0; i < interleave; i++) {
@@ -66,7 +71,7 @@ int main(int argc, char** argv) {
   }
   std::sort(t.begin(), t.end());
   std::sort(tw.begin(), tw.end());
-  printf("q8 matvec T=%lld interleave %d%s: %zu matrices, %.2f GB, median %.3f ms -> %.0f GB/s\n", (long long)T, interleave, indep ? " (independent)" : "", ms.size(),
+  printf("q8 matvec T=%lld%s interleave %d%s: %zu matrices, %.2f GB, median %.3f ms -> %.0f GB/s\n", (long long)T, dep ? " DEP" : "", interleave, indep ? " (independent)" : "", ms.size(),
          bytes / 1e9, t[4], bytes / 1e9 / (t[4] / 1e3));
   // wall clock (encode + submit + wait): a GPU time above the memory bandwidth means the GPU timestamps miss work
   printf("  wall median %.3f ms -> %.0f GB/s\n", tw[4], bytes / 1e9 / (tw[4] / 1e3));
