@@ -35,3 +35,12 @@ inline float e8m0_to_f(uint b) {
   return as_type<float>(b << 23);
 }
 
+
+// 8x8 simdgroup matrix element layout (same as MLX BaseMMAFrag): thread holds row fm, cols fn and fn+1.
+inline short2 frag_coord(uint lane) {  // (col, row) of the first of this thread's two elements
+  short qid = short(lane / 4);
+  short fm = (qid & 4) + short((lane / 2) % 4);
+  short fn = (qid & 2) * 2 + short(lane % 2) * 2;
+  return short2(fn, fm);
+}
+

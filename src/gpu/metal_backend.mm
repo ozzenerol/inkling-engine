@@ -358,8 +358,8 @@ class MetalBackend final : public Backend {
       uint32_t nsplit = cdiv(nkeys, split_keys);
       AttnDecParams p{T, H, KVH, uint32_t(a.kv.cap), len, a.kv.ring ? 1u : 0u, window, uint32_t(a.rel_proj.dim(1)),
                       split_keys, nsplit};
-      Tensor part = scratch("attn-part", DType::F32, {KVH * nsplit * 12, 132});
-      pipe(T == 1 ? "attn_decode_split_r3" : "attn_decode_split_r12");
+      Tensor part = scratch("attn-part", DType::F32, {KVH * nsplit * 16, 132});
+      pipe(T <= 2 ? "attn_decode_split_f1" : "attn_decode_split_f2");
       bind(0, a.q);
       bind(1, a.k_new);
       bind(2, a.v_new);
@@ -369,7 +369,7 @@ class MetalBackend final : public Backend {
       bind(6, a.kv.v.valid() ? a.kv.v : a.v_new);
       bind(7, part);
       g_.set_value(8, p);
-      g_.dispatch({KVH, nsplit, 1}, {128, 1, 1});
+      g_.dispatch({KVH, nsplit, 1}, {64, 1, 1});
       pipe("attn_decode_combine");
       bind(0, part);
       bind(1, a.sink);

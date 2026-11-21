@@ -1,7 +1,8 @@
-// Decode / short-verify attention, split over keys (flash-decoding). Owner: B.
-// Threadgroup = (kv head, key split), 4 simdgroups. It serves the 3 q heads of the GQA group for all T (<= 4)
-// queries: R = 3*T rows. Scores: one lane per key (lane reads its key row). PV: 4 dims per lane, p broadcast.
-// Writes per-split partials (m, l, o[128]) that attn_decode_combine reduces together with the sink logit.
+// Decode / short-verify attention, split over keys (flash-decoding) with simdgroup matrices. Owner: B.
+// Threadgroup = (kv head, key split), 2 simdgroups. Rows = the 3 q heads of the GQA group x T queries (T <= 4),
+// padded to NF frag rows of 8 (row rr = t*3 + head-in-group). Each simdgroup walks every other 16-key block of the
+// split: K and V tiles are staged in its own threadgroup area with coalesced 16-byte loads, S = Q K^T and O += P V
+// on 8x8 frags, softmax on the frag elements. Partials (m, l, o[128]) per row go to attn_decode_combine.
 
 struct AttnDecParams {
   uint T, H, KVH;
@@ -9,11 +10,11 @@ struct AttnDecParams {
   uint split_keys, nsplit;
 };
 
-constant uint AD_MAXR = 12;
+constant uint AD_MAXR = 16;  // partial rows per (kvh, split)
+constant uint AD_BK = 16;
+constant uint AD_SG = 2;
 
-inline uint key_slot(uint pos, constant AttnDecParams& p) { return p.ring ? pos % p.cap : pos; }
-
-template <uint MR>
+template <uint NF>
 kernel void attn_decode_split(device const ushort* q [[buffer(0)]], device const ushort* k_new [[buffer(1)]],
                               device const ushort* v_new [[buffer(2)]], device const ushort* r [[buffer(3)]],
                               device const ushort* rel_proj [[buffer(4)]], device const ushort* kc [[buffer(5)]],
@@ -21,127 +22,176 @@ kernel void attn_decode_split(device const ushort* q [[buffer(0)]], device const
                               constant AttnDecParams& p [[buffer(8)]], uint2 tg [[threadgroup_position_in_grid]],
                               uint tid [[thread_index_in_threadgroup]], uint sg [[simdgroup_index_in_threadgroup]],
                               uint lane [[thread_index_in_simdgroup]]) {
+  constexpr uint LDK = 128 + 8;
+  threadgroup bfloat Ks[AD_SG][AD_BK * LDK];
+  threadgroup bfloat Vs[AD_SG][AD_BK * LDK];
+  threadgroup bfloat Qst[8 * NF * 128];
   uint kvh = tg.x, split = tg.y;
-  uint G = p.H / p.KVH;  // 3
-  uint R = min(G * p.T, MR);
-  threadgroup float qs[AD_MAXR][128];
-  threadgroup float rs[AD_MAXR][16];
-  for (uint i = tid; i < R * 128; i += 128) {
-    uint rr = i / 128, d = i % 128, t = rr / G, h = kvh * G + rr % G;
-    qs[rr][d] = bf2f(q[(t * p.H + h) * 128 + d]);
-  }
-  for (uint i = tid; i < R * 16; i += 128) {
-    uint rr = i / 16, d = i % 16, t = rr / G, h = kvh * G + rr % G;
-    rs[rr][d] = bf2f(r[(t * p.H + h) * 16 + d]);
+  uint G = p.H / p.KVH;
+  uint R = G * p.T;
+  for (uint i = tid; i < 8 * NF * 128; i += 32 * AD_SG) {
+    uint rr = i / 128, d = i % 128;
+    uint rc = min(rr, R - 1), t = rc / G, h = kvh * G + rc % G;
+    Qst[i] = as_type<bfloat>(q[(t * p.H + h) * 128 + d]);
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
-  // key range of this split: positions [lo, hi) over all keys any query can see
-  uint last = p.len + p.T - 1;  // newest key position
+  simdgroup_bfloat8x8 qf[NF][16];
+  for (uint f = 0; f < NF; f++)
+    for (uint d = 0; d < 16; d++) simdgroup_load(qf[f][d], Qst + (f * 8) * 128 + d * 8, 128);
+
+  short2 fc = frag_coord(lane);
+  uint fm = uint(fc.y), fn = uint(fc.x);
+  // per frag row f: this thread's row rr = f*8 + fm
+  float rrv[NF][16];
+  uint qpos[NF];
+  bool rok[NF];
+  for (uint f = 0; f < NF; f++) {
+    uint rr = f * 8 + fm;
+    rok[f] = rr < R;
+    uint rc = min(rr, R - 1), t = rc / G, h = kvh * G + rc % G;
+    qpos[f] = p.len + t;
+    for (uint d = 0; d < 16; d++) rrv[f][d] = bf2f(r[(t * p.H + h) * 16 + d]);
+  }
+  uint last = p.len + p.T - 1;
   uint first = 0;
-  if (p.window && p.len + 1 > p.window) first = p.len + 1 - p.window;  // oldest key the first query sees
+  if (p.window && p.len + 1 > p.window) first = p.len + 1 - p.window;
   uint k0 = first + split * p.split_keys;
   uint k1 = min(k0 + p.split_keys, last + 1);
   const float scale = 0.08838834764831845f;
-  float m[MR], l[MR], o[MR][4];
-  for (uint rr = 0; rr < MR; rr++) {
-    m[rr] = -INFINITY;
-    l[rr] = 0;
-    for (uint j = 0; j < 4; j++) o[rr][j] = 0;
+  float m[NF], l[NF];
+  simdgroup_float8x8 of[NF][16];
+  for (uint f = 0; f < NF; f++) {
+    m[f] = -INFINITY;
+    l[f] = 0;
+    for (uint j = 0; j < 16; j++) of[f][j] = simdgroup_float8x8(0);
   }
-  for (uint base = k0 + sg * 32; base < k1; base += 128) {
-    uint pos = base + lane;
-    bool kvalid = pos < k1;
-    device const ushort* kp;
-    if (pos < p.len) kp = kc + (size_t(kvh) * p.cap + key_slot(pos, p)) * 128;
-    else kp = k_new + (size_t(min(pos, last) - p.len) * p.KVH + kvh) * 128;
-    float s[MR];
-    for (uint rr = 0; rr < R; rr++) s[rr] = 0;
-    device const uint4* kp4 = (device const uint4*)kp;
-    for (uint c = 0; c < 16; c++) {
-      float kv[8];
-      unpack_bf8(kp4[c], kv);
-      for (uint rr = 0; rr < R; rr++)
-        for (uint i = 0; i < 8; i++) s[rr] = fma(qs[rr][c * 8 + i], kv[i], s[rr]);
+  threadgroup bfloat* K_ = Ks[sg];
+  threadgroup bfloat* V_ = Vs[sg];
+  for (uint kb = k0 + sg * AD_BK; kb < k1; kb += AD_BK * AD_SG) {
+    for (uint i = lane; i < AD_BK * 16; i += 32) {
+      uint kr = i / 16, c8 = (i % 16) * 8;
+      uint pos = min(kb + kr, k1 - 1);
+      device const ushort* kp;
+      device const ushort* vp;
+      if (pos < p.len) {
+        uint slot = p.ring ? pos % p.cap : pos;
+        kp = kc + (size_t(kvh) * p.cap + slot) * 128;
+        vp = vc + (size_t(kvh) * p.cap + slot) * 128;
+      } else {
+        kp = k_new + (size_t(pos - p.len) * p.KVH + kvh) * 128;
+        vp = v_new + (size_t(pos - p.len) * p.KVH + kvh) * 128;
+      }
+      *(threadgroup uint4*)(K_ + kr * LDK + c8) = *(device const uint4*)(kp + c8);
+      *(threadgroup uint4*)(V_ + kr * LDK + c8) = *(device const uint4*)(vp + c8);
     }
-    for (uint rr = 0; rr < R; rr++) {
-      uint t = rr / G, qpos = p.len + t;
-      bool vis = kvalid && pos <= qpos && (p.window == 0 || qpos - pos < p.window);
-      float sc = -INFINITY;
-      if (vis) {
-        sc = s[rr] * scale;
-        uint dist = qpos - pos;
-        if (dist < p.rel_extent) {
-          float b = 0;
-          for (uint d = 0; d < 16; d++) b = fma(rs[rr][d], bf2f(rel_proj[d * p.rel_extent + dist]), b);
-          sc += round_bf(b);
+    simdgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint f = 0; f < NF; f++) {
+      simdgroup_float8x8 sf[2] = {simdgroup_float8x8(0), simdgroup_float8x8(0)};
+      for (uint d = 0; d < 16; d++)
+        for (uint j = 0; j < 2; j++) {
+          simdgroup_bfloat8x8 kf;
+          simdgroup_load(kf, K_ + (j * 8) * LDK + d * 8, LDK, ulong2(0, 0), true);
+          simdgroup_multiply_accumulate(sf[j], qf[f][d], kf, sf[j]);
+        }
+      float cmax = -INFINITY;
+      for (uint j = 0; j < 2; j++) {
+        thread auto& el = sf[j].thread_elements();
+        for (uint e = 0; e < 2; e++) {
+          uint kpos = kb + j * 8 + fn + e;
+          bool vis = rok[f] && kpos < k1 && kpos <= qpos[f] && (p.window == 0 || qpos[f] - kpos < p.window);
+          float sc = -INFINITY;
+          if (vis) {
+            sc = el[e] * scale;
+            uint dist = qpos[f] - kpos;
+            if (dist < p.rel_extent) {
+              float b = 0;
+              for (uint d = 0; d < 16; d++) b = fma(rrv[f][d], bf2f(rel_proj[d * p.rel_extent + dist]), b);
+              sc += round_bf(b);
+            }
+          }
+          el[e] = sc;
+          cmax = max(cmax, sc);
         }
       }
-      s[rr] = sc;
-    }
-    // online softmax per row over this chunk of 32 keys
-    float pr[MR];
-    for (uint rr = 0; rr < R; rr++) {
-      float cm = simd_max(s[rr]);
-      float mn = max(m[rr], cm);
-      float c = mn == -INFINITY ? 1.0f : exp(m[rr] - mn);
-      pr[rr] = mn == -INFINITY ? 0.0f : exp(s[rr] - mn);
-      l[rr] = l[rr] * c + simd_sum(pr[rr]);
-      for (uint j = 0; j < 4; j++) o[rr][j] *= c;
-      m[rr] = mn;
-    }
-    uint nk = min(32u, k1 - base);
-    for (uint kk = 0; kk < nk; kk++) {
-      uint vpos = base + kk;
-      device const ushort* vp;
-      if (vpos < p.len) vp = vc + (size_t(kvh) * p.cap + key_slot(vpos, p)) * 128;
-      else vp = v_new + (size_t(vpos - p.len) * p.KVH + kvh) * 128;
-      uint2 vv = *(device const uint2*)(vp + lane * 4);
-      float v0 = as_type<float>(vv.x << 16), v1 = as_type<float>(vv.x & 0xffff0000u);
-      float v2 = as_type<float>(vv.y << 16), v3 = as_type<float>(vv.y & 0xffff0000u);
-      for (uint rr = 0; rr < R; rr++) {
-        float pk = simd_shuffle(pr[rr], kk);
-        o[rr][0] = fma(pk, v0, o[rr][0]);
-        o[rr][1] = fma(pk, v1, o[rr][1]);
-        o[rr][2] = fma(pk, v2, o[rr][2]);
-        o[rr][3] = fma(pk, v3, o[rr][3]);
+      cmax = max(cmax, simd_shuffle_xor(cmax, 1));
+      cmax = max(cmax, simd_shuffle_xor(cmax, 8));
+      float mn = max(m[f], cmax);
+      float corr = mn == -INFINITY ? 1.0f : exp(m[f] - mn);
+      float psum = 0;
+      for (uint j = 0; j < 2; j++) {
+        thread auto& el = sf[j].thread_elements();
+        for (uint e = 0; e < 2; e++) {
+          float pv = el[e] == -INFINITY ? 0.0f : exp(el[e] - mn);
+          el[e] = pv;
+          psum += pv;
+        }
+      }
+      psum += simd_shuffle_xor(psum, 1);
+      psum += simd_shuffle_xor(psum, 8);
+      l[f] = l[f] * corr + psum;
+      m[f] = mn;
+      for (uint j = 0; j < 16; j++) {
+        thread auto& oe = of[f][j].thread_elements();
+        oe[0] *= corr;
+        oe[1] *= corr;
+        for (uint kk = 0; kk < 2; kk++) {
+          simdgroup_float8x8 vf;
+          thread auto& ve = vf.thread_elements();
+          threadgroup const bfloat* vr = V_ + (kk * 8 + fm) * LDK + j * 8 + fn;
+          ve[0] = float(vr[0]);
+          ve[1] = float(vr[1]);
+          simdgroup_multiply_accumulate(of[f][j], sf[kk], vf, of[f][j]);
+        }
       }
     }
+    simdgroup_barrier(mem_flags::mem_threadgroup);
   }
-  // combine the 4 simdgroups through threadgroup memory
-  threadgroup float tm[4][AD_MAXR], tl[4][AD_MAXR];
-  threadgroup float to[4][AD_MAXR][128];
-  for (uint rr = 0; rr < R; rr++) {
-    if (lane == 0) {
-      tm[sg][rr] = m[rr];
-      tl[sg][rr] = l[rr];
-    }
-    for (uint j = 0; j < 4; j++) to[sg][rr][lane * 4 + j] = o[rr][j];
-  }
+  // combine the 2 simdgroups: sg 1 writes its partial to threadgroup memory (reusing the K/V areas as float)
   threadgroup_barrier(mem_flags::mem_threadgroup);
-  // 128 threads: thread = dim, loop rows
-  for (uint rr = 0; rr < R; rr++) {
-    float M = -INFINITY;
-    for (uint i = 0; i < 4; i++) M = max(M, tm[i][rr]);
-    float L = 0, O = 0;
-    for (uint i = 0; i < 4; i++) {
-      if (tm[i][rr] == -INFINITY) continue;
-      float c = exp(tm[i][rr] - M);
-      L += tl[i][rr] * c;
-      O += to[i][rr][tid] * c;
+  threadgroup float* xo = (threadgroup float*)&Ks[0][0];  // NF*8 rows x 128 floats (<= 16 KB fits in Ks+Vs)
+  threadgroup float* xm = (threadgroup float*)&Qst[0];    // m, l per row
+  if (sg == 1)
+    for (uint f = 0; f < NF; f++) {
+      if (lane % 4 == 0 || true) {
+        // rows are shared by 4 lanes; any of them may write m, l (same values)
+        xm[(f * 8 + fm) * 2] = m[f];
+        xm[(f * 8 + fm) * 2 + 1] = l[f];
+      }
+      for (uint j = 0; j < 16; j++) {
+        thread auto& oe = of[f][j].thread_elements();
+        xo[(f * 8 + fm) * 128 + j * 8 + fn] = oe[0];
+        xo[(f * 8 + fm) * 128 + j * 8 + fn + 1] = oe[1];
+      }
     }
-    device float* dst = part + (size_t(kvh * p.nsplit + split) * AD_MAXR + rr) * 132;
-    dst[4 + tid] = O;
-    if (tid == 0) {
-      dst[0] = M;
-      dst[1] = L;
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (sg == 0)
+    for (uint f = 0; f < NF; f++) {
+      uint rr = f * 8 + fm;
+      float m1 = xm[rr * 2], l1 = xm[rr * 2 + 1];
+      float M = max(m[f], m1);
+      float c0 = m[f] == -INFINITY ? 0.0f : exp(m[f] - M);
+      float c1 = m1 == -INFINITY ? 0.0f : exp(m1 - M);
+      device float* dst = part + (size_t(kvh * p.nsplit + split) * AD_MAXR + rr) * 132;
+      if (rr < R) {
+        if (lane % 4 == 0 || true) {
+          dst[0] = M;
+          dst[1] = l[f] * c0 + l1 * c1;
+        }
+        for (uint j = 0; j < 16; j++) {
+          thread auto& oe = of[f][j].thread_elements();
+          for (uint e = 0; e < 2; e++) {
+            uint d = j * 8 + fn + e;
+            dst[4 + d] = oe[e] * c0 + xo[rr * 128 + d] * c1;
+          }
+        }
+      }
     }
-  }
 }
 
-template [[host_name("attn_decode_split_r3")]] kernel void attn_decode_split<3>(
+template [[host_name("attn_decode_split_f1")]] kernel void attn_decode_split<1>(
     device const ushort*, device const ushort*, device const ushort*, device const ushort*, device const ushort*,
     device const ushort*, device const ushort*, device float*, constant AttnDecParams&, uint2, uint, uint, uint);
-template [[host_name("attn_decode_split_r12")]] kernel void attn_decode_split<12>(
+template [[host_name("attn_decode_split_f2")]] kernel void attn_decode_split<2>(
     device const ushort*, device const ushort*, device const ushort*, device const ushort*, device const ushort*,
     device const ushort*, device const ushort*, device float*, constant AttnDecParams&, uint2, uint, uint, uint);
 

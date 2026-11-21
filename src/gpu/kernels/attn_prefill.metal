@@ -12,13 +12,6 @@ struct AttnPreParams {
 
 constant uint AP_BQ = 32, AP_BK = 32, AP_SG = 12;
 
-inline short2 frag_coord(uint lane) {  // (col, row) of the first of this thread's two elements
-  short qid = short(lane / 4);
-  short fm = (qid & 4) + short((lane / 2) % 4);
-  short fn = (qid & 2) * 2 + short(lane % 2) * 2;
-  return short2(fn, fm);
-}
-
 kernel void attn_prefill(device const ushort* q [[buffer(0)]], device const ushort* k_new [[buffer(1)]],
                          device const ushort* v_new [[buffer(2)]], device const ushort* r [[buffer(3)]],
                          device const ushort* rel_proj [[buffer(4)]], device const ushort* sink [[buffer(5)]],
