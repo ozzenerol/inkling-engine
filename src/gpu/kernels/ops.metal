@@ -799,3 +799,34 @@ kernel void rms_norm3(device const void* x0 [[buffer(0)]], device const void* x1
     stv(out, dto, base + i, v);
   }
 }
+
+// Short conv, parallel over (channel, row): out[t] depends only on inputs x[t-3..t] (state rows for t < 3), so
+// rows are independent. Same arithmetic as short_conv4. State/hist rows are written from the inputs directly.
+kernel void short_conv4_par(device const ushort* x [[buffer(0)]], device const ushort* w [[buffer(1)]],
+                            device const float* state [[buffer(2)]], device ushort* out [[buffer(3)]],
+                            constant ConvParams& p [[buffer(4)]], device float* hist [[buffer(5)]],
+                            device float* state_out [[buffer(6)]], uint2 gid [[thread_position_in_grid]]) {
+  uint c = gid.x, t = gid.y;
+  if (c >= p.C || t >= p.T) return;
+  int ti = int(t);
+  float v4[4];  // inputs rows t-3..t (negative rows: old state)
+  for (int j = 0; j < 4; j++) {
+    int r = ti - 3 + j;
+    v4[j] = r < 0 ? state[uint(3 + r) * p.C + c] : bf2f(x[uint(r) * p.C + c]);
+  }
+  float s0 = v4[0], s1 = v4[1], s2 = v4[2], xv = v4[3];
+  float w0 = bf2f(w[c * 4 + 0]), w1 = bf2f(w[c * 4 + 1]), w2 = bf2f(w[c * 4 + 2]), w3 = bf2f(w[c * 4 + 3]);
+  const float div = 2.2360679774997896f;
+  float v = 0;
+  v = v + s0 * w0;
+  v = v + s1 * w1;
+  v = v + s2 * w2;
+  v = v + xv * w3;
+  out[t * p.C + c] = f2bf((v + xv) / div);
+  if (p.has_hist) {  // state after row t = inputs t-2, t-1, t
+    hist[(t * 3 + 0) * p.C + c] = s1;
+    hist[(t * 3 + 1) * p.C + c] = s2;
+    hist[(t * 3 + 2) * p.C + c] = xv;
+  }
+  if (t + 3 >= p.T) state_out[(t + 3 - p.T) * p.C + c] = xv;  // last 3 inputs; T >= 3 guaranteed by the host
+}

@@ -17,7 +17,7 @@ Format: `LOCK <agent> <what> <start time>` / `UNLOCK <agent> <time>`.
 
 **One line, always current. Replace it (do not append). Message the next holder when you release.**
 
-HOLDER: B (fused-op checks since 18:47; A released at 18:51) -> NEXT: C (full bench, 60-90 min) -> then A (8-bit validation)
+HOLDER: C (full bench, from 18:52, 60-90 min) -> NEXT: A (8-bit validation) -> then B
 
 Kernel micro-benches on synthetic buffers (op_diff, bench_*) do not need the lock but skew a running benchmark:
 do not run them while C is benchmarking.

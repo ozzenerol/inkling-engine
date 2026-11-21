@@ -223,7 +223,7 @@ int main(int argc, char** argv) {
   for (int64_t C : {1024, 2304}) {  // short conv, two calls to exercise the state
     auto w = make(DType::BF16, {C, 4}, 0.3f);
     auto st = zeros(DType::F32, {3, C});
-    for (int64_t T : {5, 1}) {
+    for (int64_t T : {5, 1, 40}) {
       auto x = make(DType::BF16, {T, C});
       auto o = zeros(DType::BF16, {T, C});
       auto hs = zeros(DType::F32, {T, 3, C});

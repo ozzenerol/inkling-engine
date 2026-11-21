@@ -525,6 +525,23 @@ class MetalBackend final : public Backend {
     uint32_t C = uint32_t(x.dim(-1));
     bool hh = hist && hist->valid();
     ConvParams p{uint32_t(x.numel() / C), C, 0, hh ? 1u : 0u};
+    if (p.T >= 16 && !getenv("INK_CONV_SERIAL")) {
+      // prefill: parallel over rows; new state goes to a scratch copy (rows read the old state), then copied back
+      Tensor ns = scratch("conv-newstate", DType::F32, {3, C});
+      pipe("short_conv4_par");
+      bind(0, x);
+      bind(1, w);
+      bind(2, state);
+      bind(3, out);
+      g_.set_value(4, p);
+      bind(5, hh ? *hist : state);
+      bind(6, ns);
+      g_.dispatch({cdiv(C, 256), p.T, 1}, {256, 1, 1});
+      Tensor nsv = ns;
+      nsv.set_shape({3, C});
+      copy(nsv, state, 0, 0, size_t(3) * C * 4);
+      return;
+    }
     pipe("short_conv4");
     bind(0, x);
     bind(1, w);
