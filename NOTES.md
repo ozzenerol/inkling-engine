@@ -879,3 +879,26 @@ warm-up now retries until 200. Still to measure (MLX=1 on any batch).
 The 8-bit read session at temp 0 writes 3639 tokens since batch 12 (2010 in batches 10-11): the pinned prefix
 changes the first prefill's chunking (2045 + 72 instead of 1058 + 1059), the logits move in the last bits and a
 near-tie goes the other way. Not a regression; totals of that session are comparable only within the same chunking.
+
+## Batch 14 (main 8ddda6d, 01:15-01:32): mix in two wide dispatches; C's numbers contaminated
+
+Gates pass (op_diff ALL OK, acc as before, spec identity, rollback). B: mix2 (plain mix as mix2_red + mix2_out,
+6.6 + 6.4 us vs 18.2 in the profile) 45.8 vs 44.7 tok/s on 8-bit, tokens identical; before the batch 46.1-46.3 vs
+45.5-45.7 over three runs. Default on (INK_MIX2=0 off). The fused-norm form stays one kernel (19 vs 22 us in two
+dispatches + rms).
+C's depth and agent numbers of this batch are NOT valid: the user ran nib chats on the same server at 01:28-01:30
+(checkpoints at 1121 / 1157 / 1215 tokens in the log are nib's prefix), which evicted the bench's cache on every
+turn (median TTFT 15.6 s) and shared the GPU. Batch 15 repeats them.
+
+## nib (2026-11-22): a harness written for this engine, ~/projects/nib
+
+Go, stdlib only, installed at ~/.local/bin/nib; README there. What it does differently because of this engine:
+constant system prompt + tool list (the pinned prefix, 1121 tokens; environment in the first user message, the
+same tools in read-only runs), append-only conversation with reasoning_content sent back, effort fixed per
+session (the template puts the effort line after the system prompt: a change re-reads the whole conversation),
+runaway thinking cut by closing the stream and appending a `Thinking effort level: 0.1` system message (rewind,
+no cache loss; not yet measured whether the model follows a mid-conversation effort line), tool results cut to
+8000 characters, read without line numbers and temperature 0 (copy drafts), compaction at 64k by asking for notes
+on the cached prompt. First real run: tools/nib_e2e.sh task 5/5 tests pass, 5 steps, 15.6 s, wrote 731 tokens at
+66 tok/s, read 2.3k at 563 tok/s. `tools/nib_e2e.sh` runs in C's queue after the qh test.
+Note for installs: copy the binary with rm + cp; cp over the old file gets the new one killed (exit 137) by macOS.
