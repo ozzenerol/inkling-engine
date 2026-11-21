@@ -133,6 +133,7 @@ def bench(args):
         row["tool_calls"] = len(r["calls"])
         turns.append(row)
         print(f"  {args.label} turn {k + 1}: prompt {row['prompt_tokens']}, cached {row['cached_tokens']}, "
+              f"read {read_tps(row):.0f} tok/s, "
               f"ttft {row['ttft']:.2f} s, wall {row['wall']:.2f} s, gen {row['gen_tps'] or 0:.1f} tok/s, "
               f"out {row['completion_tokens']} "
               f"({row['finish']}, {row['tool_calls']} calls)", flush=True)
@@ -158,6 +159,12 @@ def name(r):
     return r["label"] + (" copy" if r.get("scenario") == "copy" else "")
 
 
+def read_tps(t):
+    """New prompt tokens read per second of waiting: (prompt - cached) / TTFT. All-in, as the client sees it."""
+    new = (t.get("prompt_tokens") or 0) - (t.get("cached_tokens") or 0)
+    return new / t["ttft"] if t["ttft"] > 0 else 0.0
+
+
 def gen_median(r):
     v = [turn_gen(t) for t in r["turns"] if turn_gen(t)]
     return statistics.median(v) if v else 0.0
@@ -166,14 +173,17 @@ def gen_median(r):
 def report(paths):
     rs = [json.load(open(p)) for p in paths]
     print("| server | base ctx | turns | last prompt | total wall s | sum TTFT s | median TTFT after turn 1 s | "
-          "median gen tok/s | tokens out |")
-    print("|---|---|---|---|---|---|---|---|---|")
+          "median read tok/s after turn 1 | median gen tok/s | tokens out |")
+    print("|---|---|---|---|---|---|---|---|---|---|")
     for r in rs:
         print(f"| {name(r)} | {r['base_tokens']} | {len(r['turns'])} | {r['turns'][-1]['prompt_tokens']} | "
               f"{r['total_wall']:.1f} | {r['ttft_sum']:.1f} | {r['ttft_median_after_1']:.2f} | "
+              f"{statistics.median([read_tps(t) for t in r['turns'][1:]] or [0]):.0f} | "
               f"{gen_median(r):.1f} | {r['completion_tokens']} |")
+    print("\nread tok/s = new prompt tokens (prompt - cached) / time to first token: what one turn's read costs, "
+          "all-in.")
     print()
-    print("| turn | " + " | ".join(f"{name(r)}@{r['base_tokens']} TTFT s, gen tok/s (prompt/cached)" for r in rs)
+    print("| turn | " + " | ".join(f"{name(r)}@{r['base_tokens']} TTFT s, read tok/s, gen tok/s (prompt/cached)" for r in rs)
           + " |")
     print("|---|" + "---|" * len(rs))
     for k in range(max(len(r["turns"]) for r in rs)):
@@ -181,7 +191,7 @@ def report(paths):
         for r in rs:
             if k < len(r["turns"]):
                 t = r["turns"][k]
-                cells.append(f"{t['ttft']:.2f}, {turn_gen(t) or 0:.1f} ({t['prompt_tokens']}/{t['cached_tokens']})")
+                cells.append(f"{t['ttft']:.2f}, {read_tps(t):.0f}, {turn_gen(t) or 0:.1f} ({t['prompt_tokens']}/{t['cached_tokens']})")
             else:
                 cells.append("-")
         print(f"| {k + 1} | " + " | ".join(cells) + " |")

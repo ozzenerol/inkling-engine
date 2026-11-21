@@ -24,6 +24,7 @@ struct ApiOptions {
   float default_top_p = 1.0f;
   int default_top_k = 0;
   pyjson::Value default_effort;        // null = template default (0.9)
+  int64_t prefill_chunk = 2048;      // the engine's prefill chunk (EngineOptions.prefill_chunk)
   int64_t shared_prefix_min = 256;   // see PromptCache::set_shared_prefix_min
   bool splice = true;                // reuse generated token ids for assistant turns sent back
   bool keepalive_comments = true;    // SSE ": prefill" comments during long prefills

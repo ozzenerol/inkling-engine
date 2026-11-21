@@ -43,6 +43,7 @@ void PromptCache::invalidate() {
 PromptCache::Prep PromptCache::prepare(const std::vector<int32_t>& prompt,
                                        const std::function<void(int64_t, int64_t)>& progress) {
   Prep r;
+  const auto t_begin = std::chrono::steady_clock::now();
   const int64_t n = (int64_t)prompt.size();
   if (e_.cached_len() != (int64_t)toks_.size()) {
     std::fprintf(stderr, "[cache] engine has %lld tokens, cache thinks %zu: resetting\n",
@@ -100,12 +101,23 @@ PromptCache::Prep PromptCache::prepare(const std::vector<int32_t>& prompt,
   r.reused = cur;
   r.prefilled = n - cur;
   auto t0 = std::chrono::steady_clock::now();
+  r.position_s = std::chrono::duration<double>(t0 - t_begin).count();
   auto feed = [&](int64_t upto) {
-    const int64_t from = cur;
-    e_.prefill(std::span<const int32_t>(prompt.data() + from, upto - from), [&](int64_t done) {
-      if (progress) progress(from + done, n);
-    });
-    cur = upto;
+    // ceil(N / chunk) near-equal pieces: 2100 new tokens go as 1050 + 1050, not 2048 + 52.
+    const int64_t total = upto - cur, pieces = (total + chunk_ - 1) / chunk_;
+    for (int64_t k = 0; k < pieces; k++) {
+      const int64_t from = cur, len = (upto - cur) / (pieces - k);
+      e_.prefill(std::span<const int32_t>(prompt.data() + from, len), [&](int64_t done) {
+        if (progress) progress(from + done, n);
+      });
+      r.chunks.push_back(len);
+      cur += len;
+    }
+  };
+  auto timed_ckpt = [&](bool pin) {
+    auto c0 = std::chrono::steady_clock::now();
+    take_ckpt(pin);
+    r.ckpt_s += std::chrono::duration<double>(std::chrono::steady_clock::now() - c0).count();
   };
   // Shared prefix of a missed prompt: stop there once to checkpoint it.
   // (diverged: the cache went on differently after the common prefix, and the prompt goes on too.)
@@ -116,12 +128,12 @@ PromptCache::Prep PromptCache::prepare(const std::vector<int32_t>& prompt,
     // a divergence deeper in (an edited or regenerated turn) must not take the pin away from it.
     bool have_pin = false;
     for (auto& x : ck_) have_pin |= x.pinned && x.c.len <= target;
-    take_ckpt(!have_pin);
+    timed_ckpt(!have_pin);
   }
   feed(n);
-  r.prefill_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
   toks_ = prompt;
-  take_ckpt();
+  timed_ckpt(false);
+  r.prefill_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count() - r.ckpt_s;
   return r;
 }
 
