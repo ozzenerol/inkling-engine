@@ -453,3 +453,25 @@ head 0.93 -> 0.48). Check script: tests/ref/check_8bit_layout.py (tensor-by-tens
   so all four are in one accuracy class; GEMM vs flash attention shows no systematic difference (same median),
   and the 8-bit build is not measurably worse than the lossless one on this set. Prefill of the 6224-token prompt:
   8.5 s (731 tok/s).
+
+## Batches (A, integrator; logs in bench/batch-N/)
+
+- **Batch 1** (main d1ac5a8, 19:40): gates pass except op_diff (3 controller cases: test bounds, fixed by B in
+  b/work). Lookup drafts v1 lost: the "copy" prompt spent all 400 tokens thinking (no copying), and any forward
+  above 4 rows costs 61-126 ms (T=4: 47-53 ms).
+- **Batch 2** (main fa90053, 19:46): copy prompt now starts inside the answer's code block (ref_data/copy.ids,
+  2282 tokens; edit.ids). Greedy, 600 tokens, one run each:
+
+  | | plain | DSpark block 4 | + lookup max 3 | + lookup max 7 / 15 |
+  |---|---|---|---|---|
+  | copy | 33.9 tok/s | **62.0** (acceptance 1.00 / 1.00 / 1.00) | 53.2 (391 of 625 accepted) | 33.0 / 33.4 |
+  | edit | 33.4 | **54.7** (0.98 / 0.95 / 0.92) | 52.1 | 55.2 / 50.7 |
+
+  So on copy-heavy output the bundled drafter is already right every time and the BLOCK SIZE is the limit;
+  bare-trigram lookup is less precise than the drafter (-> v2: best of 4 positions by backward match, >= 6
+  tokens). Forward cost at 2.3k context: T=1 30.0 ms, T=2 35.5, T=3 46.7, T=4 52.6, T>=5 122-126 ms (D's task).
+  Server (C, lossless build): ctxbench gen 34.6 / 33.0 tok/s at 1.2k / 9.5k (1.50x / 1.36x MLX), prefill 655 / 746
+  (1.16x / 1.24x); agent bench 10 turns: median gen 58 tok/s (MLX 44.1), median TTFT 1.41 s (MLX 13.5 s), total
+  102 s (MLX 241.5 s); qh end-to-end PASS in 38 s.
+  Attention sparsity (INK_AG_STATS, p17, global layers): (row, 64-key tile) pairs below 1e-6 of the row's top
+  weight: 0-2.5%; 64x64 tiles where every row is below 1e-6: 0.0%. Skipping far keys is not an option.
