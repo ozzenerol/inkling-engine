@@ -71,7 +71,11 @@ def run_turn(url, model, messages, tools, max_tokens, temperature):
                     cur["arguments"] += fn.get("arguments") or ""
                 finish = c.get("finish_reason") or finish
     t1 = time.perf_counter()
-    return {"ttft": (first or t1) - t0, "wall": t1 - t0, "prompt_tokens": usage.get("prompt_tokens"),
+    n_out = usage.get("completion_tokens") or 0
+    # Generation speed after the first streamed delta (what the user watches); same formula for every server.
+    gen_tps = (n_out - 1) / (t1 - first) if first and n_out > 1 and t1 > first else None
+    return {"ttft": (first or t1) - t0, "wall": t1 - t0, "gen_tps": gen_tps,
+            "prompt_tokens": usage.get("prompt_tokens"),
             "cached_tokens": (usage.get("prompt_tokens_details") or {}).get("cached_tokens"),
             "completion_tokens": usage.get("completion_tokens"), "finish": finish,
             "reasoning": reasoning, "content": content, "calls": [calls[k] for k in sorted(calls)]}
@@ -105,11 +109,13 @@ def bench(args):
         else:
             messages.append(a)
             messages.append({"role": "user", "content": f"Here is step{k}.py:\n{text}\nWhat is wrong with it?"})
-        row = {x: r[x] for x in ("ttft", "wall", "prompt_tokens", "cached_tokens", "completion_tokens", "finish")}
+        row = {x: r[x] for x in ("ttft", "wall", "gen_tps", "prompt_tokens", "cached_tokens", "completion_tokens",
+                                 "finish")}
         row["tool_calls"] = len(r["calls"])
         turns.append(row)
         print(f"  {args.label} turn {k + 1}: prompt {row['prompt_tokens']}, cached {row['cached_tokens']}, "
-              f"ttft {row['ttft']:.2f} s, wall {row['wall']:.2f} s, out {row['completion_tokens']} "
+              f"ttft {row['ttft']:.2f} s, wall {row['wall']:.2f} s, gen {row['gen_tps'] or 0:.1f} tok/s, "
+              f"out {row['completion_tokens']} "
               f"({row['finish']}, {row['tool_calls']} calls)", flush=True)
     total = time.perf_counter() - t_start
     return {"label": args.label, "url": args.url, "date": time.ctime(), "turns": turns, "total_wall": total,
@@ -117,27 +123,42 @@ def bench(args):
             "temperature": args.temperature,
             "ttft_median_after_1": statistics.median([t["ttft"] for t in turns[1:]]) if len(turns) > 1 else None,
             "ttft_sum": sum(t["ttft"] for t in turns),
+            "gen_tps_median": statistics.median([t["gen_tps"] for t in turns if t["gen_tps"]] or [0]),
             "completion_tokens": sum(t["completion_tokens"] or 0 for t in turns)}
+
+
+def turn_gen(t):
+    """Per-turn generation tok/s; older result files lack gen_tps, so derive it."""
+    if t.get("gen_tps"):
+        return t["gen_tps"]
+    n, dt = t.get("completion_tokens") or 0, t["wall"] - t["ttft"]
+    return (n - 1) / dt if n > 1 and dt > 0 else None
+
+
+def gen_median(r):
+    v = [turn_gen(t) for t in r["turns"] if turn_gen(t)]
+    return statistics.median(v) if v else 0.0
 
 
 def report(paths):
     rs = [json.load(open(p)) for p in paths]
     print("| server | base ctx | turns | last prompt | total wall s | sum TTFT s | median TTFT after turn 1 s | "
-          "tokens out |")
-    print("|---|---|---|---|---|---|---|---|")
+          "median gen tok/s | tokens out |")
+    print("|---|---|---|---|---|---|---|---|---|")
     for r in rs:
         print(f"| {r['label']} | {r['base_tokens']} | {len(r['turns'])} | {r['turns'][-1]['prompt_tokens']} | "
               f"{r['total_wall']:.1f} | {r['ttft_sum']:.1f} | {r['ttft_median_after_1']:.2f} | "
-              f"{r['completion_tokens']} |")
+              f"{gen_median(r):.1f} | {r['completion_tokens']} |")
     print()
-    print("| turn | " + " | ".join(f"{r['label']}@{r['base_tokens']} TTFT s (prompt/cached)" for r in rs) + " |")
+    print("| turn | " + " | ".join(f"{r['label']}@{r['base_tokens']} TTFT s, gen tok/s (prompt/cached)" for r in rs)
+          + " |")
     print("|---|" + "---|" * len(rs))
     for k in range(max(len(r["turns"]) for r in rs)):
         cells = []
         for r in rs:
             if k < len(r["turns"]):
                 t = r["turns"][k]
-                cells.append(f"{t['ttft']:.2f} ({t['prompt_tokens']}/{t['cached_tokens']})")
+                cells.append(f"{t['ttft']:.2f}, {turn_gen(t) or 0:.1f} ({t['prompt_tokens']}/{t['cached_tokens']})")
             else:
                 cells.append("-")
         print(f"| {k + 1} | " + " | ".join(cells) + " |")

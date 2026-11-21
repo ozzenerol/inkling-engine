@@ -1,7 +1,7 @@
 // inkling-server: OpenAI-compatible server for Inkling 2 Mini. Owner: C.
 //   inkling-server [--model DIR] [--host 127.0.0.1] [--port 8091] [--stub] [--ctx 131072] [--max-tokens 16384]
 //                  [--temp 1.0] [--effort none|low|...|0.5] [--no-mtp] [--draft-block 4] [--prefill-chunk 2048]
-//                  [--no-splice] [--ckpts 4]
+//                  [--no-splice] [--shared-prefix-min 256 (0 = off)] [--dump-requests DIR]
 #include <csignal>
 #include <cstdio>
 #include <cstdlib>
@@ -48,6 +48,7 @@ int main(int argc, char** argv) {
     else if (a == "--draft-block") eo.draft_block = std::stoi(next());
     else if (a == "--prefill-chunk") eo.prefill_chunk = std::stoi(next());
     else if (a == "--no-splice") ao.splice = false;
+    else if (a == "--shared-prefix-min") ao.shared_prefix_min = std::stoll(next());
     else if (a == "--quiet") ao.log = false;
     else if (a == "--dump-requests") ao.dump_dir = next();
     else { std::fprintf(stderr, "unknown option %s\n", a.c_str()); return 2; }

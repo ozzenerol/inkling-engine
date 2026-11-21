@@ -49,7 +49,9 @@ const pyjson::DumpOptions kSorted{",", ":", true, false};
 }  // namespace
 
 Api::Api(const Tokenizer& tok, EngineIface& eng, ApiOptions o)
-    : tok_(tok), eng_(eng), o_(std::move(o)), cache_(eng), stops_(OutputParser::stop_ids(tok)) {}
+    : tok_(tok), eng_(eng), o_(std::move(o)), cache_(eng), stops_(OutputParser::stop_ids(tok)) {
+  cache_.set_shared_prefix_min(o_.shared_prefix_min);
+}
 
 std::string Api::turn_key(const std::string& reasoning, const std::string& content,
                           const std::vector<std::pair<std::string, Value>>& calls) {
