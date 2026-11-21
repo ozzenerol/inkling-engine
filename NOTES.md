@@ -16,6 +16,8 @@ One model on the GPU at a time. Before loading weights: add a line here AND mess
 Format: `LOCK <agent> <what> <start time>` / `UNLOCK <agent> <time>`.
 
 (none held)  [A ran the MLX reference dump 17:22, done]
+LOCK C MLX-VLM baseline (serve_inkling.sh :8091, qh e2e + ctxbench) 17:43 / UNLOCK C 17:50
+
 
 ## Module layout and file ownership
 
@@ -233,3 +235,13 @@ src/engine/engine.cpp exists; `-DINK_SERVER_ENGINE=OFF` forces stub-only).
 - **Tests**: tests/server/api_test.py runs the server with `--stub` (scripted engine with the real cache contract:
   slack 512, checkpoint prefixes checked) — 30/30 pass: streaming, tool calls, 3-turn agent loop (turn 2 prefills
   13 tokens, turn 3 8 tokens), divergence + checkpoint restore, disconnect, length, errors.
+
+- 2026-11-21 C: **MLX-VLM baseline, same day** (serve_inkling.sh: DSpark block 4, prefill step 2048), one run each:
+  - qh e2e (/tmp/inkling-qh-test, tools/qh_e2e.sh mlx 2): 2/2 PASS (5/5 tests), 57 s and 40 s wall, 4-5 steps;
+    qh reports ~23 s of each run "reading the prompt" on a 3.6-3.9k context: MLX re-prefills every turn.
+  - ctxbench (temp 0.7, effort none, 400 tok): 1.2k 565/23.1, 9.5k 602/24.2, 38.6k 495/22.0 (prefill/gen tok/s),
+    matching BRIEF's table.
+  - saetta bench.py multi-turn (6 turns, 128 tok): cached_tokens 0 on every turn; TTFT 11.6, 15.5, 22.0, 27.9 s at
+    5.4k/8.3k/11.2k/14.1k prompt; turn 5 spent all 128 tokens thinking (effort none still thinks), so no content.
+  - bench.py's context sweep fails on Inkling: its 2-token calibration run gets no content (the first two tokens are
+    <|message_model|><|content_text|>). Use ctxbench for the sweep and bench.py --contexts "" for multi-turn.
