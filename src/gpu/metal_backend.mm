@@ -599,7 +599,7 @@ class MetalBackend final : public Backend {
     // kernel reduces in a different order, so a verify row above 4 would not equal the decode row.
     bool wide = p.T <= kMR;
     p.eps = eps;
-    if (wide && mix2_ && nq <= 4) {
+    if (wide && mix2_ && nq <= 4 && !normed) {  // the fused-norm form is faster in one kernel (19 vs 22 us)
       // two wide dispatches (+ rms_norm for the fused-norm form) instead of one latency-bound threadgroup
       Mix2Params mp{p.T, D, p.nb, nq, {}};
       Tensor red = scratch("mix2-red", DType::F32, {int64_t(p.T), 8, 5});
@@ -622,7 +622,6 @@ class MetalBackend final : public Backend {
           g_.dispatch({cdiv(D, 256), p.T, 1}, {256, 1, 1});
         }
       }
-      if (normed) rms_norm(out, gamma, eps, D, *normed);
       return;
     }
     pipe(normed ? "attn_residual_mix_norm_1024" : wide ? "attn_residual_mix_1024" : "attn_residual_mix");
@@ -1562,7 +1561,8 @@ class MetalBackend final : public Backend {
   // rows of one expert per MoE prefill tile (bit-identical for any choice)
   uint32_t moe_cur_m_ = 64;
   uint32_t moe_m_ = getenv("INK_MOE_M") ? uint32_t(atoi(getenv("INK_MOE_M"))) : 0u;  // 32, 64 or 0 = by T (default since batch 10)
-  bool mix2_ = getenv("INK_MIX2") != nullptr;  // opt-in until measured
+  // mix in two wide dispatches: 46.1-46.3 vs 45.5-45.7 tok/s on 8-bit (3 runs), tokens identical. INK_MIX2=0 off.
+  bool mix2_ = !(getenv("INK_MIX2") && getenv("INK_MIX2")[0] == '0');
   bool t2_off_ = getenv("INK_NO_T2") != nullptr;  // 2-row matvec kernels (same per-row arithmetic as t1 / t4)
   bool fuse2_ = getenv("INK_NO_FUSE2") == nullptr;  // batch 7: tokens identical, 43.5 vs 42.9 tok/s (8-bit)
   std::string skip_;
