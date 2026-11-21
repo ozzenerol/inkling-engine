@@ -183,6 +183,43 @@ int main(int argc, char** argv) {
     MTL->controller(x.m, mm, dn.m, fg.m, gn.m, o.m);
     compare("controller", o, 1e-4);
   }
+  for (int64_t T : {1, 3}) {  // controller_multi / rms_norm_multi (Metal fused) vs CPU loops
+    Pair xs[3], ms[3], dn[3], fg[3], gn[3], os[3];
+    for (int i = 0; i < 3; i++) {
+      xs[i] = make(DType::F32, {T, D});
+      ms[i] = make(DType::F32, {T, D});
+      dn[i] = make(DType::BF16, {64, 2 * D}, 0.02f);
+      fg[i] = make(DType::BF16, {D, 64}, 0.1f);
+      gn[i] = make(DType::BF16, {D, 64}, 0.1f);
+      os[i] = zeros(DType::F32, {T, D});
+    }
+    Tensor xc[3], mc[3], dc[3], fc[3], gc[3], oc[3], xm[3], mm[3], dm[3], fm[3], gm[3], om[3];
+    for (int i = 0; i < 3; i++) {
+      xc[i] = xs[i].c, mc[i] = ms[i].c, dc[i] = dn[i].c, fc[i] = fg[i].c, gc[i] = gn[i].c, oc[i] = os[i].c;
+      xm[i] = xs[i].m, mm[i] = ms[i].m, dm[i] = dn[i].m, fm[i] = fg[i].m, gm[i] = gn[i].m, om[i] = os[i].m;
+    }
+    CPU->controller_multi(3, xc, mc, dc, fc, gc, oc);
+    MTL->controller_multi(3, xm, mm, dm, fm, gm, om);
+    for (int i = 0; i < 3; i++) {
+      os[i].c = oc[i];
+      os[i].m = om[i];
+      compare(("controller_multi part " + std::to_string(i)).c_str(), os[i], 1e-4);
+    }
+    Pair gam[3], ro[3];
+    const Tensor *gcp[3], *gmp[3];
+    Tensor roc[3], rom[3];
+    for (int i = 0; i < 3; i++) {
+      gam[i] = make(DType::BF16, {D}, 0.2f, 1.0f);
+      ro[i] = zeros(DType::BF16, {T, D});
+      gcp[i] = &gam[i].c;
+      gmp[i] = &gam[i].m;
+      roc[i] = ro[i].c;
+      rom[i] = ro[i].m;
+    }
+    CPU->rms_norm_multi(3, oc, gcp, 1e-6f, D, roc);
+    MTL->rms_norm_multi(3, om, gmp, 1e-6f, D, rom);
+    for (int i = 0; i < 3; i++) compare(("rms_norm_multi part " + std::to_string(i)).c_str(), ro[i], 0, 1);
+  }
   for (int64_t C : {1024, 2304}) {  // short conv, two calls to exercise the state
     auto w = make(DType::BF16, {C, 4}, 0.3f);
     auto st = zeros(DType::F32, {3, C});

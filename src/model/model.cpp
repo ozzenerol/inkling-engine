@@ -367,23 +367,23 @@ void Model::run_visit(int v, Tensor& x, std::vector<Tensor>& blocks, const Tenso
     xk = xv = xq;
   } else {
     Tensor ins[3];
-    for (int i = 0; i < 3; ++i) {
-      ins[i] = part(i);
-      if (msg.valid()) {
-        Tensor out = view(parts_[i], {T, D});
-        Tensor mi = row_view(msg, i, {T, D});
-        be_.controller(ins[i], mi, w.ctrl_down[i], w.ctrl_forget[i], w.ctrl_gain[i], out);
-        if (i == 0) dbg("ctrl0", out);
-        ins[i] = out;
+    for (int i = 0; i < 3; ++i) ins[i] = part(i);
+    if (msg.valid()) {
+      // the three controllers (attn, k, v parts) in one batched op (B); same order and math as three calls
+      Tensor outs_c[3], ms_c[3];
+      for (int i = 0; i < 3; ++i) {
+        outs_c[i] = view(parts_[i], {T, D});
+        ms_c[i] = row_view(msg, i, {T, D});
       }
+      be_.controller_multi(3, ins, ms_c, w.ctrl_down.data(), w.ctrl_forget.data(), w.ctrl_gain.data(), outs_c);
+      dbg("ctrl0", outs_c[0]);
+      for (int i = 0; i < 3; ++i) ins[i] = outs_c[i];
     }
     const Tensor* norms[3] = {w.local ? &w.in_norm : &w.q_norm, w.local ? &w.in_norm : &w.k_norm,
                               w.local ? &w.in_norm : &w.v_norm};
     Tensor outs[3];
-    for (int i = 0; i < 3; ++i) {
-      outs[i] = view(partsb_[i], {T, D});
-      be_.rms_norm(ins[i], norms[i], cfg_.rms_eps, D, outs[i]);
-    }
+    for (int i = 0; i < 3; ++i) outs[i] = view(partsb_[i], {T, D});
+    be_.rms_norm_multi(3, ins, norms, cfg_.rms_eps, D, outs);
     dbg("xq", outs[0]);
     dbg("xk", outs[1]);
     dbg("xv", outs[2]);

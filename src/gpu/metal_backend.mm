@@ -45,6 +45,12 @@ struct MatvecMultiParams {
   uint32_t K, T, count;
   uint32_t row_start[9];
   uint32_t dt_out[8];
+  uint32_t x_off[8];
+};
+struct Rms3Params {
+  uint32_t rows, dim;
+  float eps;
+  uint32_t has_gamma[3], dt_x[3], dt_out[3];
 };
 struct PrepParams {
   uint32_t T, H, KVH;
@@ -417,6 +423,78 @@ class MetalBackend final : public Backend {
     mix(states, query, uint32_t(query.dim(0)), out);
   }
 
+  void controller_multi(int n, const Tensor* xs, const Tensor* ms, const Tensor* downs, const Tensor* forgets,
+                        const Tensor* gains, Tensor* outs) override {
+    uint32_t D = uint32_t(xs[0].dim(-1)), T = uint32_t(xs[0].numel() / D), R = uint32_t(downs[0].dim(0));
+    if (n != 3 || T > 4 || getenv("INK_NO_FUSE")) return Backend::controller_multi(n, xs, ms, downs, forgets, gains, outs);
+    if (skip("ctrl")) return;
+    CtrlParams p{T, D, R, D};
+    Tensor pair = scratch("ctrl-pair3", DType::BF16, {3 * T, 2 * D});
+    Tensor h = scratch("ctrl-h3", DType::BF16, {3 * T, R});
+    pipe("ctrl_pair3");
+    for (int i = 0; i < 3; i++) {
+      bind(i, xs[i]);
+      bind(3 + i, ms[i]);
+    }
+    bind(6, pair);
+    g_.set_value(7, p);
+    g_.dispatch({T, 3, 1}, {256, 1, 1});
+    // h_i = bf16(pair_i @ down_i^T): one matvec_multi with per-matrix inputs (same per-row math as linear)
+    MatvecMultiParams mp{};
+    mp.K = 2 * D;
+    mp.T = T;
+    mp.count = 3;
+    pipe("matvec_multi_bf16");
+    Tensor hv[3];
+    for (uint32_t i = 0; i < 8; i++) {
+      uint32_t j = std::min<uint32_t>(i, 2);
+      bind(i, downs[j]);
+      hv[j] = h;
+      hv[j].offset = h.offset + size_t(j) * T * R * 2;
+      bind(8 + i, hv[j]);
+    }
+    for (uint32_t i = 0; i < 3; i++) {
+      mp.row_start[i + 1] = mp.row_start[i] + R;
+      mp.dt_out[i] = 1;
+      mp.x_off[i] = i * T * 2 * D;
+    }
+    bind(16, pair);
+    g_.set_value(17, mp);
+    g_.dispatch({cdiv(mp.row_start[3], 8), 1, 1}, {64, 1, 1});
+    pipe("ctrl_out3");
+    for (int i = 0; i < 3; i++) {
+      bind(i, xs[i]);
+      bind(3 + i, ms[i]);
+      bind(7 + i, forgets[i]);
+      bind(10 + i, gains[i]);
+      bind(13 + i, outs[i]);
+    }
+    bind(6, h);
+    g_.set_value(16, p);
+    g_.dispatch({cdiv(D, 256), T, 3}, {256, 1, 1});
+  }
+  void rms_norm_multi(int n, const Tensor* xs, const Tensor* const* gammas, float eps, int64_t dim,
+                      Tensor* outs) override {
+    if (n != 3 || getenv("INK_NO_FUSE")) return Backend::rms_norm_multi(n, xs, gammas, eps, dim, outs);
+    if (skip("small")) return;
+    Rms3Params p{};
+    p.rows = uint32_t(xs[0].numel() / dim);
+    p.dim = uint32_t(dim);
+    p.eps = eps;
+    pipe("rms_norm3");
+    for (int i = 0; i < 3; i++) {
+      bool hg = gammas[i] && gammas[i]->valid();
+      if (hg && gammas[i]->dtype != DType::BF16) fail("rms_norm gamma must be bf16");
+      p.has_gamma[i] = hg;
+      p.dt_x[i] = dtc(xs[i].dtype);
+      p.dt_out[i] = dtc(outs[i].dtype);
+      bind(i, xs[i]);
+      bind(3 + i, hg ? *gammas[i] : xs[i]);
+      bind(6 + i, outs[i]);
+    }
+    g_.set_value(9, p);
+    g_.dispatch({p.rows, 3, 1}, {256, 1, 1});
+  }
   void controller(const Tensor& x, const Tensor& m, const Tensor& down, const Tensor& forget, const Tensor& gain,
                   Tensor& out) override {
     if (skip("ctrl")) return;

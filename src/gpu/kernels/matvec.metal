@@ -80,6 +80,7 @@ struct MatvecMultiParams {
   uint K, T, count;
   uint row_start[9];  // prefix sums of N_i (row_start[count] = total)
   uint dt_out[8];     // 0 f32, 1 bf16
+  uint x_off[8];      // element offset of matrix i's input rows in x (0 = shared input)
 };
 template <typename XT>
 kernel void matvec_multi(device const uint4* W0 [[buffer(0)]], device const uint4* W1 [[buffer(1)]],
@@ -111,7 +112,7 @@ kernel void matvec_multi(device const uint4* W0 [[buffer(0)]], device const uint
   for (uint k8 = lane; k8 < kv; k8 += 32) {
     float xv[4][8];
     for (uint t = 0; t < s.T; t++) {
-      device const XT* xp = x + t * s.K + k8 * 8;
+      device const XT* xp = x + s.x_off[mi] + t * s.K + k8 * 8;
       for (uint i = 0; i < 8; i++) xv[t][i] = float(xp[i]);
     }
     for (uint r = 0; r < R; r++) {

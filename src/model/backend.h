@@ -147,6 +147,16 @@ class Backend {
     attn_residual(states, query, mixed);
     rms_norm(mixed, &gamma, eps, mixed.dim(-1), normed);
   }
+  // n controller() calls in order (the attn/k/v parts of a looped layer).
+  virtual void controller_multi(int n, const Tensor* xs, const Tensor* ms, const Tensor* downs, const Tensor* forgets,
+                                const Tensor* gains, Tensor* outs) {
+    for (int i = 0; i < n; ++i) controller(xs[i], ms[i], downs[i], forgets[i], gains[i], outs[i]);
+  }
+  // n rms_norm() calls in order.
+  virtual void rms_norm_multi(int n, const Tensor* xs, const Tensor* const* gammas, float eps, int64_t dim,
+                              Tensor* outs) {
+    for (int i = 0; i < n; ++i) rms_norm(xs[i], gammas[i], eps, dim, outs[i]);
+  }
   // attention() then sigmoid_gate(out, gate, out).
   virtual void attention_gated(const AttnArgs& a, const Tensor& gate, Tensor& out) {
     attention(a, out);

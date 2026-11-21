@@ -5,11 +5,12 @@
 // For kv head g the query rows are r = token * 3 + (q head % 3), so all rows share the keys and values of g.
 // Per block of keys [j0, j0 + n):
 //   ag_scores  S = Q K^T in 64 x 64 tiles (bf16 tiles, fp32 accumulators), + bias, mask; writes
-//              sh = exp(s - t) as half, with t the row's max over the keys it sees in the 64-key tile (so sh is
-//              in [0, 1] with 11 bits of relative precision), and t to tmax.
-//   ag_pv      m = max(m, tile maxes); P = sh * exp(t - m) (half tile), O = exp(m_old - m) O + P V, l likewise.
+//              sh = exp(s - t) in fp32, with t the row's max over the keys it sees in the 64-key tile, and t to
+//              tmax.
+//   ag_pv      m = max(m, tile maxes); P = sh * exp(t - m) (fp32 tile), O = exp(m_old - m) O + P V, l likewise.
 // ag_init sets m = sink logit, l = 1, O = 0 (the sink is a zero value with its own logit); ag_final writes
-// out = bf16(O / l) (* sigmoid(gate)). Scores are fp32 until the exp; P is half (MLX rounds scores and P to bf16).
+// out = bf16(O / l) (* sigmoid(gate)). Scores, P and the P V sums are fp32 throughout (MLX rounds scores and P to bf16); saetta's half P tile was
+// faster but cost accuracy on long prompts (p3 KL vs fp32 up to 1.2e-2 against 4.8e-3 exact).
 
 struct AgParams {
   uint T, rows, rows_pad, H, KVH;
@@ -172,6 +173,10 @@ kernel void ag_scores(device const ushort* q [[buffer(0)]], device const ushort*
   }
 }
 
+// fp32 P and V tiles (exact), 16 keys per step so the threadgroup memory stays under 10 KB (float tiles of 32
+// keys spill and run 8 times slower).
+constant uint AG_PK = 16, AG_PLD = AG_PK + 4, AG_VLD2 = 64 + 4;
+
 kernel void ag_pv(device const float* sh [[buffer(0)]], device const ushort* v_new [[buffer(1)]],
                   device const ushort* vc [[buffer(2)]], device float* o [[buffer(3)]],
                   device const float* tmax [[buffer(4)]], constant AgParams& p [[buffer(5)]],
@@ -179,15 +184,17 @@ kernel void ag_pv(device const float* sh [[buffer(0)]], device const ushort* v_n
                   device const float* l_in [[buffer(8)]], device float* l_out [[buffer(9)]],
                   uint3 tg [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
                   uint simd [[simdgroup_index_in_threadgroup]]) {
-  threadgroup float c[64 * AG_LD + 32 * AG_VLD];  // P tile + V tile (fp32); the first 64 x 64 again for the store
+  threadgroup float c[64 * AG_PLD + AG_PK * AG_VLD2];  // P tile + V tile; the first 32 x 64 again for the store
+  threadgroup float rowa[64];
+  threadgroup float rowsum[64];
   threadgroup float* pt = c;
-  threadgroup float* vt = pt + 64 * AG_LD;
+  threadgroup float* vt = pt + 64 * AG_PLD;
   uint g = tg.z, r0 = tg.y * 64, d0 = tg.x * 64;
   if (r0 >= p.rows) return;
   int2 tk = ag_tile_keys(p, r0);
 
-  // Thread t loads P row t / 2 and later updates the same row of O.
-  uint pr = tid / 2, pc = (tid % 2) * 16;
+  // Thread t loads P row t / 2 (8 keys of each 16-key step).
+  uint pr = tid / 2, pc = (tid % 2) * 8;
   uint r = r0 + pr;
   ulong row = ulong(g) * p.rows_pad + r;
   float m_old = m_in[row];
@@ -204,43 +211,40 @@ kernel void ag_pv(device const float* sh [[buffer(0)]], device const ushort* v_n
   float a = exp(m_old - m_new);
 
   device const float* pp = sh + row * AG_KEYS + pc;
-  threadgroup float4* pd = (threadgroup float4*)(pt + pr * AG_LD + pc);
-  uint vr = tid / 4, vcol = (tid % 4) * 16;
-  threadgroup float4* vd = (threadgroup float4*)(vt + vr * AG_VLD + vcol);
+  threadgroup float4* pd = (threadgroup float4*)(pt + pr * AG_PLD + pc);
+  uint vr = tid / 8, vcol = (tid % 8) * 8;
+  threadgroup float4* vd = (threadgroup float4*)(vt + vr * AG_VLD2 + vcol);
 
   uint sm = (simd / 2) * 32, sn = (simd % 2) * 32;
   simdgroup_float8x8 acc[4][4];
   for (uint i = 0; i < 4; i++)
     for (uint j = 0; j < 4; j++) acc[i][j] = simdgroup_float8x8(0);
   float sum = 0.0f;
-  for (uint k0 = uint(tk.x); k0 < uint(tk.y); k0 += AG_BK) {
+  for (uint k0 = uint(tk.x); k0 < uint(tk.y); k0 += AG_PK) {
     float tm = tmax[row * AG_TILES + k0 / 64];
-    float off = tm == -INFINITY ? 0.0f : exp(tm - m_new);  // one exp per 32 keys instead of one per score
-    for (uint i = 0; i < 4; i++) {
+    float off = tm == -INFINITY ? 0.0f : exp(tm - m_new);
+    for (uint i = 0; i < 2; i++) {
       float4 e = ((device const float4*)(pp + k0))[i] * off;
       sum += e.x + e.y + e.z + e.w;
       pd[i] = e;
     }
-    bool v_ok = k0 + vr < p.n;
-    if (v_ok) {
-      device const uint4* vp = (device const uint4*)(ag_kv(vc, v_new, p, g, p.j0 + k0 + vr) + d0 + vcol);
-      for (uint i = 0; i < 2; i++) {
-        float f[8];
-        unpack_bf8(vp[i], f);
-        vd[2 * i] = float4(f[0], f[1], f[2], f[3]);
-        vd[2 * i + 1] = float4(f[4], f[5], f[6], f[7]);
-      }
+    if (k0 + vr < p.n) {
+      float f[8];
+      unpack_bf8(*(device const uint4*)(ag_kv(vc, v_new, p, g, p.j0 + k0 + vr) + d0 + vcol), f);
+      vd[0] = float4(f[0], f[1], f[2], f[3]);
+      vd[1] = float4(f[4], f[5], f[6], f[7]);
     } else {
-      for (uint i = 0; i < 4; i++) vd[i] = float4(0);
+      vd[0] = float4(0);
+      vd[1] = float4(0);
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 #pragma clang loop unroll(full)
-    for (uint kk = 0; kk < AG_BK; kk += 8) {
+    for (uint kk = 0; kk < AG_PK; kk += 8) {
       simdgroup_float8x8 a8[4];
       simdgroup_float8x8 b8[4];
       for (uint i = 0; i < 4; i++) {
-        simdgroup_load(a8[i], pt + (sm + 8 * i) * AG_LD + kk, AG_LD);
-        simdgroup_load(b8[i], vt + kk * AG_VLD + sn + 8 * i, AG_VLD);
+        simdgroup_load(a8[i], pt + (sm + 8 * i) * AG_PLD + kk, AG_PLD);
+        simdgroup_load(b8[i], vt + kk * AG_VLD2 + sn + 8 * i, AG_VLD2);
       }
       for (uint i = 0; i < 4; i++)
         for (uint j = 0; j < 4; j++) simdgroup_multiply_accumulate(acc[i][j], a8[i], b8[j], acc[i][j]);
@@ -248,19 +252,30 @@ kernel void ag_pv(device const float* sh [[buffer(0)]], device const ushort* v_n
     threadgroup_barrier(mem_flags::mem_threadgroup);
   }
   sum += simd_shuffle_xor(sum, 1);
-  for (uint i = 0; i < 4; i++)
-    for (uint j = 0; j < 4; j++) simdgroup_store(acc[i][j], c + (sm + 8 * i) * 64 + sn + 8 * j, 64);
-  threadgroup_barrier(mem_flags::mem_threadgroup);
-
-  if (r < p.rows) {
-    if (tg.x == 0 && tid % 2 == 0) {
+  if (tid % 2 == 0) {
+    rowa[pr] = a;
+    rowsum[pr] = sum;
+    if (tg.x == 0 && r < p.rows) {
       m_out[row] = m_new;
       l_out[row] = l_in[row] * a + sum;
     }
-    uint cc = (tid % 2) * 32;
-    device float* orow = o + row * AG_D + d0 + cc;
-    threadgroup const float* crow = c + pr * 64 + cc;
-    for (uint j = 0; j < 32; j++) orow[j] = a * orow[j] + crow[j];
+  }
+  // Store 32 rows at a time through the first 8 KB of c; thread t then updates 16 dims of row t / 4.
+  uint qr = tid / 4, cc = (tid % 4) * 16;
+  for (uint half_ = 0; half_ < 2; half_++) {
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (simd / 2 == half_) {
+      for (uint i = 0; i < 4; i++)
+        for (uint j = 0; j < 4; j++) simdgroup_store(acc[i][j], c + (8 * i) * 64 + sn + 8 * j, 64);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    uint lr = half_ * 32 + qr;
+    if (r0 + lr < p.rows) {
+      float ar = rowa[lr];
+      device float4* orow = (device float4*)(o + (ulong(g) * p.rows_pad + r0 + lr) * AG_D + d0 + cc);
+      threadgroup const float4* crow = (threadgroup const float4*)(c + qr * 64 + cc);
+      for (uint j = 0; j < 4; j++) orow[j] = ar * orow[j] + crow[j];
+    }
   }
 }
 

@@ -711,3 +711,91 @@ kernel void router_fused(device const void* x [[buffer(0)]], device const uint4*
     }
   }
 }
+
+// ---------------------------------------------------------------- batched controllers / norms (up to 3 parts)
+// Same per-part code as ctrl_pair / ctrl_out / rms_norm_rows; tg.y (or gid.z) selects the part.
+kernel void ctrl_pair3(device const float* x0 [[buffer(0)]], device const float* x1 [[buffer(1)]],
+                       device const float* x2 [[buffer(2)]], device const float* m0 [[buffer(3)]],
+                       device const float* m1 [[buffer(4)]], device const float* m2 [[buffer(5)]],
+                       device ushort* pair [[buffer(6)]], constant CtrlParams& p [[buffer(7)]],
+                       uint2 tgp [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
+                       uint lane [[thread_index_in_simdgroup]], uint sg [[simdgroup_index_in_threadgroup]]) {
+  threadgroup float scratch[RT / 32];
+  uint t = tgp.x, part = tgp.y;
+  device const float* xr = (part == 0 ? x0 : part == 1 ? x1 : x2) + t * p.D;
+  device const float* mr = (part == 0 ? m0 : part == 1 ? m1 : m2) + t * p.m_stride;
+  device ushort* pr = pair + (size_t(part) * p.T + t) * 2 * p.D;
+  float sx = 0, sm = 0;
+  for (uint i = tid; i < p.D; i += RT) {
+    sx += xr[i] * xr[i];
+    sm += mr[i] * mr[i];
+  }
+  sx = tg_sum(sx, scratch, tid, lane, sg);
+  sm = tg_sum(sm, scratch, tid, lane, sg);
+  float ix = metal::precise::rsqrt(sx / float(p.D) + 1e-6f), im = metal::precise::rsqrt(sm / float(p.D) + 1e-6f);
+  for (uint i = tid; i < p.D; i += RT) {
+    pr[i] = f2bf(xr[i] * ix);
+    pr[p.D + i] = f2bf(mr[i] * im);
+  }
+}
+kernel void ctrl_out3(device const float* x0 [[buffer(0)]], device const float* x1 [[buffer(1)]],
+                      device const float* x2 [[buffer(2)]], device const float* m0 [[buffer(3)]],
+                      device const float* m1 [[buffer(4)]], device const float* m2 [[buffer(5)]],
+                      device const ushort* h [[buffer(6)]], device const ushort* f0 [[buffer(7)]],
+                      device const ushort* f1 [[buffer(8)]], device const ushort* f2 [[buffer(9)]],
+                      device const ushort* g0 [[buffer(10)]], device const ushort* g1 [[buffer(11)]],
+                      device const ushort* g2 [[buffer(12)]], device float* o0 [[buffer(13)]],
+                      device float* o1 [[buffer(14)]], device float* o2 [[buffer(15)]],
+                      constant CtrlParams& p [[buffer(16)]], uint3 gid [[thread_position_in_grid]]) {
+  uint i = gid.x, t = gid.y, part = gid.z;
+  if (i >= p.D || t >= p.T) return;
+  device const float* x = part == 0 ? x0 : part == 1 ? x1 : x2;
+  device const float* m = part == 0 ? m0 : part == 1 ? m1 : m2;
+  device const ushort* forget = part == 0 ? f0 : part == 1 ? f1 : f2;
+  device const ushort* gain = part == 0 ? g0 : part == 1 ? g1 : g2;
+  device float* out = part == 0 ? o0 : part == 1 ? o1 : o2;
+  device const ushort* hr = h + (size_t(part) * p.T + t) * p.R;
+  float f = 0, g = 0;
+  for (uint r = 0; r < p.R; r++) {
+    float hv = bf2f(hr[r]);
+    f = fma(hv, bf2f(forget[i * p.R + r]), f);
+    g = fma(hv, bf2f(gain[i * p.R + r]), g);
+  }
+  f = precise::tanh(f);
+  g = precise::tanh(g);
+  float xv = x[t * p.D + i];
+  out[t * p.D + i] = (1 - f) * xv + g * m[t * p.m_stride + i];
+}
+struct Rms3Params {
+  uint rows, dim;
+  float eps;
+  uint has_gamma[3], dt_x[3], dt_out[3];
+};
+kernel void rms_norm3(device const void* x0 [[buffer(0)]], device const void* x1 [[buffer(1)]],
+                      device const void* x2 [[buffer(2)]], device const ushort* g0 [[buffer(3)]],
+                      device const ushort* g1 [[buffer(4)]], device const ushort* g2 [[buffer(5)]],
+                      device void* o0 [[buffer(6)]], device void* o1 [[buffer(7)]], device void* o2 [[buffer(8)]],
+                      constant Rms3Params& p [[buffer(9)]], uint2 tgp [[threadgroup_position_in_grid]],
+                      uint tid [[thread_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]],
+                      uint sg [[simdgroup_index_in_threadgroup]]) {
+  threadgroup float scratch[RT / 32];
+  uint row = tgp.x, part = tgp.y;
+  device const void* x = part == 0 ? x0 : part == 1 ? x1 : x2;
+  device const ushort* gamma = part == 0 ? g0 : part == 1 ? g1 : g2;
+  device void* out = part == 0 ? o0 : part == 1 ? o1 : o2;
+  uint dtx = p.dt_x[part], dto = p.dt_out[part];
+  uint base = row * p.dim;
+  float ss = 0;
+  for (uint i = tid; i < p.dim; i += RT) {
+    float v = ldv(x, dtx, base + i);
+    ss += v * v;
+  }
+  ss = tg_sum(ss, scratch, tid, lane, sg);
+  float inv = metal::precise::rsqrt(ss / float(p.dim) + p.eps);
+  for (uint i = tid; i < p.dim; i += RT) {
+    float v = ldv(x, dtx, base + i) * inv;
+    if (dtx == 1) v = round_bf(v);
+    if (p.has_gamma[part]) v = v * bf2f(gamma[i]);
+    stv(out, dto, base + i, v);
+  }
+}
