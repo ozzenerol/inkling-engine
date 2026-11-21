@@ -63,6 +63,11 @@ class Model {
   std::function<void(int visit, const Tensor& x)> on_visit;
 
   std::vector<VisitState>& visits() { return vs_; }
+  const Tensor& embed() const { return embed_; }            // bf16 [vocab, D]
+  const Tensor& embed_norm() const { return embed_norm_; }  // bf16 [D]
+  const Tensor& lm_head() const { return head_; }           // bf16 [vocab, D]
+  // Debug hook: named intermediates inside run_visit (see model.cpp), only when set.
+  std::function<void(int visit, const char* name, const Tensor& t)> on_debug;
   void set_len(int64_t n);  // used by Engine after restoring KV/conv state (B)
 
  private:

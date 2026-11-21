@@ -31,11 +31,16 @@ match = am == gen
 first = int(np.argmin(match)) if not match.all() else n
 print(f"steps {n}  greedy match {int(match.sum())}/{n}  first mismatch {first if first < n else '-'}  "
       f"KL mean {kl.mean():.3e} max {kl.max():.3e}  max|dlogit| {np.abs(rl - ol).max():.3f}")
-if first < n:
-    i = first
-    top_r = np.argsort(-rl[i])[:3]
-    top_o = np.argsort(-ol[i])[:3]
-    print(f"  step {i}: ref top {list(top_r)} {np.round(rl[i, top_r], 3)}  ours top {list(top_o)} {np.round(ol[i, top_o], 3)}")
+# Every mismatch with the reference's own top-2 margin (logit gap): a near-tie (gap below ~0.1) is a rounding
+# flip, a large gap would be a real error.
+for i in np.nonzero(~match)[0]:
+    top_r = np.argsort(-rl[i])[:2]
+    gap = rl[i, top_r[0]] - rl[i, top_r[1]]
+    ours_gap = ol[i, am[i]] - ol[i, gen[i]]
+    print(f"  mismatch step {i}: ref {gen[i]} (gap to 2nd {gap:.4f}), ours {am[i]} (ours prefers by {ours_gap:.4f}), KL {kl[i]:.2e}")
+gaps = np.sort(rl, -1)
+gaps = gaps[:, -1] - gaps[:, -2]
+print(f"  ref top-2 gap: min {gaps.min():.4f}, steps with gap < 0.1: {int((gaps < 0.1).sum())}")
 hs = sorted(out.glob("hidden_*.f32"), key=lambda p: int(p.stem.split("_")[1]))
 for p in hs:
     v = int(p.stem.split("_")[1])

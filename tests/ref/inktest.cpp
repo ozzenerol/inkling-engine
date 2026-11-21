@@ -9,6 +9,7 @@
 #include <unistd.h>
 #include <chrono>
 #include <cstdio>
+#include <cmath>
 #include <cstring>
 #include <fstream>
 #include <string>
@@ -44,6 +45,8 @@ int main(int argc, char** argv) {
   int steps = 8;
   int64_t chunk = 2048, ctx = 8192;
   bool hidden = false;
+  std::string isolate;
+  int debug_visit = -1;  // prefix of ref hidden files: PREFIX{v}.f32
   for (int i = 1; i < argc; ++i) {
     std::string a = argv[i];
     auto next = [&] { return std::string(argv[++i]); };
@@ -54,6 +57,8 @@ int main(int argc, char** argv) {
     else if (a == "--steps") steps = std::stoi(next());
     else if (a == "--out") out = next();
     else if (a == "--hidden") hidden = true;
+    else if (a == "--isolate") isolate = next();
+    else if (a == "--debug-visit") debug_visit = std::stoi(next());
     else if (a == "--chunk") chunk = std::stoll(next());
     else if (a == "--ctx") ctx = std::stoll(next());
     else { std::fprintf(stderr, "unknown arg %s\n", a.c_str()); return 2; }
@@ -67,6 +72,87 @@ int main(int argc, char** argv) {
     auto t1 = std::chrono::steady_clock::now();
     std::fprintf(stderr, "[inktest] backend %s, load %.1f s\n", be->name(), std::chrono::duration<double>(t1 - t0).count());
     const int64_t D = m.config().hidden, V = m.config().vocab_unpadded;
+    if (!isolate.empty()) {
+      // Per-visit isolation: run each visit on the reference input/blocks/bank, compare with the next ref input.
+      const auto& cfg = m.config();
+      const int64_t T = int64_t(ids.size());
+      auto load_ref = [&](int v) {
+        std::ifstream f(isolate + std::to_string(v) + ".f32", std::ios::binary);
+        std::vector<float> h(size_t(T * D));
+        f.read(reinterpret_cast<char*>(h.data()), h.size() * 4);
+        return h;
+      };
+      auto to_dev = [&](const std::vector<float>& h) {
+        Tensor t = be->alloc(DType::BF16, {T, D}, "iso");
+        std::vector<uint16_t> b(h.size());
+        for (size_t i = 0; i < h.size(); ++i) b[i] = f32_to_bf16(h[i]);
+        be->write(t, b.data(), b.size() * 2);
+        return t;
+      };
+      if (debug_visit >= 0)
+        m.on_debug = [&](int v, const char* name, const Tensor& t) {
+          if (v != debug_visit) return;
+          be->sync();
+          std::vector<float> f(size_t(t.numel()));
+          if (t.dtype == DType::F32) be->read(t, f.data(), f.size() * 4);
+          else {
+            std::vector<uint16_t> h(f.size());
+            be->read(t, h.data(), h.size() * 2);
+            for (size_t i = 0; i < h.size(); ++i) f[i] = bf16_to_f32(h[i]);
+          }
+          std::ofstream o(out + "/dbg_" + name + ".f32", std::ios::binary);
+          o.write(reinterpret_cast<const char*>(f.data()), f.size() * 4);
+        };
+      std::vector<Tensor> ref(size_t(cfg.num_visits()));
+      for (int v = 0; v < cfg.num_visits(); ++v) ref[size_t(v)] = to_dev(load_ref(v));
+      std::vector<int> blocks;  // visit indices whose ref input is a block
+      int prelude_n = -1, prev12 = -1;
+      Tensor xo = be->alloc(DType::BF16, {T, D}, "iso.out"), last = be->alloc(DType::BF16, {T, D}, "iso.last");
+      for (int v = 0; v < cfg.num_visits(); ++v) {
+        const int L = cfg.visits[size_t(v)];
+        std::vector<const Tensor*> bank;
+        if (L == cfg.core_start) {
+          if (prelude_n < 0) prelude_n = int(blocks.size());
+          else { blocks.resize(size_t(prelude_n)); }
+        }
+        if (v >= cfg.core_start + (cfg.core_end - cfg.core_start) && L >= cfg.core_start && L < cfg.core_end) {
+          bank = {&ref[size_t(prev12)], &last};
+        }
+        std::vector<const Tensor*> bl;
+        for (int b : blocks) bl.push_back(&ref[size_t(b)]);
+        if (v == debug_visit && !bank.empty()) {
+          be->sync();
+          std::vector<uint16_t> h(size_t(T * D));
+          be->read(last, h.data(), h.size() * 2);
+          std::vector<float> f(h.size());
+          for (size_t i = 0; i < h.size(); ++i) f[i] = bf16_to_f32(h[i]);
+          std::ofstream o(out + "/bank1.f32", std::ios::binary);
+          o.write(reinterpret_cast<const char*>(f.data()), f.size() * 4);
+        }
+        m.debug_visit(v, ref[size_t(v)], bl, bank, xo, T);
+        if (L % cfg.block == 0) blocks.push_back(v);
+        if (L == 12) prev12 = v;
+        if (L == cfg.core_end - 1) be->copy(xo, last);
+        // compare with next ref input (skip pass restarts where the next input is the prelude)
+        const bool restart = v + 1 < cfg.num_visits() && cfg.visits[size_t(v + 1)] == cfg.core_start && v + 1 != cfg.core_start;
+        if (v + 1 < cfg.num_visits() && !restart) {
+          std::vector<uint16_t> o(size_t(T * D));
+          be->sync();
+          be->read(xo, o.data(), o.size() * 2);
+          auto r = load_ref(v + 1);
+          double num = 0, den = 0, mx = 0;
+          size_t neq = 0;
+          for (size_t i = 0; i < o.size(); ++i) {
+            double d = double(bf16_to_f32(o[i])) - r[i];
+            num += d * d; den += double(r[i]) * r[i]; mx = std::max(mx, std::fabs(d));
+            neq += f32_to_bf16(r[i]) != o[i];
+          }
+          std::printf("visit %2d (layer %2d %s): rel err %.3e  max abs %.3e  bf16 mismatch %.2f%%\n", v, L,
+                      cfg.is_local[size_t(L)] ? "local " : "global", std::sqrt(num / den), mx, 100.0 * neq / o.size());
+        }
+      }
+      return 0;
+    }
     std::vector<std::vector<float>> hid(static_cast<size_t>(m.config().num_visits() + 1));
     int64_t pos_base = 0;
     if (hidden) {

@@ -211,6 +211,7 @@ void Model::write_tau(int64_t T) {
 // One layer visit: x (bf16 [T,D]) is updated in place. blocks = current attention-residual blocks (appended to at
 // block boundaries, storage blk_[blocks.size()]). msg = loop messages f32 [4,T,D] or invalid.
 void Model::run_visit(int v, Tensor& x, std::vector<Tensor>& blocks, const Tensor& msg, int64_t T) {
+  auto dbg = [&](const char* n, const Tensor& t) { if (on_debug) on_debug(v, n, t); };
   const int L = cfg_.visits[v];
   const int64_t D = cfg_.hidden;
   const auto& w = lw_[L];
@@ -222,6 +223,7 @@ void Model::run_visit(int v, Tensor& x, std::vector<Tensor>& blocks, const Tenso
     for (auto& b : blocks) states.push_back(&b);
     states.push_back(&x);
     be_.attn_residual(states, w.attn_query, mixed);
+    dbg("mixed", mixed);
   }
   auto part = [&](int i) -> Tensor {
     if (L == 0) return x;
@@ -241,6 +243,7 @@ void Model::run_visit(int v, Tensor& x, std::vector<Tensor>& blocks, const Tenso
         Tensor out = view(parts_[i], {T, D});
         Tensor mi = row_view(msg, i, {T, D});
         be_.controller(ins[i], mi, w.ctrl_down[i], w.ctrl_forget[i], w.ctrl_gain[i], out);
+        if (i == 0) dbg("ctrl0", out);
         ins[i] = out;
       }
     }
@@ -251,6 +254,10 @@ void Model::run_visit(int v, Tensor& x, std::vector<Tensor>& blocks, const Tenso
       outs[i] = view(partsb_[i], {T, D});
       be_.rms_norm(ins[i], norms[i], cfg_.rms_eps, D, outs[i]);
     }
+    dbg("xq", outs[0]);
+    dbg("xk", outs[1]);
+    dbg("xv", outs[2]);
+    if (msg.valid()) dbg("msg", msg);
     xq = outs[0];
     xk = outs[1];
     xv = outs[2];
@@ -277,6 +284,9 @@ void Model::run_visit(int v, Tensor& x, std::vector<Tensor>& blocks, const Tenso
       be_.linear_multi(xv, {&w.v_proj, &w.v_wproj}, {&vraw, &dv});
     }
   }
+  dbg("q_raw", q);
+  dbg("k_raw", kraw);
+  dbg("v_raw", vraw);
   Tensor kc = view(kc_, {T, KVC}), vc = view(vc_, {T, KVC});
   Tensor* hist[4] = {nullptr, nullptr, nullptr, nullptr};
   if (keep_hist_)
@@ -301,6 +311,11 @@ void Model::run_visit(int v, Tensor& x, std::vector<Tensor>& blocks, const Tenso
   be_.rms_norm(vc, nullptr, cfg_.rms_eps, HD, v3);
   Tensor r3 = view(r_, {T, H, cfg_.d_rel});
   be_.l2_clip(r3, &w.rel_scale, cfg_.rel_clip, w.local ? nullptr : &tau, r3);
+  dbg("q", q3);
+  dbg("k", k3);
+  dbg("v", v3);
+  dbg("r", r3);
+  dbg("sink", sink);
   AttnArgs aa;
   aa.q = q3;
   aa.k_new = k3;
@@ -312,10 +327,12 @@ void Model::run_visit(int v, Tensor& x, std::vector<Tensor>& blocks, const Tenso
   aa.window = w.local ? cfg_.window : 0;
   Tensor at = view(attn_, {T, H * HD});
   be_.attention(aa, at);
+  dbg("attn", at);
   be_.kv_append(k3, v3, s.kv);
   be_.sigmoid_gate(at, g, at);
   Tensor ao = view(ao_, {T, D});
   be_.linear(at, w.o_proj, ao);
+  dbg("o", ao);
 
   // ---- residual + MoE ----
   Tensor resb = view(resb_, {T, D}), res = view(res_, {T, D});
@@ -335,6 +352,7 @@ void Model::run_visit(int v, Tensor& x, std::vector<Tensor>& blocks, const Tenso
     states.push_back(&res);
     be_.attn_residual(states, w.mlp_query, hid);
   }
+  dbg("hid_mix", hid);
   Tensor hid2 = view(hid_, {T, D});
   if (msg.valid()) {
     Tensor m3 = row_view(msg, 3, {T, D});
@@ -342,13 +360,17 @@ void Model::run_visit(int v, Tensor& x, std::vector<Tensor>& blocks, const Tenso
   }
   Tensor hn = view(hn_, {T, D});
   be_.rms_norm(hid2, &w.post_norm, cfg_.rms_eps, D, hn);
+  dbg("hn", hn);
   Tensor ridx = view(ridx_, {T, cfg_.topk}), rw = view(rw_, {T, cfg_.topk});
   be_.router(hn, w.moe, cfg_.topk, cfg_.route_scale, ridx, rw);
   Tensor mo = view(moe_, {T, D});
   be_.moe(hn, ridx, rw, w.moe, mo);
+  dbg("moe", mo);
   Tensor mc = view(mo_, {T, D});
   be_.short_conv(mo, w.mlp_sconv, s.conv[3], mc, hist[3]);
   be_.add(res, mc, x);  // new x (bf16)
+  dbg("res", res);
+  dbg("out", x);
 }
 
 void Model::forward(const int32_t* ids, int64_t T, bool all_logits, bool keep_hist) {
