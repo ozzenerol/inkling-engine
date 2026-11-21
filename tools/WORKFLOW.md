@@ -40,11 +40,17 @@ The benchmark runs (C: ctxbench, agent bench, MLX baseline) are batch items too,
 - `tools/spec_check.sh ref_data/p2.ids 200 4`: token streams identical.
 - 8-bit build: same acc_check with MODEL=~/llm/mlx-models/Inkling-2-Mini-MLX-8bit.
 
+## Target (user, 2026-11-21 evening)
+
+Generation **60 tok/s at the start of the context and 40 tok/s at 128k**, on free text (where drafts help
+least), 8-bit build (the server default). C's target table (gen tok/s at 1.2k .. 127.5k against that line) is part
+of every batch.
+
 ## Roles
 
 | agent | session | area |
 |---|---|---|
-| A | inkling-engine-9e | coordinator, integrator, accuracy; speculative policy (prompt-lookup drafts) |
-| B | ozzenerol-5f | plain decode cost per forward (dispatch fusion), q8 kernels as default, prefill MoE GEMM |
-| C | ozzenerol-aa | server, benchmarks (batch items), qh end-to-end |
-| D | ozzenerol-a5 | multi-row forwards: verify at T = 5..16 at ~plain + 6-7 ms per extra row; drafter cost 8 ms -> 3 ms |
+| A | inkling-engine-9e | coordinator, integrator, accuracy; drafting policy (drafter + prompt lookup), KV-cache accuracy |
+| B | ozzenerol-5f | the plain step at short context: 23.6 ms -> 17-20 ms on the 8-bit build (fusion, MoE and q8 readers) |
+| C | ozzenerol-aa | server, benchmarks (target table every batch), qh end-to-end, docs/RESULTS.md |
+| D | ozzenerol-a5 | multi-row forwards (done: 3..16 rows, expert-union MoE, q8) and attention at long context (32k..128k) |
