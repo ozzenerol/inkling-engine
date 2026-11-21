@@ -75,6 +75,9 @@ struct KvAppendParams {
 struct AttnParams {
   uint32_t T, H, KVH, cap, len, ring, window, rel_extent;
 };
+struct AttnDecParams {
+  uint32_t T, H, KVH, cap, len, ring, window, rel_extent, split_keys, nsplit;
+};
 struct RouterParams {
   uint32_t T, D, E, topk, dt_x;
   float scale;
@@ -84,6 +87,12 @@ struct QmvParams {
 };
 struct MoeFastParams {
   uint32_t N, K, topk;
+};
+struct SortParams {
+  uint32_t routes, E, tile_m;
+};
+struct MoeGemmParams {
+  uint32_t N, K, topk, gather_a, scatter_out;
 };
 struct CombineParams {
   uint32_t T, D, topk;
@@ -341,6 +350,34 @@ class MetalBackend final : public Backend {
 
   void attention(const AttnArgs& a, Tensor& out) override {
     uint32_t T = uint32_t(a.q.dim(0)), H = uint32_t(a.q.dim(1)), KVH = uint32_t(a.k_new.dim(1));
+    if (T <= 4 && H == 3 * KVH && !getenv("INK_ATTN_SLOW")) {
+      uint32_t len = uint32_t(a.kv.len), window = uint32_t(a.window);
+      uint32_t first = (window && len + 1 > window) ? len + 1 - window : 0;
+      uint32_t nkeys = len + T - first;
+      uint32_t split_keys = std::max<uint32_t>(256, (cdiv(nkeys, 96) + 127) / 128 * 128);
+      uint32_t nsplit = cdiv(nkeys, split_keys);
+      AttnDecParams p{T, H, KVH, uint32_t(a.kv.cap), len, a.kv.ring ? 1u : 0u, window, uint32_t(a.rel_proj.dim(1)),
+                      split_keys, nsplit};
+      Tensor part = scratch("attn-part", DType::F32, {KVH * nsplit * 12, 132});
+      pipe(T == 1 ? "attn_decode_split_r3" : "attn_decode_split_r12");
+      bind(0, a.q);
+      bind(1, a.k_new);
+      bind(2, a.v_new);
+      bind(3, a.r);
+      bind(4, a.rel_proj);
+      bind(5, a.kv.k.valid() ? a.kv.k : a.k_new);
+      bind(6, a.kv.v.valid() ? a.kv.v : a.v_new);
+      bind(7, part);
+      g_.set_value(8, p);
+      g_.dispatch({KVH, nsplit, 1}, {128, 1, 1});
+      pipe("attn_decode_combine");
+      bind(0, part);
+      bind(1, a.sink);
+      bind(2, out);
+      g_.set_value(3, p);
+      g_.dispatch({T, H, 1}, {128, 1, 1});
+      return;
+    }
     AttnParams p{T, H, KVH, uint32_t(a.kv.cap), uint32_t(a.kv.len), a.kv.ring ? 1u : 0u, uint32_t(a.window),
                  uint32_t(a.rel_proj.dim(1))};
     pipe("attention_generic");
@@ -431,6 +468,10 @@ class MetalBackend final : public Backend {
       g_.dispatch({cdiv(D, 4), T, 1}, {128, 1, 1});
       return;
     }
+    if (topk == 8 && !getenv("INK_MOE_SLOW")) {
+      moe_prefill(x, idx, w, m, out, T, D, topk);
+      return;
+    }
     Tensor gt = scratch("moe-g", DType::BF16, {routes, I});
     Tensor ut = scratch("moe-u", DType::BF16, {routes, I});
     Tensor at = scratch("moe-a", DType::BF16, {routes, I});
@@ -445,6 +486,62 @@ class MetalBackend final : public Backend {
     g_.set_value(3, n);
     g_.dispatch({cdiv(n, 256), 1, 1}, {256, 1, 1});
     qmv(m.down, at, idx, routes, 1, dt);
+    CombineParams cp{T, D, topk};
+    pipe("moe_combine");
+    bind(0, dt);
+    bind(1, w);
+    bind(2, out);
+    g_.set_value(3, cp);
+    g_.dispatch({cdiv(D, 256), T, 1}, {256, 1, 1});
+  }
+
+  void moe_gemm(const QuantProj& q, const Tensor& a, const Tensor& perm, const Tensor& offs, const Tensor& tiles,
+                const Tensor& tiles_n, uint32_t max_tiles, uint32_t topk, bool gather, bool scatter, Tensor& out) {
+    MoeGemmParams p{uint32_t(q.n), uint32_t(q.k), topk, gather ? 1u : 0u, scatter ? 1u : 0u};
+    pipe(q.mode == QuantMode::NVFP4 ? "moe_gemm_nvfp4" : "moe_gemm_mxfp8");
+    bind(0, q.weight);
+    bind(1, q.scales);
+    bind(2, q.global.valid() ? q.global : q.scales);
+    bind(3, a);
+    bind(4, perm);
+    bind(5, offs);
+    bind(6, tiles);
+    bind(7, tiles_n);
+    bind(8, out);
+    g_.set_value(9, p);
+    g_.dispatch({cdiv(p.N, 64), max_tiles, 1}, {128, 1, 1});
+  }
+  void moe_prefill(const Tensor& x, const Tensor& idx, const Tensor& w, const MoeWeights& m, Tensor& out, uint32_t T,
+                   uint32_t D, uint32_t topk) {
+    uint32_t routes = T * topk, I = uint32_t(m.gate.n), E = 128;
+    uint32_t max_tiles = cdiv(routes, 64) + E;
+    Tensor perm = scratch("moep-perm", DType::I32, {routes});
+    Tensor offs = scratch("moep-offs", DType::I32, {E + 1});
+    Tensor tiles = scratch("moep-tiles", DType::I32, {max_tiles, 2});
+    Tensor tiles_n = scratch("moep-ntiles", DType::I32, {4});
+    Tensor gt = scratch("moe-g", DType::BF16, {routes, I});
+    Tensor ut = scratch("moe-u", DType::BF16, {routes, I});
+    Tensor at = scratch("moe-a", DType::BF16, {routes, I});
+    Tensor dt = scratch("moe-d", DType::BF16, {routes, D});
+    SortParams sp{routes, E, 64};
+    pipe("moe_sort");
+    bind(0, idx);
+    bind(1, perm);
+    bind(2, offs);
+    bind(3, tiles);
+    bind(4, tiles_n);
+    g_.set_value(5, sp);
+    g_.dispatch({1, 1, 1}, {1024, 1, 1});
+    moe_gemm(m.gate, x, perm, offs, tiles, tiles_n, max_tiles, topk, true, false, gt);
+    moe_gemm(m.up, x, perm, offs, tiles, tiles_n, max_tiles, topk, true, false, ut);
+    uint32_t n = routes * I;
+    pipe("softcap_swiglu");
+    bind(0, gt);
+    bind(1, ut);
+    bind(2, at);
+    g_.set_value(3, n);
+    g_.dispatch({cdiv(n, 256), 1, 1}, {256, 1, 1});
+    moe_gemm(m.down, at, perm, offs, tiles, tiles_n, max_tiles, topk, false, true, dt);
     CombineParams cp{T, D, topk};
     pipe("moe_combine");
     bind(0, dt);

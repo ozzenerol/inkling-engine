@@ -203,8 +203,12 @@ int main(int argc, char** argv) {
     compare("cast f32->bf16", o, 0, 0);
   }
   // attention: global (linear cache) and local (wrapped ring)
-  for (int local = 0; local < 2; local++) {
-    int64_t T = local ? 2 : 3, cap = local ? 1536 : 4096, len = local ? 2000 : 1500;
+  struct AttnCase { int local; int64_t T, cap, len; };
+  for (AttnCase cs : {AttnCase{0, 3, 4096, 1500}, AttnCase{1, 2, 1536, 2000}, AttnCase{0, 1, 4096, 0},
+                      AttnCase{0, 1, 40000, 37000}, AttnCase{1, 1, 1536, 700}, AttnCase{1, 4, 1536, 1030},
+                      AttnCase{0, 9, 4096, 3000}, AttnCase{1, 40, 1536, 1500}}) {
+    int local = cs.local;
+    int64_t T = cs.T, cap = cs.cap, len = cs.len;
     auto q = make(DType::BF16, {T, 24, 128}, 0.5f), kn = make(DType::BF16, {T, 8, 128}, 0.5f),
          vn = make(DType::BF16, {T, 8, 128});
     auto r = make(DType::BF16, {T, 24, 16}, 1.0f), rp = make(DType::BF16, {16, 1024}, 0.5f),
@@ -215,7 +219,8 @@ int main(int argc, char** argv) {
     AttnArgs am{q.m, kn.m, vn.m, r.m, rp.m, sk.m, KvView{kc.m, vc.m, cap, len, bool(local)}, local ? 1024 : 0};
     CPU->attention(ac, o.c);
     MTL->attention(am, o.m);
-    compare(local ? "attention local ring" : "attention global", o, 0, 2);
+    compare(((local ? "attn local T=" : "attn global T=") + std::to_string(T) + " len=" + std::to_string(len)).c_str(),
+            o, 0, 2);
     CPU->kv_append(kn.c, vn.c, ac.kv);
     MTL->kv_append(kn.m, vn.m, am.kv);
     compare("kv_append k", kc, 0, 0);
@@ -249,7 +254,7 @@ int main(int argc, char** argv) {
       else if (pj[0] == 'u') mc.up = qc, mm.up = qm;
       else mc.down = qc, mm.down = qm;
     }
-    for (int64_t T : {1, 5}) {
+    for (int64_t T : {1, 5, 300}) {
       auto x = make(DType::BF16, {T, D}, 1.0f);
       auto ic = zeros(DType::I32, {T, 8}), wc = zeros(DType::F32, {T, 8});
       CPU->router(x.c, mc, 8, 8.0f, ic.c, wc.c);
