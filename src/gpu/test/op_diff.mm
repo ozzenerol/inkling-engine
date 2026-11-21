@@ -180,7 +180,9 @@ int main(int argc, char** argv) {
     mm.set_shape({T, D});
     CPU->controller(x.c, mc, dn.c, fg.c, gn.c, o.c);
     MTL->controller(x.m, mm, dn.m, fg.m, gn.m, o.m);
-    compare("controller", o, 1e-4);
+    // h = bf16(pair @ down^T) sits between two fp32 sums: when CPU and Metal round one h to different bf16
+    // neighbours (sum order), every output of that token moves by ~1e-3. Bound, not bit-exactness.
+    compare("controller", o, 2e-2);
   }
   for (int64_t T : {1, 3}) {  // controller_multi / rms_norm_multi (Metal fused) vs CPU loops
     Pair xs[3], ms[3], dn[3], fg[3], gn[3], os[3];
@@ -202,7 +204,14 @@ int main(int argc, char** argv) {
     for (int i = 0; i < 3; i++) {
       os[i].c = oc[i];
       os[i].m = om[i];
-      compare(("controller_multi part " + std::to_string(i)).c_str(), os[i], 1e-4);
+      compare(("controller_multi part " + std::to_string(i)).c_str(), os[i], 2e-2);  // same h rounding effect
+    }
+    // rms_norm_multi must see identical inputs on both sides: copy the CPU controller outputs to Metal
+    MTL->sync();
+    for (int i = 0; i < 3; i++) {
+      std::vector<float> v(size_t(T * D));
+      CPU->read(oc[i], v.data(), v.size() * 4);
+      MTL->write(om[i], v.data(), v.size() * 4);
     }
     Pair gam[3], ro[3];
     const Tensor *gcp[3], *gmp[3];
