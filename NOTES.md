@@ -867,3 +867,15 @@ Gates pass. Depth bench as batches 10-11 (127k: 27.7 gen, 383 read). **Prefix pi
 copy session (second session, same system prompt + tools) starts with `cache: ckpt`, 2043 of 2643 tokens cached,
 TTFT 1.00 s (batch 10-11: full prefill, 3.35 s). Its sum of TTFT 5.6 s vs 7.9. The read session wrote 3639 tokens
 this run (2010 before: sampled output, 12 turns' worth of text), so its 83 s total is not comparable.
+
+## Batch 13 (main 0fb5072, 00:30-01:12, `MLX=1 tools/batch.sh queues full`, one run): the RESULTS.md sweep
+
+docs/RESULTS.md is now batch 13. Cold sweep (ctxbench) prefill / gen tok/s, 8-bit: 1.2k 805 / 41.8, 9.5k 819 /
+40.7, 18.9k 781 / 40.0, 38.6k 712 / 37.2, 78.1k 596 / 33.2, 127.5k 494 / 28.1; lossless 761 / 37.2 ... 495 / 25.2
+(MLX 127.5k: 324 / 13.8). Depth bench lossless: gen 35.2 / 36.0 / 32.5 / 28.7 / 25.5. Agent at base 30000: 8-bit
+118.5 s, lossless 114.6 s, MLX 742.8 s. qh e2e PASS twice (13 s, 18 s).
+The MLX copy baseline failed: mlx_vlm answers /v1/models while loading and 503 on completions; bench_c.sh's
+warm-up now retries until 200. Still to measure (MLX=1 on any batch).
+The 8-bit read session at temp 0 writes 3639 tokens since batch 12 (2010 in batches 10-11): the pinned prefix
+changes the first prefill's chunking (2045 + 72 instead of 1058 + 1059), the logits move in the last bits and a
+near-tie goes the other way. Not a regression; totals of that session are comparable only within the same chunking.
