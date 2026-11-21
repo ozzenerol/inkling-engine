@@ -326,6 +326,7 @@ kernel void mr_attn_split(device const ushort* q [[buffer(0)]], device const ush
       device const ushort*, device const ushort*, device const ushort*, device const ushort*,                  \
       device const ushort*, device const ushort*, device const ushort*, device float*, constant MrAttnParams&, \
       uint2, uint, uint, uint);
+MR_ATTN_INST("mr_attn_split_g1", 1, 0)
 MR_ATTN_INST("mr_attn_split_g2", 2, 0)
 MR_ATTN_INST("mr_attn_split_g3", 3, 0)
 MR_ATTN_INST("mr_attn_split_g4", 4, 0)

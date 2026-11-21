@@ -400,12 +400,13 @@ class MetalBackend final : public Backend {
     if (K % 8 == 0 && T > 4 && T <= 16 && mr_ && !skinny_ && !getenv("INK_MV_T8")) {
       // D: one pass over W for 5..16 rows; every row equals the 1-row matvec bit for bit (kernels/multirow.metal)
       MatvecShape ms{N, K, T, K, N};
-      pipe(std::string("mr_matvec_") + dtn(x.dtype) + "_" + dtn(out.dtype) + (T <= 8 ? "_t8" : "_t16") + mr_rs_);
+      // measured (bench_multirow): up to 8 rows 2 output rows per simdgroup is best, above 8 rows 4
+      pipe(std::string("mr_matvec_") + dtn(x.dtype) + "_" + dtn(out.dtype) + (T <= 8 ? "_t8_r2_s2" : "_t16_r4_s2"));
       bind(0, w);
       bind(1, x);
       bind(2, out);
       g_.set_value(3, ms);
-      g_.dispatch({cdiv(N, mr_rows_), 1, 1}, {mr_threads_, 1, 1});
+      g_.dispatch({cdiv(N, T <= 8 ? 4 : 8), 1, 1}, {64, 1, 1});
       return;
     }
     if (K % 8 == 0 && T > 4 && T <= 16 && x.dtype == DType::BF16 && skinny_) {
@@ -738,7 +739,7 @@ class MetalBackend final : public Backend {
     if (skip("attn")) return; attention_impl(a, nullptr, out); }
   void attention_impl(const AttnArgs& a, const Tensor* gate, Tensor& out) {
     uint32_t T = uint32_t(a.q.dim(0)), H = uint32_t(a.q.dim(1)), KVH = uint32_t(a.k_new.dim(1));
-    if (T <= 4 && H == 3 * KVH && !getenv("INK_ATTN_SLOW")) {
+    if (T <= 4 && !(mr_attn_ && T >= mr_attn_min_) && H == 3 * KVH && !getenv("INK_ATTN_SLOW")) {
       uint32_t len = uint32_t(a.kv.len), window = uint32_t(a.window);
       uint32_t first = (window && len + 1 > window) ? len + 1 - window : 0;
       uint32_t nkeys = len + T - first;
@@ -1233,12 +1234,11 @@ class MetalBackend final : public Backend {
   bool skinny_ = false;
   uint32_t split_keys_ = 512;
   uint32_t split_local_ = 64;
-  // D: one-pass dense for 5..16 rows. INK_MR=0 restores passes of 4 rows; INK_MR_RS=r_s picks the bench variant.
+  // D: one-pass dense for 5..16 rows. INK_MR=0 restores passes of 4 rows.
   bool mr_ = !(getenv("INK_MR") && getenv("INK_MR")[0] == '0');
-  std::string mr_rs_ = std::string("_r") + (getenv("INK_MR_RS") ? std::string(1, getenv("INK_MR_RS")[0]) : "4") +
-                       "_s" + (getenv("INK_MR_RS") ? std::string(1, getenv("INK_MR_RS")[2]) : "2");
-  uint32_t mr_rows_ = uint32_t(mr_rs_[2] - '0') * uint32_t(mr_rs_[5] - '0');
-  uint32_t mr_threads_ = 32u * uint32_t(mr_rs_[5] - '0');
+  // rows from which the multi-row attention kernel is used. 3: it is bit-identical to attn_decode_split and at
+  // T = 3, 4 faster (32k global: 1.11 ms vs 1.94; 128k: 3.8 vs 6.8), at T <= 2 equal.
+  uint32_t mr_attn_min_ = getenv("INK_MR_ATTN_MIN") ? uint32_t(atoi(getenv("INK_MR_ATTN_MIN"))) : 3;
   bool mr_attn_ = !(getenv("INK_MR_ATTN") && getenv("INK_MR_ATTN")[0] == '0');  // D: 5..16-row attention
   bool ag_stats_ = getenv("INK_AG_STATS") != nullptr;
   // Chain kernels (A), opt-in with INK_CHAIN=1: measured SLOWER than the separate ops (decode 28.6 vs 36.9 tok/s;
