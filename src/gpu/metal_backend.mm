@@ -678,7 +678,7 @@ class MetalBackend final : public Backend {
     g_.set_value(3, p);
     g_.dispatch({T, 1, 1}, {256, 1, 1});
     linear(pair, down, h);
-    if (T > 16 && getenv("INK_CTRL_GEMM")) {  // opt-in until measured
+    if (T > 16 && !getenv("INK_CTRL_SCALAR")) {  // batch 3: p3 prefill 3.96 -> 3.72 s (one run)
       // prefill: forget/gain projections as GEMMs (K = 64), then an elementwise combine
       Tensor F = scratch("ctrl-F", DType::F32, {T, D}), G = scratch("ctrl-G", DType::F32, {T, D});
       linear(h, forget, F);
@@ -1149,7 +1149,7 @@ class MetalBackend final : public Backend {
       bool nv = m.gate.mode == QuantMode::NVFP4;
       Tensor at = scratch("moe-a", DType::BF16, {routes, I});
       MoeFastParams gp{I, D, topk};
-      pipe(nv ? (getenv("INK_FP4_LUT") ? "moe_gateup_nvfp4_lut" : "moe_gateup_nvfp4") : "moe_gateup_mxfp8");
+      pipe(nv ? "moe_gateup_nvfp4" : "moe_gateup_mxfp8");
       bind(0, m.gate.weight);
       bind(1, m.gate.scales);
       bind(2, m.gate.global.valid() ? m.gate.global : m.gate.scales);
@@ -1204,9 +1204,7 @@ class MetalBackend final : public Backend {
   void moe_gemm(const QuantProj& q, const Tensor& a, const Tensor& perm, const Tensor& offs, const Tensor& tiles,
                 const Tensor& tiles_n, uint32_t max_tiles, uint32_t topk, bool gather, bool scatter, Tensor& out) {
     MoeGemmParams p{uint32_t(q.n), uint32_t(q.k), topk, gather ? 1u : 0u, scatter ? 1u : 0u};
-    bool v2 = getenv("INK_MOE_GEMM2") != nullptr;  // candidate, off until measured
-    pipe(q.mode == QuantMode::NVFP4 ? (v2 ? "moe_gemm2_nvfp4" : "moe_gemm_nvfp4")
-                                    : (v2 ? "moe_gemm2_mxfp8" : "moe_gemm_mxfp8"));
+    pipe(q.mode == QuantMode::NVFP4 ? "moe_gemm_nvfp4" : "moe_gemm_mxfp8");
     bind(0, q.weight);
     bind(1, q.scales);
     bind(2, q.global.valid() ? q.global : q.scales);
