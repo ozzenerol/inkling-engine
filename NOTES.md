@@ -310,7 +310,7 @@ Findings (CPU backend vs MLX-bf16 GPU reference, one run each):
     prompt with 4590 reused, 36 prefilled). One run in the first session reset twice at ~5.1k (22 s lost); not
     reproduced in the second session, which has divergence logging — watch for `[cache] diverged`.
   - ctxbench (temp 0.7, 400 tok): 1.2k 462/27.9, 9.5k 436/27.0, 38.6k 260/23.4 (prefill/gen tok/s). vs MLX
-    565/23.1, 602/24.2, 495/22.0: gen +16-21%, prefill 0.53-0.82x (B: long-context attention prefill still slow).
+    565/23.1, 602/24.2, 495/22.0: gen 1.21x/1.12x/1.06x (+6-21%, corrected), prefill 0.82x/0.72x/0.53x (B: long-context attention prefill still slow).
   - Our prompts are 2 tokens shorter than MLX's in ctxbench (1219 vs 1221): MLX-VLM ignores
     chat_template_kwargs.reasoning_effort, so its baseline ran at the template default 0.9 ("0.9" = 3 tokens vs "0").
   - Gotcha: building from the shared tree embeds others' uncommitted .metal edits; for runs I build HEAD in a
@@ -333,3 +333,13 @@ p3 "mismatches" vs MLX-bf16 are MLX's own bf16 rounding (MLX-bf16 itself only ge
 oracle is the most accurate; Metal has some headroom on long prompts (fp32-accumulated pieces could close it).
 Going forward, speed changes are checked against BOTH: greedy == MLX-bf16 up to near-ties, and KL vs fp32 not
 worse than MLX-bf16's.
+- 2026-11-21 C: **bench tooling for the 2x goal** (A's request):
+  - `tools/bench_c.sh inkling|mlx` = ctxbench at 1.2k..127.5k (SIZES) + `tools/agent_bench.py` (qh's real system
+    prompt + 10 tools from tests/server/fixtures/qh_request.json, ~800-token scripted tool result per turn, 10 turns,
+    temp 0, thinking on as qh sends it; base context 0 and 30000). `tools/bench_c.sh report` -> tools/bench_report.py:
+    BRIEF table side by side with x-ratios vs MLX + agent tables (total wall, per-turn TTFT, prompt/cached).
+    `BIN=` lets the run use a binary built from HEAD in a worktree. MLX at 104000 needs PREFILL=512 (OOM at 2048).
+  - **Server overhead per token** (stub engine at 0 ms/token, 20k-token replies, one run): streaming 4.4-4.8 us/token
+    (SSE write per token), non-streaming 0.14-0.19 us; independent of a 30k prompt. At 90 tok/s that is <0.05% of
+    a token. Render + tokenize of a 143k-token prompt: 42 ms per request. Now reported live as
+    `server_us_per_token` in timings and the [req] log line.

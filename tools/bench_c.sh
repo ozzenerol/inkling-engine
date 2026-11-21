@@ -3,11 +3,12 @@
 #   tools/bench_c.sh inkling   start build-c/src/server/inkling-server, measure it, stop it
 #   tools/bench_c.sh mlx       start ~/llm/serve_inkling.sh (MLX-VLM + DSpark), measure it, stop it
 #   tools/bench_c.sh report    print markdown tables from the JSON files
-# Measures: ~/llm/ctxbench.py (BRIEF baseline: temp 0.7, effort none, 400 tokens) and saetta's tools/bench.py
-# (temp 0, thinking off, contexts + a 10-turn conversation through the prompt cache).
+# Measures: ~/llm/ctxbench.py (BRIEF baseline: temp 0.7, effort none, 400 tokens) and tools/agent_bench.py
+# (qh-like session, 10 turns, with base context 0 and 30000: per-turn TTFT and total wall time).
 # Announce the GPU lock in NOTES.md and to the other agents before running inkling or mlx.
 # Env: SIZES (ctxbench, default 1000,8000,16000,32000,64000,104000), CONTEXTS (bench.py, default 40,1k,4k,16k,32k),
-#      RUNS (3), TURNS (10), OUT (bench/), SERVER_ARGS (extra inkling-server flags), SKIP_CTX=1, SKIP_BENCH=1.
+#      TURNS (10), AGENT_BASES ("0 30000"), OUT (bench/), SERVER_ARGS (extra inkling-server flags),
+#      BIN (server binary, default build-c/src/server/inkling-server), SKIP_CTX=1, SKIP_AGENT=1.
 set -u
 here=$(cd "$(dirname "$0")/.." && pwd)
 py=$HOME/llm/inkling-venv/bin/python
@@ -28,10 +29,12 @@ measure() {
 		echo "== ctxbench $label ($sizes)"
 		"$py" -u "$HOME/llm/ctxbench.py" "$url/v1" "$model" "$sizes" | tee "$out/ctx-$label.jsonl"
 	fi
-	if [ -z "${SKIP_BENCH:-}" ]; then
-		echo "== bench.py $label ($contexts, $turns turns)"
-		"$py" -u "$HOME/projects/saetta-macqwen/tools/bench.py" --url "$url" --label "$label" \
-			--contexts "$contexts" --runs "$runs" --turns "$turns" --out "$out/bench-$label.json"
+	if [ -z "${SKIP_AGENT:-}" ]; then
+		for base in ${AGENT_BASES:-0 30000}; do
+			echo "== agent_bench $label (base $base, $turns turns)"
+			"$py" -u "$here/tools/agent_bench.py" --url "$url" --label "$label" --turns "$turns" \
+				--base-tokens "$base" --out "$out/agent-$label-$base.json"
+		done
 	fi
 }
 
@@ -52,7 +55,7 @@ case "${1:-}" in
 inkling)
 	up && { echo "something already serves $url; stop it first"; exit 1; }
 	# shellcheck disable=SC2086
-	start_and_wait "$out/inkling-serve.log" "$here/build-c/src/server/inkling-server" --port 8091 ${SERVER_ARGS:-}
+	start_and_wait "$out/inkling-serve.log" "${BIN:-$here/build-c/src/server/inkling-server}" --port 8091 ${SERVER_ARGS:-}
 	measure inkling
 	;;
 mlx)
@@ -61,18 +64,7 @@ mlx)
 	measure mlx
 	;;
 report)
-	for f in "$out"/ctx-*.jsonl; do
-		[ -f "$f" ] || continue
-		echo "### ctxbench $(basename "$f" .jsonl | sed 's/^ctx-//')"
-		echo "| prompt tokens | prefill tok/s | gen tok/s |"
-		echo "|---|---|---|"
-		"$py" -c 'import json,sys
-for l in open(sys.argv[1]):
-    d=json.loads(l)
-    print("| %s | %s | %s |" % (d.get("prompt_tokens","-"), d.get("prefill_tps", d.get("error","-")), d.get("gen_tps","-")))' "$f"
-		echo
-	done
-	ls "$out"/bench-*.json >/dev/null 2>&1 && "$py" "$HOME/projects/saetta-macqwen/tools/bench.py" --report "$out"/bench-*.json
+	"$py" "$here/tools/bench_report.py" "$out"
 	;;
 *)
 	sed -n 2,11p "$0"; exit 2 ;;
