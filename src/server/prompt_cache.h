@@ -20,6 +20,9 @@ class PromptCache {
   // (a new agent session: same system prompt and tools), checkpoint at that shared prefix on the way, so
   // the next new session restores it instead of prefilling it again. 0 turns it off.
   void set_shared_prefix_min(int64_t n) { shared_prefix_min_ = n; }
+  // The engine's prefill chunk. New tokens are fed in ceil(N / chunk) near-equal calls, so a turn never ends
+  // with a small tail chunk after a full one (small chunks run through slower kernels).
+  void set_chunk(int64_t n) { chunk_ = n > 0 ? n : 2048; }
 
   struct Prep {
     int64_t reused = 0;     // prompt tokens taken from the cache
@@ -27,6 +30,9 @@ class PromptCache {
     double prefill_s = 0;
     std::string how;        // "hit", "rewind", "ckpt", "reset"
     int64_t lcp = 0;        // common prefix with the cached ids
+    double position_s = 0;  // compare + rewind / checkpoint restore / reset, before any prefill
+    double ckpt_s = 0;      // taking checkpoints
+    std::vector<int64_t> chunks;  // sizes of the prefill calls made
   };
   // Afterwards the engine has prefilled the whole prompt and holds its last logits.
   Prep prepare(const std::vector<int32_t>& prompt, const std::function<void(int64_t done, int64_t total)>& progress);
@@ -48,6 +54,7 @@ class PromptCache {
   EngineIface& e_;
   int max_ckpts_;
   int64_t shared_prefix_min_ = 256;
+  int64_t chunk_ = 2048;
   std::vector<int32_t> toks_;
   struct Entry {
     Ckpt c;

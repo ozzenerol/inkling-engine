@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """Owner: C. THE per-batch benchmark: generation speed at increasing context depth, in one server session.
 
-Target (user): 60 tok/s at the beginning and 40 tok/s at the end of the context (127.5k), linear in between.
+Target (user, relaxed 2026-11-21): each prompt is read fast (prefill tok/s on the new tokens, TTFT); generation
+>= 40 tok/s at the beginning and >= 20-30 tok/s at the end of the context (127.5k). tools/bench_report.py prints
+the table; the `target_tps` field in the rows is the earlier 60 -> 40 line, kept for reference.
 
 Same workload as ~/llm/ctxbench.py (log-file filler, "write a detailed 400-word essay", temp 0.7, effort none,
 400 tokens, streaming), but as ONE growing conversation: each turn appends a user message with more of the log
