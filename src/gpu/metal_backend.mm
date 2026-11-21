@@ -1176,6 +1176,56 @@ class MetalBackend final : public Backend {
       moe_routes_[T] += routes;
       moe_uniq_[T] += uniq;
     }
+    if (topk == 8 && T >= mr_moe_min_ && T <= 16 && mr_moe_ && m.gate_w.dim(0) <= 128 && !getenv("INK_MOE_SLOW")) {
+      // D: expert union (kernels/multirow.metal): each used expert is read once for all the rows routed to it;
+      // per (route, row) the arithmetic of the two-dispatch path below, so rows equal T = 1 bit for bit.
+      bool nv = m.gate.mode == QuantMode::NVFP4;
+      const uint32_t E = 128, slots = std::min(routes, E);
+      Tensor at = scratch("moe-a", DType::BF16, {routes, I});
+      Tensor dd = scratch("mr-moe-d", DType::BF16, {16 * topk, D});
+      Tensor ul = scratch("mr-moe-ulist", DType::I32, {E, 18});
+      Tensor uh = scratch("mr-moe-uhdr", DType::I32, {4});
+      struct { uint32_t routes, E; } gp{routes, E};
+      pipe("mr_moe_group");
+      bind(0, idx);
+      bind(1, ul);
+      bind(2, uh);
+      g_.set_value(3, gp);
+      g_.dispatch({1, 1, 1}, {128, 1, 1});
+      MoeFastParams up{I, D, topk};
+      pipe(nv ? "mr_moe_gateup_nvfp4" : "mr_moe_gateup_mxfp8");
+      bind(0, m.gate.weight);
+      bind(1, m.gate.scales);
+      bind(2, m.gate.global.valid() ? m.gate.global : m.gate.scales);
+      bind(3, m.up.weight);
+      bind(4, m.up.scales);
+      bind(5, m.up.global.valid() ? m.up.global : m.up.scales);
+      bind(6, x);
+      bind(7, ul);
+      bind(8, uh);
+      bind(9, at);
+      g_.set_value(10, up);
+      g_.dispatch({slots, cdiv(I, 16), 1}, {128, 1, 1});
+      MoeFastParams dp{D, I, topk};
+      pipe(nv ? "mr_moe_down_nvfp4" : "mr_moe_down_mxfp8");
+      bind(0, m.down.weight);
+      bind(1, m.down.scales);
+      bind(2, m.down.global.valid() ? m.down.global : m.down.scales);
+      bind(3, at);
+      bind(4, ul);
+      bind(5, uh);
+      bind(6, dd);
+      g_.set_value(7, dp);
+      g_.dispatch({slots, cdiv(D, 32), 1}, {128, 1, 1});
+      struct { uint32_t T, N, topk; } wp{T, D, topk};
+      pipe("mr_moe_wsum");
+      bind(0, dd);
+      bind(1, w);
+      bind(2, out);
+      g_.set_value(3, wp);
+      g_.dispatch({cdiv(D, 256), T, 1}, {256, 1, 1});
+      return;
+    }
     if (topk == 8 && T <= 16 && !getenv("INK_MOE_SLOW")) {
       bool nv = m.gate.mode == QuantMode::NVFP4;
       Tensor at = scratch("moe-a", DType::BF16, {routes, I});
@@ -1331,6 +1381,11 @@ class MetalBackend final : public Backend {
   // rows from which the multi-row attention kernel is used. 3: it is bit-identical to attn_decode_split and at
   // T = 3, 4 faster (32k global: 1.11 ms vs 1.94; 128k: 3.8 vs 6.8), at T <= 2 equal.
   uint32_t mr_attn_min_ = getenv("INK_MR_ATTN_MIN") ? uint32_t(atoi(getenv("INK_MR_ATTN_MIN"))) : 3;
+  // D: expert-union MoE from this many rows (INK_MR_MOE=0 off, INK_MR_MOE_MIN=n). With random routes (almost no
+  // sharing below 8 rows) it costs ~22 us more per call at T = 2 and breaks even at 4; real rows share 21% of the
+  // routes at T = 2 and 33-41% at T = 3-4 (INK_MOE_STATS), so 3 until T = 2 is measured with the model.
+  bool mr_moe_ = !(getenv("INK_MR_MOE") && getenv("INK_MR_MOE")[0] == '0');
+  uint32_t mr_moe_min_ = getenv("INK_MR_MOE_MIN") ? uint32_t(atoi(getenv("INK_MR_MOE_MIN"))) : 3;
   bool moe_stats_ = getenv("INK_MOE_STATS") != nullptr;
   long moe_calls_[17] = {}, moe_routes_[17] = {}, moe_uniq_[17] = {};
   bool mr_attn_ = !(getenv("INK_MR_ATTN") && getenv("INK_MR_ATTN")[0] == '0');  // D: 5..16-row attention

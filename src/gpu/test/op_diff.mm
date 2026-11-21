@@ -593,6 +593,36 @@ int main(int argc, char** argv) {
       compare((std::string("moe ") + (layer < 20 ? "nvfp4" : "mxfp8") + " T=" + std::to_string(T)).c_str(), o, 0,
               2, 0.01);  // three bf16 roundings (g/u, act, down) after differently ordered fp32 sums
     }
+    // D: a T-row MoE must equal T one-row MoEs bit for bit. Rows 0..5 are the same vector (one expert shared by
+    // 6 rows: more than one pass of the union kernel), the rest random.
+    for (int64_t T : {4, 5, 8, 16}) {
+      auto x = make(DType::BF16, {T, D}, 1.0f);
+      MTL->sync();
+      for (int64_t t = 1; t < std::min<int64_t>(T, 6); t++)
+        memcpy(x.m.data<uint16_t>() + t * D, x.m.data<uint16_t>(), size_t(D) * 2);
+      Tensor ix = MTL->alloc(DType::I32, {T, 8}, "ix"), wx = MTL->alloc(DType::F32, {T, 8}, "wx");
+      Tensor oT = MTL->alloc(DType::BF16, {T, D}, "oT"), o1 = MTL->alloc(DType::BF16, {1, D}, "o1");
+      MTL->router(x.m, mm, 8, 8.0f, ix, wx);
+      MTL->moe(x.m, ix, wx, mm, oT);
+      size_t bad = 0;
+      for (int64_t t = 0; t < T; t++) {
+        Tensor xt = x.m, it = ix, wt = wx;
+        xt.set_shape({1, D});
+        xt.offset += size_t(t) * D * 2;
+        it.set_shape({1, 8});
+        it.offset += size_t(t) * 32;
+        wt.set_shape({1, 8});
+        wt.offset += size_t(t) * 32;
+        MTL->moe(xt, it, wt, mm, o1);
+        MTL->sync();
+        bad += memcmp(o1.data<char>(), oT.data<char>() + t * D * 2, size_t(D) * 2) != 0;
+      }
+      char nm[64];
+      snprintf(nm, sizeof nm, "moe %s rows==T1 T=%lld", layer < 20 ? "nvfp4" : "mxfp8", (long long)T);
+      printf("%-28s %s  rows differing: %zu/%lld\n", nm, bad ? "FAIL" : "ok  ", bad, (long long)T);
+      if (bad) fails++;
+      for (Tensor* tt : {&ix, &wx, &oT, &o1}) MTL->free(*tt);
+    }
   }
   {  // logits (small random head)
     auto h = make(DType::F32, {2, D}, 1.0f);
