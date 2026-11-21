@@ -71,10 +71,15 @@ PromptCache::Prep PromptCache::prepare(const std::vector<int32_t>& prompt,
           restored = true;
           break;
         }
+        std::fprintf(stderr, "[cache] restore of checkpoint %lld (len %lld) failed; trying the next\n",
+                     (long long)best->c.id, (long long)best->c.len);
         e_.drop(best->c);
         ck_.erase(best);
       }
       if (!restored) {
+        std::fprintf(stderr, "[cache] no checkpoint <= %lld (have:", (long long)target);
+        for (auto& x : ck_) std::fprintf(stderr, " %lld", (long long)x.c.len);
+        std::fprintf(stderr, "); full prefill\n");
         for (auto& x : ck_) e_.drop(x.c);
         ck_.clear();
         e_.reset();
