@@ -18,7 +18,7 @@ Format: `LOCK <agent> <what> <start time>` / `UNLOCK <agent> <time>`.
 (none held)
 UNLOCK B 2026-11-21 (C next: server run)  [A ran the MLX reference dump 17:22, done]
 LOCK C MLX-VLM baseline (serve_inkling.sh :8091, qh e2e + ctxbench) 17:43 / UNLOCK C 17:50
-LOCK C inkling-server real engine (:8091, smoke + qh e2e + ctxbench) 17:56
+LOCK C inkling-server real engine (:8091, smoke + qh e2e + ctxbench) 17:56 / UNLOCK C 18:08 (queue: A, then B)
 
 ## Module layout and file ownership
 
@@ -297,3 +297,19 @@ Findings (CPU backend vs MLX-bf16 GPU reference, one run each):
   the less accurate side).
 - Open: Engine::rewind only works at n == len, 0, or inside the last spec-verify rows (conv states can't rewind);
   cross-turn reuse goes through checkpoint()/restore(), which C uses.
+
+- 2026-11-21 C: **first inkling-server run on the real engine** (Metal, commit 4429d37 kernels + server 0f..; no DSpark yet),
+  one run each:
+  - Smoke: reasoning_content / content / tool_calls all correct (effort low: "Paris"; bash tool call
+    {"command":"ls -la"}). Decode 30-32 tok/s at short context (MLX same day 23-24).
+  - Cross-turn cache works on the engine's checkpoints: 3-turn tool loop prefilled 10 tokens on turns 2-3, TTFT
+    0.14-0.15 s. Spliced turns hit.
+  - qh e2e: 4/4 PASS over two sessions (83, 33, 39, 40 s; MLX 57, 40 s). In-run turns hit the cache (e.g. 4626-token
+    prompt with 4590 reused, 36 prefilled). One run in the first session reset twice at ~5.1k (22 s lost); not
+    reproduced in the second session, which has divergence logging — watch for `[cache] diverged`.
+  - ctxbench (temp 0.7, 400 tok): 1.2k 462/27.9, 9.5k 436/27.0, 38.6k 260/23.4 (prefill/gen tok/s). vs MLX
+    565/23.1, 602/24.2, 495/22.0: gen +16-21%, prefill 0.53-0.82x (B: long-context attention prefill still slow).
+  - Our prompts are 2 tokens shorter than MLX's in ctxbench (1219 vs 1221): MLX-VLM ignores
+    chat_template_kwargs.reasoning_effort, so its baseline ran at the template default 0.9 ("0.9" = 3 tokens vs "0").
+  - Gotcha: building from the shared tree embeds others' uncommitted .metal edits; for runs I build HEAD in a
+    git worktree.
