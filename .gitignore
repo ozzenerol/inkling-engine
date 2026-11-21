@@ -5,3 +5,4 @@ ref_data/
 bench/*.log
 build*/
 .cache/
+.wt/
