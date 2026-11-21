@@ -21,10 +21,11 @@ kernel void attn_prefill(device const ushort* q [[buffer(0)]], device const usho
                          uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {
   constexpr uint LDK = 128 + 8;
   constexpr uint RPW = AP_BQ + AP_BK;  // rel_proj columns staged per key block
+  constexpr uint LDV = 128 + 4;
   threadgroup bfloat Ks[AP_BK * LDK];
-  threadgroup bfloat Vs[AP_BK * LDK];
+  threadgroup float Vs[AP_BK * LDV];  // fp32 V tile (simdgroup_load into fp32 frags); also Q staging at start
   threadgroup float Rp[16][RPW];
-  threadgroup bfloat Qst[AP_SG][8 * 32];
+  threadgroup bfloat* Qst_base = (threadgroup bfloat*)Vs;  // AP_SG x 8 x 32 bf16 = 6 KB < 16.9 KB
 
   uint q0 = tg.x * AP_BQ, kvh = tg.y;
   uint G = p.H / p.KVH;
@@ -45,12 +46,13 @@ kernel void attn_prefill(device const ushort* q [[buffer(0)]], device const usho
     for (uint e = lane; e < 8 * 32; e += 32) {
       uint rI = e / 32, c = e % 32;
       uint t = min(q0 + row0 + rI, p.T - 1);
-      Qst[sg][rI * 32 + c] = as_type<bfloat>(q[(t * p.H + h) * 128 + dblk + c]);
+      Qst_base[sg * 256 + rI * 32 + c] = as_type<bfloat>(q[(t * p.H + h) * 128 + dblk + c]);
     }
     simdgroup_barrier(mem_flags::mem_threadgroup);
-    for (uint f = 0; f < 4; f++) simdgroup_load(qf[dblk / 8 + f], &Qst[sg][f * 8], 32);
+    for (uint f = 0; f < 4; f++) simdgroup_load(qf[dblk / 8 + f], Qst_base + sg * 256 + f * 8, 32);
     simdgroup_barrier(mem_flags::mem_threadgroup);
   }
+  threadgroup_barrier(mem_flags::mem_threadgroup);  // Q staging (in Vs) done before the first V tile load
   simdgroup_float8x8 of[16];
   for (uint j = 0; j < 16; j++) of[j] = simdgroup_float8x8(0);
   float m = row_ok ? bf2f(sink[t_c * p.H + h]) : 0.0f;
@@ -75,7 +77,10 @@ kernel void attn_prefill(device const ushort* q [[buffer(0)]], device const usho
         vp = v_new + (size_t(pos - p.len) * p.KVH + kvh) * 128;
       }
       *(threadgroup uint4*)(Ks + kr * LDK + c8) = *(device const uint4*)(kp + c8);
-      *(threadgroup uint4*)(Vs + kr * LDK + c8) = *(device const uint4*)(vp + c8);
+      float vf8[8];
+      unpack_bf8(*(device const uint4*)(vp + c8), vf8);
+      *(threadgroup float4*)(Vs + kr * LDV + c8) = float4(vf8[0], vf8[1], vf8[2], vf8[3]);
+      *(threadgroup float4*)(Vs + kr * LDV + c8 + 4) = float4(vf8[4], vf8[5], vf8[6], vf8[7]);
     }
     int dlo = int(qpos_first) - int(kb + AP_BK - 1);  // smallest distance in this block
     bool need_bias = dlo < int(p.rel_extent);
@@ -141,10 +146,7 @@ kernel void attn_prefill(device const ushort* q [[buffer(0)]], device const usho
       for (uint kk = 0; kk < 4; kk++) {
         // V frag (keys kk*8.., dims j*8..) as fp32: this thread's elements are row fm (key), cols fn, fn+1 (dims)
         simdgroup_float8x8 vf;
-        thread auto& ve = vf.thread_elements();
-        threadgroup const bfloat* vr = Vs + (kk * 8 + fm) * LDK + j * 8 + fn;
-        ve[0] = float(vr[0]);
-        ve[1] = float(vr[1]);
+        simdgroup_load(vf, Vs + (kk * 8) * LDV + j * 8, LDV);
         simdgroup_multiply_accumulate(of[j], sf[kk], vf, of[j]);
       }
     }

@@ -149,6 +149,11 @@ int main(int argc, char** argv) {
     CPU->attn_residual({&s0.c, &s1.c, &s2.c}, q.c, o.c);
     MTL->attn_residual({&s0.m, &s1.m, &s2.m}, q.m, o.m);
     compare("attn_residual nq=3", o, 1e-5);
+    auto q4 = make(DType::F32, {4, D}, 0.05f);
+    auto o4 = zeros(DType::F32, {4, T, D});
+    CPU->loop_messages({&s1.c, &s2.c}, q4.c, o4.c);
+    MTL->loop_messages({&s1.m, &s2.m}, q4.m, o4.m);
+    compare("loop_messages nq=4", o4, 1e-5);
   }
   {  // controller
     int64_t T = 2;

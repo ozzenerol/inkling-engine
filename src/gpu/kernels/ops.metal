@@ -110,33 +110,46 @@ kernel void attn_residual_mix(device const void* s0 [[buffer(0)]], device const 
                               constant ResParams& p [[buffer(10)]], uint t [[threadgroup_position_in_grid]],
                               uint tid [[thread_position_in_threadgroup]], uint lane [[thread_index_in_simdgroup]],
                               uint sg [[simdgroup_index_in_threadgroup]]) {
-  threadgroup float scratch[RT / 32];
+  // Single pass: each thread accumulates sum(x_b^2) and x_b . q for all b, q; one batched reduction.
+  threadgroup float red[RT / 32][8 * 5];
   threadgroup float inv[8];
   threadgroup float wts[8][4];
   device const void* st[8] = {s0, s1, s2, s3, s4, s5, s6, s7};
   uint base = t * p.D;
-  for (uint b = 0; b < p.nb; b++) {
-    float ss = 0;
-    for (uint i = tid; i < p.D; i += RT) {
+  float acc[8][5];  // [b][0] = sum of squares, [b][1 + q] = raw dot with query q (nq <= 4)
+  for (uint b = 0; b < 8; b++)
+    for (uint j = 0; j < 5; j++) acc[b][j] = 0;
+  for (uint i = tid; i < p.D; i += RT) {
+    float qv[4];
+    for (uint q = 0; q < p.nq; q++) qv[q] = query[q * p.D + i];
+    for (uint b = 0; b < p.nb; b++) {
       float v = ldv(st[b], p.dt[b], base + i);
-      ss += v * v;
+      acc[b][0] = fma(v, v, acc[b][0]);
+      for (uint q = 0; q < p.nq; q++) acc[b][1 + q] = fma(v, qv[q], acc[b][1 + q]);
     }
-    ss = tg_sum(ss, scratch, tid, lane, sg);
-    if (tid == 0) inv[b] = metal::precise::rsqrt(ss / float(p.D) + 1e-6f);
+  }
+  for (uint b = 0; b < p.nb; b++)
+    for (uint j = 0; j <= p.nq; j++) {
+      float v = simd_sum(acc[b][j]);
+      if (lane == 0) red[sg][b * 5 + j] = v;
+    }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (tid < p.nb * 5) {
+    float v = 0;
+    for (uint i = 0; i < RT / 32; i++) v += red[i][tid];
+    red[0][tid] = v;
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
   float scale = metal::precise::rsqrt(float(p.D));
-  for (uint q = 0; q < p.nq; q++)
-    for (uint b = 0; b < p.nb; b++) {
-      float d = 0;
-      for (uint i = tid; i < p.D; i += RT) d += (ldv(st[b], p.dt[b], base + i) * inv[b]) * query[q * p.D + i];
-      d = tg_sum(d, scratch, tid, lane, sg);
-      if (tid == 0) wts[b][q] = d * scale;
-    }
+  if (tid < p.nb) inv[tid] = metal::precise::rsqrt(red[0][tid * 5] / float(p.D) + 1e-6f);
   threadgroup_barrier(mem_flags::mem_threadgroup);
   if (tid < p.nq) {
     float m = -INFINITY;
-    for (uint b = 0; b < p.nb; b++) m = max(m, wts[b][tid]);
+    for (uint b = 0; b < p.nb; b++) {
+      float sc = red[0][b * 5 + 1 + tid] * inv[b] * scale;
+      wts[b][tid] = sc;
+      m = max(m, sc);
+    }
     float s = 0;
     for (uint b = 0; b < p.nb; b++) {
       float e = exp(wts[b][tid] - m);
