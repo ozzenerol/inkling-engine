@@ -27,7 +27,7 @@ if "--prompts" in args:
     sel = [int(x) for x in args[args.index("--prompts") + 1].split(",")]
 if "--gen-from" in args:
     gen_from = Path(args[args.index("--gen-from") + 1])
-pos = [a for i, a in enumerate(args) if not a.startswith("--") and (i == 0 or args[i - 1] not in ("--prompts", "--gen-from"))]
+pos = [a for i, a in enumerate(args) if not a.startswith("--") and (i == 0 or args[i - 1] not in ("--prompts", "--gen-from", "--set"))]
 out = Path(pos[0])
 steps = int(pos[1]) if len(pos) > 1 else 64
 out.mkdir(parents=True, exist_ok=True)
@@ -56,9 +56,28 @@ for conv in conversations:
 long_text = "\n".join(f"line {i}: the quick brown fox jumps over the lazy dog {i * 7 % 13}" for i in range(160))
 prompts.append(tok.encode(long_text + "\nSummarize the text above.", add_special_tokens=False))
 
+# --set long: 8 long prompts (about 2k to 6k tokens) cut from local source files, with a chat question at the
+# end; indices 10..17 so they never collide with p0..p3. Long-context accuracy needs several prompts: on one
+# prompt the KL between two equally exact implementations already varies by 2x (NOTES, "A: prefill attention").
+if "--set" in args and args[args.index("--set") + 1] == "long":
+    import glob
+    files = sorted(glob.glob(str(Path.home() / "llm/inkling-venv/lib/python3.12/site-packages/mlx_vlm/models/*/language.py")))
+    sizes = [2000, 2600, 3200, 3800, 4400, 5000, 5600, 6200]
+    questions = ["Summarize what this file does.", "List the classes defined above.", "What does the attention module do?",
+                 "Explain the cache handling in this code.", "Which functions deal with quantization?",
+                 "Describe the forward pass in three sentences.", "What would you refactor first, and why?",
+                 "Write a docstring for the main model class."]
+    prompts = [None] * 10
+    for i, n in enumerate(sizes):
+        body = tok.encode(Path(files[(i * 7) % len(files)]).read_text(), add_special_tokens=False)[:n]
+        conv = [{"role": "user", "content": tok.decode(body) + "\n\n" + questions[i]}]
+        text = tok.apply_chat_template(conv, tokenize=False, add_generation_prompt=True, reasoning_effort="none")
+        prompts.append(tok.encode(text, add_special_tokens=False))
+    sel = list(range(10, 18)) if sel is None else sel
+
 meta = []
 for pi, ids in enumerate(prompts):
-    if sel is not None and pi not in sel:
+    if ids is None or (sel is not None and pi not in sel):
         continue
     forced = np.load(gen_from / f"p{pi}.npz")["gen"] if gen_from else None
     cache = lm.make_cache()
@@ -79,10 +98,12 @@ for pi, ids in enumerate(prompts):
             break
         o = lm(mx.array([[t]]), cache=cache)
         logits.append(np.array(o.logits[0, -1].astype(mx.float32)))
+    np.array(ids, np.int32).tofile(out / f"p{pi}.ids")
+    np.array(gen, np.int32).tofile(out / f"p{pi}.gen")
     np.savez(out / f"p{pi}.npz", ids=np.array(ids, np.int32), gen=np.array(gen, np.int32),
              logits=np.stack(logits), **extra)
     meta.append({"prompt": pi, "n_ids": len(ids), "gen_text": tok.decode(gen)})
     print(json.dumps(meta[-1]), flush=True)
     del cache
     mx.clear_cache()
-(out / "meta.json").write_text(json.dumps(meta, indent=1))
+(out / ("meta_long.json" if "--set" in args else "meta.json")).write_text(json.dumps(meta, indent=1))
