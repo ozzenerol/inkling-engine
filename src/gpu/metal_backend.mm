@@ -383,7 +383,7 @@ class MetalBackend final : public Backend {
     if (T <= 16) {
       for (uint32_t t0 = 0; t0 < T; t0 += 4) {
         uint32_t tt = std::min<uint32_t>(4, T - t0);
-        std::string nm = std::string("matvec_q8_") + dtn(x.dtype) + "_" + dtn(out.dtype) + (tt == 1 ? "_t1" : "_t4");
+        std::string nm = std::string("matvec_q8_") + dtn(x.dtype) + "_" + dtn(out.dtype) + (tt == 1 ? "_t1" : (tt == 2 && !t2_off_) ? "_t2" : "_t4");
         Q8Params qp{N, K, tt, K, N};
         pipe(nm);
         bind(0, w);
@@ -462,7 +462,7 @@ class MetalBackend final : public Backend {
     if (K % 8 == 0 && T <= 16) {
       for (uint32_t t0 = 0; t0 < T; t0 += 4) {
         uint32_t tt = std::min<uint32_t>(4, T - t0);
-        std::string nm = std::string("matvec_bf16_") + dtn(x.dtype) + "_" + dtn(out.dtype) + (tt == 1 ? "_t1" : "_t4") +
+        std::string nm = std::string("matvec_bf16_") + dtn(x.dtype) + "_" + dtn(out.dtype) + (tt == 1 ? "_t1" : (tt == 2 && !t2_off_) ? "_t2" : "_t4") +
                          "_r4_s2";
         MatvecShape s{N, K, tt, K, N};
         pipe(nm);
@@ -829,6 +829,62 @@ class MetalBackend final : public Backend {
 
   void attention(const AttnArgs& a, Tensor& out) override {
     if (skip("attn")) return; attention_impl(a, nullptr, out); }
+  // ---- B's fused decode ops. NOTE: these overrides were missing until now (a silent failed edit in 5f0fe21: the
+  // kernels existed but the defaults ran). Opt-in INK_FUSE2=1 until a batch has run them.
+  bool fuse2() const { return fuse2_; }
+  void attention_gated(const AttnArgs& a, const Tensor& gate, Tensor& out) override {
+    uint32_t H = uint32_t(a.q.dim(1)), KVH = uint32_t(a.k_new.dim(1));
+    if (!fuse2_ || H != 3 * KVH) return Backend::attention_gated(a, gate, out);
+    if (skip("attn")) return;
+    attention_impl(a, &gate, out);  // every path rounds O/L to bf16, then multiplies by sigmoid(gate)
+  }
+  void attn_prep_local(const Tensor& kraw, const Tensor& vraw, const Tensor& k_conv, const Tensor& v_conv,
+                       Tensor& kstate, Tensor& vstate, Tensor* khist, Tensor* vhist, Tensor& q3, const Tensor& q_scale,
+                       Tensor& r3, const Tensor& rel_scale, float qk_clip, float rel_clip, float eps, Tensor& kc,
+                       Tensor& vc, Tensor& k3, Tensor& v3) override {
+    uint32_t T = uint32_t(q3.dim(0)), H = uint32_t(q3.dim(1)), KVH = uint32_t(k3.dim(1));
+    // rows are walked in order inside each unit, so any T is bit-equal to the primitives; 32 = verify limit (D's kMR)
+    if (!fuse2_ || T > 32 || q3.dim(2) != 128 || k3.dim(2) != 128 || r3.dim(2) != 16)
+      return Backend::attn_prep_local(kraw, vraw, k_conv, v_conv, kstate, vstate, khist, vhist, q3, q_scale, r3,
+                                      rel_scale, qk_clip, rel_clip, eps, kc, vc, k3, v3);
+    if (skip("small")) return;
+    bool hh = khist && khist->valid();
+    PrepParams p{T, H, KVH, qk_clip, rel_clip, eps, hh ? 1u : 0u};
+    pipe("attn_prep_local");
+    bind(0, q3);
+    bind(1, q_scale);
+    bind(2, r3);
+    bind(3, rel_scale);
+    bind(4, kraw);
+    bind(5, vraw);
+    bind(6, k_conv);
+    bind(7, v_conv);
+    bind(8, kstate);
+    bind(9, vstate);
+    bind(10, hh ? *khist : kstate);
+    bind(11, hh ? *vhist : vstate);
+    bind(12, k3);
+    bind(13, v3);
+    g_.set_value(14, p);
+    g_.dispatch({2 * H + 2 * KVH, 1, 1}, {32, 1, 1});
+  }
+  void conv_add(const Tensor& x, const Tensor& w, Tensor& state, Tensor* hist, const Tensor& other, Tensor& tmp,
+                Tensor& out) override {
+    uint32_t C = uint32_t(x.dim(-1)), T = uint32_t(x.numel() / C);
+    if (!fuse2_ || T > 32) return Backend::conv_add(x, w, state, hist, other, tmp, out);
+    if (skip("small")) return;
+    bool hh = hist && hist->valid();
+    ConvAddParams p{T, C, hh ? 1u : 0u, dtc(other.dtype), dtc(out.dtype)};
+    pipe("conv_add4");
+    bind(0, x);
+    bind(1, w);
+    bind(2, state);
+    bind(3, hh ? *hist : state);
+    bind(4, other);
+    bind(5, out);
+    g_.set_value(6, p);
+    g_.dispatch({cdiv(C, 256), 1, 1}, {256, 1, 1});
+  }
   void attention_impl(const AttnArgs& a, const Tensor* gate, Tensor& out) {
     uint32_t T = uint32_t(a.q.dim(0)), H = uint32_t(a.q.dim(1)), KVH = uint32_t(a.k_new.dim(1));
     if (T <= 4 && !(mr_attn_ && T >= mr_attn_min_) && H == 3 * KVH && !getenv("INK_ATTN_SLOW")) {
@@ -1249,7 +1305,8 @@ class MetalBackend final : public Backend {
       uint32_t rps = getenv("INK_MOE_RPS") ? uint32_t(atoi(getenv("INK_MOE_RPS"))) : 4;
       if (rps != 1 && rps != 2) rps = 4;
       std::string gun = std::string(nv ? "moe_gateup_nvfp4" : "moe_gateup_mxfp8") + (rps == 4 ? "" : rps == 2 ? "_r2" : "_r1");
-      if (nv && rps == 4 && getenv("INK_FP4_VEC")) gun = "moe_gateup_nvfp4_vec";  // bit-identical decode variant
+      // bit-identical vector decode: 137.0 -> 131.6 us per call, tokens identical (batch 6); INK_FP4_SCALAR=1 = old
+      if (nv && rps == 4 && !getenv("INK_FP4_SCALAR")) gun = "moe_gateup_nvfp4_vec";
       pipe(gun);
       bind(0, m.gate.weight);
       bind(1, m.gate.scales);
@@ -1385,6 +1442,8 @@ class MetalBackend final : public Backend {
   bool pending_ = false;
   bool profile_ = false;
   bool gpu_time_ = false;
+  bool t2_off_ = getenv("INK_NO_T2") != nullptr;  // 2-row matvec kernels (same per-row arithmetic as t1 / t4)
+  bool fuse2_ = getenv("INK_FUSE2") != nullptr;
   std::string skip_;
   std::chrono::steady_clock::time_point last_sync_;
   double acc_gpu_ = 0, acc_wall_ = 0, acc_wait_ = 0;
