@@ -1,3 +1,5 @@
 build/
 logs/
 *.o
+ref_data/
+bench/*.log
