@@ -28,6 +28,8 @@ target_link_libraries(inkcore PUBLIC inkbase "-Wl,-force_load,$<TARGET_FILE:inkg
 # CLI and reference test tool (A).
 add_executable(inktest tests/ref/inktest.cpp)
 target_link_libraries(inktest PRIVATE inkcore)
+add_executable(kernel_check tests/ref/kernel_check.cpp)
+target_link_libraries(kernel_check PRIVATE inkcore)
 add_executable(sample_test tests/ref/sample_test.cpp)
 target_link_libraries(sample_test PRIVATE inkcore)
 if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/tools/inkling.cpp)
