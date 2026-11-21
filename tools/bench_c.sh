@@ -31,8 +31,13 @@ measure() {
 	label=$1
 	model=$(curl -s "$url/v1/models" | "$py" -c 'import json,sys,os; d=json.load(sys.stdin)["data"]; print(d[0]["id"] if d else os.path.expanduser("~/llm/mlx-models/Inkling-2-Mini-MLX-4-8bit"))')
 	echo "== warm-up (kernel compile, first allocations)"
-	curl -s -m 900 "$url/v1/chat/completions" -H 'Content-Type: application/json' \
-		-d '{"messages":[{"role":"user","content":"Say hi."}],"max_tokens":32,"chat_template_kwargs":{"reasoning_effort":"none"}}' >/dev/null
+	# MLX-VLM answers /v1/models while it is still loading and returns 503 to completions: retry until 200.
+	for _ in $(seq 1 180); do
+		code=$(curl -s -m 900 -o /dev/null -w '%{http_code}' "$url/v1/chat/completions" -H 'Content-Type: application/json' \
+			-d '{"messages":[{"role":"user","content":"Say hi."}],"max_tokens":32,"chat_template_kwargs":{"reasoning_effort":"none"}}')
+		[ "$code" = 200 ] && break
+		sleep 5
+	done
 	if [ -n "${DEPTH:-}" ]; then
 		echo "== depth_bench $label (target: 60 tok/s at 1.2k, 40 tok/s at 127.5k)"
 		"$py" -u "$here/tools/depth_bench.py" --url "$url" --label "$label" ${DEPTHS:+--depths "$DEPTHS"} \
