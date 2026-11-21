@@ -108,6 +108,10 @@ struct KvAppendParams {
 struct AttnParams {
   uint32_t T, H, KVH, cap, len, ring, window, rel_extent, use_gate;
 };
+struct ChainParams {  // kernels/chain.metal
+  uint32_t T, D, nb, has_conv, boundary, has_hist, has_msg, topk, E, R;
+  float eps, route_scale;
+};
 struct AgParams {  // kernels/attn_gemm.metal
   uint32_t T, rows, rows_pad, H, KVH, cap, len, ring, window, rel_extent, j0, n, use_gate, t0;
 };
@@ -784,6 +788,75 @@ class MetalBackend final : public Backend {
     g_.dispatch({T, H, 1}, {256, 1, 1});
   }
 
+  // ---- Chain ops (kernels/chain.metal, owner A): one 1024-thread dispatch for the small ops of a visit.
+  bool has_chain(int64_t T) const override { return chain_ && T <= 8; }
+  void chain_front(const ChainFrontArgs& a) override {
+    const uint32_t T = uint32_t(a.x.dim(0)), D = uint32_t(a.x.dim(1));
+    if (a.blocks.size() > 4 || D > 2304) fail("chain_front: unsupported shape");
+    ChainParams p{T, D, uint32_t(a.blocks.size()), a.has_conv ? 1u : 0u, 0u,
+                  (a.has_conv && a.conv.hist) ? 1u : 0u, a.msg ? 1u : 0u, 0u, 0u,
+                  a.msg ? uint32_t(a.ctrl[0].down.dim(0)) : 64u, a.eps, 0.0f};
+    pipe("chain_front");
+    const Tensor& dummy = a.x;
+    bind(0, a.has_conv ? a.conv.in : dummy);
+    bind(1, a.has_conv ? a.conv.w : dummy);
+    bind(2, a.has_conv ? *a.conv.state : dummy);
+    bind(3, (a.has_conv && a.conv.hist) ? *a.conv.hist : dummy);
+    bind(4, a.has_conv ? a.res : dummy);
+    bind(5, a.x);
+    for (uint32_t b = 0; b < 4; b++) bind(6 + b, b < a.blocks.size() ? *a.blocks[b] : dummy);
+    bind(10, a.query);
+    bind(11, a.gamma);
+    bind(12, a.xq);
+    bind(13, a.xk);
+    bind(14, a.xv);
+    bind(15, a.msg ? a.msg->bank0 : dummy);
+    bind(16, a.msg ? a.msg->bank1 : dummy);
+    bind(17, a.msg ? a.msg->queries : dummy);
+    for (uint32_t c = 0; c < 3; c++) {
+      bind(18 + 3 * c, a.msg ? a.ctrl[c].down : dummy);
+      bind(19 + 3 * c, a.msg ? a.ctrl[c].forget : dummy);
+      bind(20 + 3 * c, a.msg ? a.ctrl[c].gain : dummy);
+    }
+    g_.set_value(27, p);
+    g_.dispatch({1, 1, 1}, {1024, 1, 1});
+  }
+  void chain_mid(const ChainMidArgs& a) override {
+    const uint32_t T = uint32_t(a.x.dim(0)), D = uint32_t(a.x.dim(1));
+    std::vector<const Tensor*> st = a.blocks;
+    if (a.boundary) st.push_back(&a.x);  // the new block is x itself
+    const uint32_t E = uint32_t(a.moe->gate_w.dim(0));
+    if (st.size() > 4 || D > 2304 || E != 128 || a.topk > 8 || a.moe->gate_w.dtype != DType::BF16)
+      fail("chain_mid: unsupported shape");
+    ChainParams p{T, D, uint32_t(st.size()), 0u, a.boundary ? 1u : 0u, a.conv.hist ? 1u : 0u, a.msg ? 1u : 0u,
+                  uint32_t(a.topk), E, a.msg ? uint32_t(a.ctrl->down.dim(0)) : 64u, a.eps, a.route_scale};
+    pipe("chain_mid");
+    const Tensor& dummy = a.x;
+    bind(0, a.conv.in);
+    bind(1, a.conv.w);
+    bind(2, *a.conv.state);
+    bind(3, a.conv.hist ? *a.conv.hist : a.res);
+    bind(4, a.x);
+    bind(5, a.boundary ? a.blk : a.hn);
+    for (uint32_t b = 0; b < 4; b++) bind(6 + b, b < st.size() ? *st[b] : dummy);
+    bind(10, a.query);
+    bind(11, a.gamma);
+    bind(12, a.res);
+    bind(13, a.hn);
+    bind(14, a.moe->gate_w);
+    bind(15, a.moe->bias);
+    bind(16, a.idx);
+    bind(17, a.w);
+    bind(18, a.msg ? a.msg->bank0 : dummy);
+    bind(19, a.msg ? a.msg->bank1 : dummy);
+    bind(20, a.msg ? a.msg->queries : dummy);
+    bind(21, a.msg ? a.ctrl->down : dummy);
+    bind(22, a.msg ? a.ctrl->forget : dummy);
+    bind(23, a.msg ? a.ctrl->gain : dummy);
+    g_.set_value(24, p);
+    g_.dispatch({1, 1, 1}, {1024, 1, 1});
+  }
+
   // Prefill attention as matrix products (kernels/attn_gemm.metal, owner A; port of saetta's attention_gemm).
   void attention_gemm(const AttnArgs& a, const Tensor* gate, Tensor& out) {
     const uint32_t T = uint32_t(a.q.dim(0)), H = uint32_t(a.q.dim(1)), KVH = uint32_t(a.k_new.dim(1));
@@ -1078,6 +1151,7 @@ class MetalBackend final : public Backend {
   bool skinny_ = false;
   uint32_t split_keys_ = 512;
   uint32_t split_local_ = 64;
+  bool chain_ = !getenv("INK_NO_CHAIN");  // chain kernels for T <= 8 (A)
   uint32_t ag_min_t_ = getenv("INK_AG_MIN_T") ? uint32_t(atoi(getenv("INK_AG_MIN_T"))) : 64;  // GEMM attention from this T
   std::string cur_;
   std::map<std::string, std::pair<double, long>> prof_;

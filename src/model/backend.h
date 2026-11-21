@@ -58,6 +58,47 @@ struct AttnArgs {
   //   out = softmax(s) @ v  -> bf16
 };
 
+// ---- Chain ops (A): one dispatch for a run of small per-token ops, T <= 8. Backends without them return false
+// from has_chain() and Model runs the separate ops (the CPU reference never uses chains).
+struct ChainConv {          // causal short conv K=4: in bf16 [T,D], w bf16 [D,4], state f32 [3,D], hist or null
+  Tensor in, w;
+  Tensor* state = nullptr;
+  Tensor* hist = nullptr;
+};
+struct ChainMsg {           // loop messages of one visit, never materialized: m_slot = softmax mix of the bank
+  Tensor bank0, bank1;      // bf16 [T,D]
+  Tensor queries;           // f32 [4,D]: slots attn, k, v, mlp
+};
+struct ChainCtrl {
+  Tensor down, forget, gain;
+};
+struct ChainFrontArgs {     // local layer, L > 0
+  bool has_conv = false;    // first finish the previous visit: x = bf16(res + conv(moe out))
+  ChainConv conv;
+  Tensor res;               // f32 [T,D] (has_conv)
+  Tensor x;                 // bf16 [T,D]: written when has_conv, read otherwise
+  std::vector<const Tensor*> blocks;  // bf16 [T,D] each, at most 4
+  Tensor query, gamma;      // attention_input query f32 [D], input_layernorm
+  const ChainMsg* msg = nullptr;      // loop passes: controllers attn, k, v (slots 0..2)
+  const ChainCtrl* ctrl = nullptr;    // [3]
+  float eps = 1e-6f;
+  Tensor xq, xk, xv;        // bf16 [T,D]; xk, xv only with msg
+};
+struct ChainMidArgs {       // after o_proj, any layer
+  ChainConv conv;           // o_proj out + attn_sconv
+  Tensor x;                 // bf16 [T,D] visit input
+  bool boundary = false;    // block boundary: res = conv only, x is copied to blk and is the newest block
+  Tensor blk;
+  std::vector<const Tensor*> blocks;  // completed blocks, without blk
+  Tensor query, gamma;      // mlp_input query, post_attention_layernorm
+  const ChainMsg* msg = nullptr;      // loop passes: mlp controller (slot 3)
+  const ChainCtrl* ctrl = nullptr;
+  const MoeWeights* moe = nullptr;
+  int topk = 8;
+  float route_scale = 8.0f, eps = 1e-6f;
+  Tensor res, hn, idx, w;   // out: f32 [T,D], bf16 [T,D], i32 [T,topk], f32 [T,topk]
+};
+
 class Backend {
  public:
   virtual ~Backend() = default;
@@ -180,6 +221,9 @@ class Backend {
   }
 
   // Logits: hb = f32(bf16(h)); z = hb @ f32(head)^T; out = tanh(z/30)*30, first `vocab` columns. h f32 [T,D].
+  virtual bool has_chain(int64_t T) const { (void)T; return false; }
+  virtual void chain_front(const ChainFrontArgs&) {}
+  virtual void chain_mid(const ChainMidArgs&) {}
   virtual void logits(const Tensor& h, const Tensor& head, int64_t vocab, float softcap, Tensor& out) = 0;
 };
 

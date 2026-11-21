@@ -348,15 +348,55 @@ void Model::write_tau(int64_t T) {
 
 // One layer visit: x (bf16 [T,D]) is updated in place. blocks = current attention-residual blocks (appended to at
 // block boundaries, storage blk_[blocks.size()]). msg = loop messages f32 [4,T,D] or invalid.
-void Model::run_visit(int v, Tensor& x, std::vector<Tensor>& blocks, const Tensor& msg, int64_t T) {
+void Model::run_visit(int v, Tensor& x, std::vector<Tensor>& blocks, const ChainMsg* cm, int64_t T) {
   auto dbg = [&](const char* n, const Tensor& t) { if (on_debug) on_debug(v, n, t); };
   const int L = cfg_.visits[v];
   const int64_t D = cfg_.hidden;
   const auto& w = lw_[L];
   const bool boundary = L % cfg_.block == 0;
   const int nq = w.local ? 1 : 3;
-  const bool fused_in = L > 0 && w.local && !msg.valid();  // mix + input norm in one op (B)
-  if (L > 0) {
+  // Chain kernels (A): one dispatch for the front (mix, controllers, norms) and one for the middle (conv, mix,
+  // controller, norm, router). Decode and verify only; the debug hook needs the separate intermediates.
+  const bool chain = be_.has_chain(T) && !on_debug && !no_chain_;
+  const bool chain_front = chain && w.local && L > 0;
+  ChainCtrl ctrl_w[4];
+  if (cm)
+    for (int i = 0; i < 4; ++i) ctrl_w[i] = ChainCtrl{w.ctrl_down[i], w.ctrl_forget[i], w.ctrl_gain[i]};
+  // The message tensor is only materialized for paths that are not chained.
+  Tensor msg;
+  if (cm && !(chain && chain_front)) {
+    msg = view(msg_, {4, T, D});
+    be_.loop_messages({&cm->bank0, &cm->bank1}, cm->queries, msg);
+  }
+  const bool has_msg = cm != nullptr;
+  Tensor xq, xk, xv;
+  if (chain_front) {
+    ChainFrontArgs fa;
+    fa.has_conv = pending_.on;
+    if (pending_.on) {
+      fa.conv = pending_.conv;
+      fa.res = pending_.res;
+      pending_.on = false;
+    }
+    fa.x = x;
+    for (auto& b : blocks) fa.blocks.push_back(&b);
+    fa.query = w.attn_query;
+    fa.gamma = w.in_norm;
+    fa.msg = cm;
+    fa.ctrl = cm ? ctrl_w : nullptr;
+    fa.eps = cfg_.rms_eps;
+    fa.xq = view(partsb_[0], {T, D});
+    fa.xk = cm ? view(partsb_[1], {T, D}) : fa.xq;
+    fa.xv = cm ? view(partsb_[2], {T, D}) : fa.xq;
+    be_.chain_front(fa);
+    xq = fa.xq;
+    xk = fa.xk;
+    xv = fa.xv;
+  }
+  if (pending_.on) throw std::runtime_error("pending conv was not consumed");
+  if (on_visit) on_visit(v, x);  // x is complete here (after a deferred tail), and unchanged until the visit ends
+  const bool fused_in = L > 0 && w.local && !has_msg;  // mix + input norm in one op (B)
+  if (L > 0 && !chain_front) {
     Tensor mixed = view(mixed_, {nq, T, D});
     std::vector<const Tensor*> states;
     for (auto& b : blocks) states.push_back(&b);
@@ -373,8 +413,9 @@ void Model::run_visit(int v, Tensor& x, std::vector<Tensor>& blocks, const Tenso
     if (L == 0) return x;
     return row_view(mixed_, std::min(i, nq - 1), {T, D});
   };
-  Tensor xq, xk, xv;
-  if (w.local && !msg.valid()) {
+  if (chain_front) {
+    // done above
+  } else if (w.local && !has_msg) {
     xq = view(partsb_[0], {T, D});
     if (!fused_in) {
       Tensor p0 = part(0);
@@ -384,7 +425,7 @@ void Model::run_visit(int v, Tensor& x, std::vector<Tensor>& blocks, const Tenso
   } else {
     Tensor ins[3];
     for (int i = 0; i < 3; ++i) ins[i] = part(i);
-    if (msg.valid()) {
+    if (has_msg) {
       // the three controllers (attn, k, v parts) in one batched op (B); same order and math as three calls
       Tensor outs_c[3], ms_c[3];
       for (int i = 0; i < 3; ++i) {
@@ -403,7 +444,7 @@ void Model::run_visit(int v, Tensor& x, std::vector<Tensor>& blocks, const Tenso
     dbg("xq", outs[0]);
     dbg("xk", outs[1]);
     dbg("xv", outs[2]);
-    if (msg.valid()) dbg("msg", msg);
+    if (has_msg) dbg("msg", msg);
     xq = outs[0];
     xk = outs[1];
     xv = outs[2];
@@ -416,7 +457,7 @@ void Model::run_visit(int v, Tensor& x, std::vector<Tensor>& blocks, const Tenso
   Tensor q = view(q_, {T, H * HD}), r = view(r_, {T, H * cfg_.d_rel}), sink = view(sink_, {T, H});
   Tensor g = view(gate_, {T, H * HD});
   Tensor dk = view(dk_, {T, KVH * 4}), dv = view(dv_, {T, KVH * 4});
-  if (w.local && !msg.valid()) {
+  if (w.local && !has_msg) {
     // One shared input: q, k, v, r, sink, gate in one multi-linear.
     be_.linear_multi(xq, {&w.q_proj, &w.k_proj, &w.v_proj, &w.r_proj, &w.sink_proj, &w.gate_proj},
                      {&q, &kraw, &vraw, &r, &sink, &g});
@@ -482,42 +523,79 @@ void Model::run_visit(int v, Tensor& x, std::vector<Tensor>& blocks, const Tenso
 
   // ---- residual + MoE ----
   Tensor resb = view(resb_, {T, D}), res = view(res_, {T, D});
-  if (boundary) {
-    be_.short_conv(ao, w.attn_sconv, s.conv[2], resb, hist[2]);
-    Tensor blk = view(blk_[blocks.size()], {T, D});
-    be_.copy(x, blk);
-    blocks.push_back(blk);
-    be_.cast(resb, res);
-  } else {
-    be_.conv_add(ao, w.attn_sconv, s.conv[2], hist[2], x, resb, res);  // conv + residual add (fused on Metal)
-  }
-  Tensor hid = view(hid_, {1, T, D});
-  {
-    std::vector<const Tensor*> states;
-    for (auto& b : blocks) states.push_back(&b);
-    states.push_back(&res);
-    if (!msg.valid()) {
-      Tensor hn0 = view(hn_, {T, D});
-      be_.attn_residual_norm(states, w.mlp_query, hid, w.post_norm, cfg_.rms_eps, hn0);  // mix + post norm (B)
-    } else {
-      be_.attn_residual(states, w.mlp_query, hid);
-    }
-  }
-  dbg("hid_mix", hid);
-  Tensor hid2 = view(hid_, {T, D});
   Tensor hn = view(hn_, {T, D});
-  if (msg.valid()) {
-    Tensor m3 = row_view(msg, 3, {T, D});
-    be_.controller(hid2, m3, w.ctrl_down[3], w.ctrl_forget[3], w.ctrl_gain[3], hid2);
-    be_.rms_norm(hid2, &w.post_norm, cfg_.rms_eps, D, hn);
-  }
-  dbg("hn", hn);
   Tensor ridx = view(ridx_, {T, cfg_.topk}), rw = view(rw_, {T, cfg_.topk});
-  be_.router(hn, w.moe, cfg_.topk, cfg_.route_scale, ridx, rw);
+  if (chain) {
+    ChainMidArgs ma;
+    ma.conv = ChainConv{ao, w.attn_sconv, &s.conv[2], hist[2]};
+    ma.x = x;
+    ma.boundary = boundary;
+    for (auto& b : blocks) ma.blocks.push_back(&b);
+    if (boundary) {
+      ma.blk = view(blk_[blocks.size()], {T, D});
+      blocks.push_back(ma.blk);
+    }
+    ma.query = w.mlp_query;
+    ma.gamma = w.post_norm;
+    ma.msg = cm;
+    ma.ctrl = cm ? &ctrl_w[3] : nullptr;
+    ma.moe = &w.moe;
+    ma.topk = cfg_.topk;
+    ma.route_scale = cfg_.route_scale;
+    ma.eps = cfg_.rms_eps;
+    ma.res = res;
+    ma.hn = hn;
+    ma.idx = ridx;
+    ma.w = rw;
+    be_.chain_mid(ma);
+  } else {
+    if (boundary) {
+      be_.short_conv(ao, w.attn_sconv, s.conv[2], resb, hist[2]);
+      Tensor blk = view(blk_[blocks.size()], {T, D});
+      be_.copy(x, blk);
+      blocks.push_back(blk);
+      be_.cast(resb, res);
+    } else {
+      be_.conv_add(ao, w.attn_sconv, s.conv[2], hist[2], x, resb, res);  // conv + residual add (fused on Metal)
+    }
+    Tensor hid = view(hid_, {1, T, D});
+    {
+      std::vector<const Tensor*> states;
+      for (auto& b : blocks) states.push_back(&b);
+      states.push_back(&res);
+      if (!has_msg) {
+        Tensor hn0 = view(hn_, {T, D});
+        be_.attn_residual_norm(states, w.mlp_query, hid, w.post_norm, cfg_.rms_eps, hn0);  // mix + post norm (B)
+      } else {
+        be_.attn_residual(states, w.mlp_query, hid);
+      }
+    }
+    dbg("hid_mix", hid);
+    Tensor hid2 = view(hid_, {T, D});
+    if (has_msg) {
+      Tensor m3 = row_view(msg, 3, {T, D});
+      be_.controller(hid2, m3, w.ctrl_down[3], w.ctrl_forget[3], w.ctrl_gain[3], hid2);
+      be_.rms_norm(hid2, &w.post_norm, cfg_.rms_eps, D, hn);
+    }
+    dbg("hn", hn);
+    be_.router(hn, w.moe, cfg_.topk, cfg_.route_scale, ridx, rw);
+  }
   Tensor mo = view(moe_, {T, D});
   be_.moe(hn, ridx, rw, w.moe, mo);
   dbg("moe", mo);
   Tensor mc = view(mo_, {T, D});
+  // x = res + conv(mo). With chains the next local visit's front kernel does it (same pass, same block list).
+  const int Ln = v + 1 < cfg_.num_visits() ? cfg_.visits[v + 1] : -1;
+  if (chain && Ln > 0 && Ln != cfg_.core_start && lw_[Ln].local) {
+    pending_.on = true;
+    pending_.res = res;
+    pending_.conv = ChainConv{mo, w.mlp_sconv, &s.conv[3], nullptr};
+    if (hist[3]) {
+      pending_.hist_view = *hist[3];
+      pending_.conv.hist = &pending_.hist_view;
+    }
+    return;
+  }
   be_.conv_add(mo, w.mlp_sconv, s.conv[3], hist[3], res, mc, x);  // x = res + conv(mo) (bf16; fp32 add commutes)
   dbg("res", res);
   dbg("out", x);
@@ -564,15 +642,14 @@ void Model::forward(const int32_t* ids, int64_t T, bool all_logits, bool keep_hi
         blocks.resize(size_t(prelude_n));
       }
     }
-    Tensor msg;
-    if (have_bank && L < cfg_.core_end) {
-      msg = view(msg_, {4, T, D});
-      Tensor q = row_view(msg_queries_, L - cfg_.core_start, {4, D});
-      Tensor b0 = view(bank_[0], {T, D}), b1 = view(bank_[1], {T, D});
-      be_.loop_messages({&b0, &b1}, q, msg);
+    ChainMsg cmsg;
+    const bool with_msg = have_bank && L < cfg_.core_end;
+    if (with_msg) {
+      cmsg.bank0 = view(bank_[0], {T, D});
+      cmsg.bank1 = view(bank_[1], {T, D});
+      cmsg.queries = row_view(msg_queries_, L - cfg_.core_start, {4, D});
     }
-    if (on_visit) on_visit(v, x);
-    run_visit(v, x, blocks, msg, T);
+    run_visit(v, x, blocks, with_msg ? &cmsg : nullptr, T);  // calls on_visit(v, x) once x is complete
   }
 
   // Final: attention-residual readout, norm, logits.
@@ -632,18 +709,19 @@ void Model::debug_visit(int v, const Tensor& x_in, const std::vector<const Tenso
     be_.copy(*blocks_in[i], b);
     blocks.push_back(b);
   }
-  Tensor msg;
+  ChainMsg cmsg;
   if (!bank_in.empty()) {
     for (size_t i = 0; i < bank_in.size(); ++i) {
       Tensor b = view(bank_[i], {T, D});
       be_.copy(*bank_in[i], b);
     }
-    msg = view(msg_, {4, T, D});
-    Tensor q = row_view(msg_queries_, L - cfg_.core_start, {4, D});
-    Tensor b0 = view(bank_[0], {T, D}), b1 = view(bank_[1], {T, D});
-    be_.loop_messages({&b0, &b1}, q, msg);
+    cmsg.bank0 = view(bank_[0], {T, D});
+    cmsg.bank1 = view(bank_[1], {T, D});
+    cmsg.queries = row_view(msg_queries_, L - cfg_.core_start, {4, D});
   }
-  run_visit(v, x, blocks, msg, T);
+  no_chain_ = true;  // the whole visit must finish here (no tail left for a next visit)
+  run_visit(v, x, blocks, bank_in.empty() ? nullptr : &cmsg, T);
+  no_chain_ = false;
   be_.copy(x, x_out);
   be_.sync();
 }

@@ -73,7 +73,13 @@ class Model {
 
  private:
   void load(const std::string& dir);
-  void run_visit(int v, Tensor& x, std::vector<Tensor>& blocks, const Tensor& msg, int64_t T);
+  void run_visit(int v, Tensor& x, std::vector<Tensor>& blocks, const ChainMsg* cm, int64_t T);
+  struct Pending {  // tail of the previous visit left for the next chain_front: x = bf16(res + conv(moe out))
+    bool on = false;
+    ChainConv conv;
+    Tensor res, hist_view;
+  } pending_;
+  bool no_chain_ = false;
   void write_tau(int64_t T);
   void ensure_hist();
   bool keep_hist_ = false;
