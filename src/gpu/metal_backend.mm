@@ -63,6 +63,11 @@ struct ConvAddParams {
 struct Q8Params {
   uint32_t N, K, T, x_stride, y_stride;
 };
+struct Q8MultiParams {
+  uint32_t K, T, count;
+  uint32_t row_start[7];
+  uint32_t dt_out[6];
+};
 struct DeqParams {
   uint32_t rows, K, use_ids;
 };
@@ -476,8 +481,34 @@ class MetalBackend final : public Backend {
   void linear_multi(const Tensor& x, const std::vector<const Tensor*>& ws, const std::vector<Tensor*>& outs) override {
     if (skip("linear")) return;
     for (auto* w : ws)
-      if (w->dtype == DType::U32) {  // 8-bit build: separate q8 matvecs (a fused q8 multi is a later step)
-        for (size_t i = 0; i < ws.size(); ++i) linear(x, *ws[i], *outs[i]);
+      if (w->dtype == DType::U32) {  // 8-bit build
+        uint32_t K8 = uint32_t(ws[0]->dim(1) * 4), T8 = uint32_t(x.numel() / K8);
+        bool ok8 = T8 <= 4 && ws.size() <= 6 && K8 % 64 == 0 && getenv("INK_Q8_MULTI");  // opt-in until tested
+        for (auto* v : ws) ok8 = ok8 && v->dtype == DType::U32 && uint32_t(v->dim(1) * 4) == K8 && v->dim(0) % 4 == 0;
+        if (!ok8) {
+          for (size_t i = 0; i < ws.size(); ++i) linear(x, *ws[i], *outs[i]);
+          return;
+        }
+        Q8MultiParams qp{};
+        qp.K = K8;
+        qp.T = T8;
+        qp.count = uint32_t(ws.size());
+        pipe(x.dtype == DType::BF16 ? "matvec_q8_multi_bf16" : "matvec_q8_multi_f32");
+        for (uint32_t i = 0; i < 6; i++) {
+          uint32_t j = std::min<uint32_t>(i, qp.count - 1);
+          auto& sb = affine_of(*ws[j]);
+          bind(i, *ws[j]);
+          bind(6 + i, sb.first);
+          bind(12 + i, sb.second);
+          bind(18 + i, *outs[j]);
+        }
+        for (uint32_t i = 0; i < qp.count; i++) {
+          qp.row_start[i + 1] = qp.row_start[i] + uint32_t(ws[i]->dim(0));
+          qp.dt_out[i] = dtc(outs[i]->dtype);
+        }
+        bind(24, x);
+        g_.set_value(25, qp);
+        g_.dispatch({cdiv(qp.row_start[qp.count], 8), 1, 1}, {64, 1, 1});
         return;
       }
     uint32_t K = uint32_t(ws[0]->dim(1)), T = uint32_t(x.numel() / K);
