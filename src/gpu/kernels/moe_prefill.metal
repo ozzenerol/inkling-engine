@@ -53,9 +53,9 @@ struct MoeGemmParams {
 constant uint MG_N = 64, MG_K = 32;
 
 // Grid: (N / 64, max_tiles). Threadgroup of MG_M * 2 threads: MG_M / 32 * 2 simdgroups, 32x32 each.
-// MG_M = rows of one expert per tile (64 or 128): the weight tile is dequantized once per K step for all of them,
-// so 128 halves the NVFP4 decode per routed row when experts have > 64 rows. Per element the accumulation order
-// is the same for both, so results are bit-identical.
+// MG_M = rows of one expert per tile (64 or 32). A tile is computed whole, so an expert with r rows costs
+// ceil(r / MG_M) tiles: at 800 new tokens (about 50 rows per expert) 32-row tiles waste less. 128-row tiles were
+// slower on both builds (batch 8). Per element the accumulation order is the same, so results are bit-identical.
 template <uint MODE, uint MG_M = 64>
 kernel void moe_gemm(device const uint4* w [[buffer(0)]], device const uchar* sc [[buffer(1)]],
                      device const float* gs [[buffer(2)]], device const ushort* a [[buffer(3)]],
@@ -96,22 +96,22 @@ kernel void moe_gemm(device const uint4* w [[buffer(0)]], device const uchar* sc
     }
     // B: 64 weight rows x 32 values, dequantized. NVFP4: one uint4 + 2 scales per row; MXFP8: 2 uint4 + 1 scale.
     if (MODE == 0) {
-      if (tid < MG_N) {
-        uint n = n0 + tid;
+      for (uint bt = tid; bt < MG_N; bt += MG_M * 2) {
+        uint n = n0 + bt;
         size_t row = size_t(e) * p.N + min(n, p.N - 1);
         uint4 q = w[(row * rowbytes_q + k0 / 2) / 16];
         ushort s2 = *(device const ushort*)(sc + row * (p.K / 16) + k0 / 16);
         float s0 = e4m3_to_f(s2 & 255u), s1 = e4m3_to_f(s2 >> 8);
         uint ws[4] = {q.x, q.y, q.z, q.w};
-        threadgroup bfloat* dst = Bs + tid * LDS;
+        threadgroup bfloat* dst = Bs + bt * LDS;
         for (uint j = 0; j < 4; j++) {
           float s = j < 2 ? s0 : s1;
           for (uint i = 0; i < 8; i++) dst[j * 8 + i] = bfloat(fp4h((ws[j] >> (4 * i)) & 15u) * 16384.0f * s);
         }
       }
     } else {
-      if (tid < 2 * MG_N) {
-        uint rr = tid / 2, half_ = tid % 2;
+      for (uint bt = tid; bt < 2 * MG_N; bt += MG_M * 2) {
+        uint rr = bt / 2, half_ = bt % 2;
         uint n = n0 + rr;
         size_t row = size_t(e) * p.N + min(n, p.N - 1);
         uint4 q = w[(row * rowbytes_q + k0 + half_ * 16) / 16];
@@ -156,7 +156,7 @@ kernel void moe_gemm(device const uint4* w [[buffer(0)]], device const uchar* sc
       device const int*, device const uint2*, device const uint*, device ushort*, constant MoeGemmParams&,    \
       uint2, uint, uint, uint);
 MG_INST(0, "moe_gemm_nvfp4", 64)
-MG_INST(0, "moe_gemm_nvfp4_m128", 128)
+MG_INST(0, "moe_gemm_nvfp4_m32", 32)
 MG_INST(1, "moe_gemm_mxfp8", 64)
-MG_INST(1, "moe_gemm_mxfp8_m128", 128)
+MG_INST(1, "moe_gemm_mxfp8_m32", 32)
 
