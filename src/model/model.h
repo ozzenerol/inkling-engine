@@ -56,6 +56,8 @@ class Model {
   const std::vector<float>& logits() const { return logits_; }  // [rows, vocab_unpadded]
   int64_t logit_rows() const { return logit_rows_; }
   int64_t len() const { return len_; }
+  // Tokens currently in the cache (size len()); -1 where unknown (restored past what this Model saw).
+  const std::vector<int32_t>& tokens() const { return toks_; }
   void reset();  // empty cache
 
   // Called with the hidden state entering each visit v (0..47) and v = 48 for the final normed output
@@ -80,6 +82,7 @@ class Model {
     Tensor res, hist_view;
   } pending_;
   bool no_chain_ = false;
+  std::vector<int32_t> toks_;
   void write_tau(int64_t T);
   void ensure_hist();
   bool keep_hist_ = false;

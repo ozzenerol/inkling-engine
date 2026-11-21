@@ -11,6 +11,7 @@
 #include <memory>
 
 #include <random>
+#include <unordered_map>
 
 #include "engine/sampling.h"
 #include "gpu/dspark.h"
@@ -26,11 +27,17 @@ struct Spec {
   double draft_ms = 0, verify_ms = 0;
   // Adaptive draft length (A): running estimates, kept across requests.
   double acc[8] = {0.7, 0.7, 0.7, 0.7, 0.7, 0.7, 0.7, 0.7};  // P(draft j accepted | drafts before it accepted)
-  double t_plain = 0, t_draft = 0, t_verify[9] = {0, 0, 0, 0, 0, 0, 0, 0, 0};  // ms, 0 = not measured yet
+  double t_plain = 0, t_draft = 0, t_verify[17] = {};  // ms, 0 = not measured yet
   long plain_steps = 0;
   double arm_rate[9] = {0, 0, 0, 0, 0, 0, 0, 0, 0};  // tokens per ms delivered by draft count k (EMA)
   long arm_n[9] = {0, 0, 0, 0, 0, 0, 0, 0, 0};
   int since_probe = 0, probe = 0;
+  // Prompt-lookup drafts (A): trigram -> position after its latest occurrence in the cached tokens.
+  std::unordered_map<uint64_t, int32_t> tri;
+  size_t tri_upto = 0;      // trigrams ending before this index are in the map
+  double lk_rate = 0;       // tokens per ms delivered by lookup rounds (EMA)
+  long lk_n = 0, lk_rounds = 0, lk_drafted = 0, lk_accepted = 0;
+  int lk_skip = 0, lk_k = 7;
   std::mt19937_64 rng{0x9E3779B97F4A7C15ull};  // speculative sampling uniforms
   uint64_t seeded = ~0ull;
   std::vector<float> pt;
@@ -141,10 +148,54 @@ bool speculative_generate(Engine& e, Model& m, const SamplingParams& p, int max_
     ema(s.arm_rate[k], tokens / ms, 0.15);
     s.arm_n[k]++;
   };
+  // Prompt lookup: agents copy a lot from their context (file contents, paths, tool-call boilerplate). When the
+  // last three tokens occurred before, the tokens that followed are the draft: no drafter cost, and blocks of up
+  // to 15 tokens, verified like any other draft (so the output is unchanged). Used while it delivers more tokens
+  // per ms than the drafter arms; the block doubles after a fully accepted round and shrinks after a rejection.
+  const bool lookup_on = !getenv("INK_NO_LOOKUP");
+  auto tri_key = [](int32_t a, int32_t b2, int32_t c) {
+    return (uint64_t(uint32_t(a)) << 40) ^ (uint64_t(uint32_t(b2)) << 20) ^ uint64_t(uint32_t(c));
+  };
+  auto lookup = [&](int32_t anchor, int kmax, std::vector<int32_t>& out) {
+    const auto& tk = m.tokens();
+    const size_t n = tk.size();
+    if (s.tri_upto > n) {  // the cache was rewound or restored: rebuild
+      s.tri.clear();
+      s.tri_upto = 0;
+    }
+    for (size_t i = std::max<size_t>(s.tri_upto, 2); i < n; i++)
+      if (tk[i] >= 0 && tk[i - 1] >= 0 && tk[i - 2] >= 0) s.tri[tri_key(tk[i - 2], tk[i - 1], tk[i])] = int32_t(i + 1);
+    s.tri_upto = n;
+    out.clear();
+    if (n < 2) return;
+    auto it = s.tri.find(tri_key(tk[n - 2], tk[n - 1], anchor));
+    if (it == s.tri.end()) return;
+    for (size_t p2 = size_t(it->second); p2 < n && int(out.size()) < kmax; p2++) {
+      if (tk[p2] < 0) break;
+      out.push_back(tk[p2]);
+    }
+    // the continuation may run into the pending anchor (a repeat of the last tokens): stop there
+  };
+  std::vector<int32_t> lk;
   while (true) {
     int k = std::min(count_max, max_tokens - emitted);
     if (k <= 0) break;
-    k = choose_k(k);
+    bool use_lookup = false;
+    if (lookup_on) {
+      if (s.lk_skip > 0) {
+        s.lk_skip--;
+      } else {
+        lookup(b, std::min({s.lk_k, 15, max_tokens - emitted}), lk);
+        double best = 0;
+        for (int j = 0; j <= count_max; j++) best = std::max(best, s.arm_rate[j]);
+        if (lk.size() >= 2) {
+          if (s.lk_n < 3 || s.lk_rate >= 0.9 * best) use_lookup = true;
+          else s.lk_skip = 24;  // not paying on this text: look again later
+        }
+      }
+    }
+    if (use_lookup) k = int(lk.size());
+    else k = choose_k(k);
     if (k == 0) {
       // Plain step: feed b, sample the next token. The capture hook ingests the row into the draft context.
       auto t0 = std::chrono::steady_clock::now();
@@ -171,7 +222,10 @@ bool speculative_generate(Engine& e, Model& m, const SamplingParams& p, int max_
     sampled = p.temperature > 0.0f && getenv("INK_SPEC_SAMPLE");
 #endif
     std::vector<int32_t> drafts;
-    if (sampled) {
+    if (use_lookup) {
+      sampled = false;
+      drafts = lk;
+    } else if (sampled) {
 #ifdef INK_DSPARK_HAS_SAMPLE
       float us[8];
       for (int j = 0; j < k; j++) us[j] = float(std::generate_canonical<double, 53>(s.rng));
@@ -190,7 +244,7 @@ bool speculative_generate(Engine& e, Model& m, const SamplingParams& p, int max_
     auto c2 = std::chrono::steady_clock::now();
     s.draft_ms += std::chrono::duration<double, std::milli>(c1 - c0).count();
     s.verify_ms += std::chrono::duration<double, std::milli>(c2 - c1).count();
-    ema(s.t_draft, std::chrono::duration<double, std::milli>(c1 - c0).count(), 0.2);
+    if (!use_lookup) ema(s.t_draft, std::chrono::duration<double, std::milli>(c1 - c0).count(), 0.2);
     ema(s.t_verify[k + 1], std::chrono::duration<double, std::milli>(c2 - c1).count(), 0.2);
     const auto& lg = m.logits();
     // Sample-and-compare (as mlx_vlm's DSpark walk): sample the target at each row in order; accept the draft
@@ -229,17 +283,26 @@ bool speculative_generate(Engine& e, Model& m, const SamplingParams& p, int max_
       break;
     }
     if (getenv("INK_SPEC_DEBUG") && s.rounds < 1000) {
-      fprintf(stderr, "round %ld: b=%d drafts", s.rounds, b);
+      fprintf(stderr, "round %ld%s: b=%d drafts", s.rounds, use_lookup ? " (lookup)" : "", b);
       for (int x : drafts) fprintf(stderr, " %d", x);
       fprintf(stderr, " | target");
       for (int x : y) fprintf(stderr, " %d", x);
       fprintf(stderr, " | a=%d\n", a);
     }
-    s.rounds++;
-    s.drafted += k;
-    s.accepted += a;
-    for (int j = 0; j < k && j <= a; j++) ema(s.acc[j], j < a ? 1.0 : 0.0, 0.08);  // positions reached this round
-    arm_update(k, a + 1, std::chrono::duration<double, std::milli>(c2 - c0).count());
+    if (use_lookup) {
+      s.lk_rounds++;
+      s.lk_drafted += k;
+      s.lk_accepted += a;
+      ema(s.lk_rate, (a + 1) / std::chrono::duration<double, std::milli>(c2 - c0).count(), 0.2);
+      s.lk_n++;
+      s.lk_k = a == k ? std::min(15, 2 * s.lk_k + 1) : std::max(3, (a + s.lk_k) / 2);
+    } else {
+      s.rounds++;
+      s.drafted += k;
+      s.accepted += a;
+      for (int j = 0; j < k && j <= a; j++) ema(s.acc[j], j < a ? 1.0 : 0.0, 0.08);  // positions reached this round
+      arm_update(k, a + 1, std::chrono::duration<double, std::milli>(c2 - c0).count());
+    }
     // emit d_0..d_{a-1}, then y_a; stop as soon as a stop token / limit / on_token=false shows up
     int keep = a + 1;  // cache rows kept: [b, d_0..d_{a-1}]
     bool done = false;
@@ -266,6 +329,9 @@ bool speculative_generate(Engine& e, Model& m, const SamplingParams& p, int max_
     fprintf(stderr, "dspark: %ld rounds, accepted %ld of %ld drafts (%.2f per round), draft %.2f ms, verify %.2f ms per round\n",
             s.rounds, s.accepted, s.drafted, s.rounds ? double(s.accepted) / s.rounds : 0.0,
             s.rounds ? s.draft_ms / s.rounds : 0.0, s.rounds ? s.verify_ms / s.rounds : 0.0);
+  if (getenv("INK_SPEC_STATS"))
+    fprintf(stderr, "lookup: %ld rounds, accepted %ld of %ld drafts, %.1f tok/s in lookup rounds\n", s.lk_rounds,
+            s.lk_accepted, s.lk_drafted, 1e3 * s.lk_rate);
   if (getenv("INK_SPEC_STATS"))
     fprintf(stderr, "dspark adaptive: %ld plain steps, plain %.1f ms, draft %.1f ms, verify T=2..5 %.1f %.1f %.1f %.1f ms, "
                     "acceptance by position %.2f %.2f %.2f, tok/s by draft count %.1f %.1f %.1f %.1f\n",
