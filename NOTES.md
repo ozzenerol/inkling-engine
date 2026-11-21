@@ -537,6 +537,19 @@ head 0.93 -> 0.48). Check script: tests/ref/check_8bit_layout.py (tensor-by-tens
   79%, T=4 59%, T=8 49%: rows of a verify share experts heavily -> expert-union MoE (D) saves up to 65% of the
   MoE reads, the only marginal cost of a verify row left (6.7 ms per row today).
   B: conv+mix+norm merge 36.5 vs 36.6 tok/s (no gain, stays off).
+- **With the model** (batch 3, copy.ids, ctx 2.3k, one run): verify T=8 74.1 ms (old path 140.6), T=16 130.1 (202.7);
+  copy at lookup max 15: 106.2 tok/s vs 69.8 without the multi-row kernels. T=16 = 29 + 15 x 6.7 ms: the marginal
+  row cost is the MoE alone.
+- **Expert sharing between the rows of a verify** (INK_MOE_STATS, batch 4): distinct experts as % of routes: copy
+  T=4 66.9, T=8 52.2, T=16 34.9; edit 68.9 / 47.9 / 35.0; free text p2 T=2 79.1, T=3 67.6, T=4 59.0, T=8 49.1
+  (independent routing would give 91 / 81 / 64 at T = 4 / 8 / 16).
+- **Expert-union MoE** (`mr_moe_group` / `_gateup` / `_down` / `_wsum`, default from 3 rows, INK_MR_MOE=0 off,
+  INK_MR_MOE_MIN=n): each used expert read once and applied to every row routed to it; rows == T=1 bit for bit
+  (op_diff "moe rows==T1", nvfp4 and mxfp8). bench_moe, random routes (little sharing), us per call, union vs per
+  route: nvfp4 T=2 255 / 233, T=4 451 / 448, T=8 780 / 867, T=16 1265 / 1706; mxfp8 T=2 362 / 346, T=4 650 / 673,
+  T=8 1130 / 1317, T=16 1798 / 2610. **NVFP4 is bound by decoding the codes, not by the read**: sharing only the
+  read gave 1743 us at T=16 (no gain); decoding a chunk once into 32 halves and applying it per row gave 1265.
+- q8 one-pass matvec for 5..16 rows (`mr_matvec_q8`): written, unmeasured.
 - **Batch 5** (main 180d9f3, 20:29-20:42; D's expert-union MoE from 3 rows, B's q8 linear_multi opt-in): all gates
   pass. 600 tokens, one run each, greedy token-identical to plain (tok/s):
 

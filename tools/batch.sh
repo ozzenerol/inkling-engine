@@ -22,7 +22,8 @@ if [[ " $what " == *" gates "* ]]; then
   gate rollback ./build/inktest --backend metal --ids ref_data/p2.ids --rollback-test --out $OUT; tail -1 $OUT/gate-rollback.log | tee -a $OUT/summary.log
 fi
 if [[ " $what " == *" queues "* ]]; then
-  for q in tools/queue/*.sh; do
+  # C's server benchmarks run last (they are the longest and want a quiet machine)
+  for q in $(ls tools/queue/*.sh | grep -v '/c.sh$') $(ls tools/queue/c.sh 2>/dev/null); do
     [ -f "$q" ] || continue
     l=$(basename $q .sh); echo "== queue $l" | tee -a $OUT/summary.log
     FULL=$([[ " $what " == *" full "* ]] && echo 1) OUT=$OUT bash $q > $OUT/$l.log 2>&1; echo "   exit $? ($(wc -l < $OUT/$l.log) lines in $OUT/$l.log)" | tee -a $OUT/summary.log
