@@ -517,3 +517,23 @@ head 0.93 -> 0.48). Check script: tests/ref/check_8bit_layout.py (tensor-by-tens
   plain + (T-1) x ~6.8 ms unless rows share experts.
 - Switches: INK_MR=0 (dense passes of 4), INK_MR_ATTN=0, INK_MR_ATTN_MIN=n.
 - Open: forward times per T with the model (queue d), drafter 8 ms -> 3 ms, a 12-row dense variant, q8 multi-row.
+- **Batch 4** (main c65c4be, 20:14-20:26): all gates pass. New drafting defaults (block 8, lookup up to 15, draft
+  count follows acceptance, plain fallback), 600 tokens, one run each, greedy token-identical to plain (tok/s):
+
+  | | plain | defaults greedy | no lookup | defaults temp 0.7 | plain temp 0.7 |
+  |---|---|---|---|---|---|
+  | copy (2.3k ctx) | 33.6 | **100.4** | 89.9 | 98.4 | 33.2 |
+  | edit (2.3k ctx) | 33.4 | **91.0** | 72.9 | 89.7 | 33.2 |
+  | p0 (code answer) | 36.2 | 53.8 | 53.4 | 49.6 | 36.0 |
+  | p2 (short prose) | 36.4 | 36.6 | 38.3 | 43.7 | 35.9 |
+  | 8-bit copy | 38.3 | 91.1 | | | |
+  | 8-bit p2 | 42.3 | 48.5 | | | |
+
+  The 8-bit build is behind on copy text because the multi-row kernels are bf16 only (D: q8 variants next).
+  Server (C): ctxbench temp 0.7 gen 34.7 / 32.8 lossless, 36.5 / 35.6 8-bit (MLX 23.1 / 24.2), prefill 731 / 809
+  (MLX 565 / 602); agent bench: median gen **76.5** lossless, 64.6 8-bit (MLX 44.1), totals 82.2 / 93.0 s (MLX
+  241.5), median TTFT 1.37 s (MLX 13.5); qh end-to-end PASS in 17 s.
+  D's expert counter (distinct experts as % of routes in one verify): copy T=4 67%, T=8 52%, T=16 35%; p2 T=2
+  79%, T=4 59%, T=8 49%: rows of a verify share experts heavily -> expert-union MoE (D) saves up to 65% of the
+  MoE reads, the only marginal cost of a verify row left (6.7 ms per row today).
+  B: conv+mix+norm merge 36.5 vs 36.6 tok/s (no gain, stays off).
