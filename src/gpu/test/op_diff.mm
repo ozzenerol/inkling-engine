@@ -389,6 +389,67 @@ int main(int argc, char** argv) {
     if (bad) fails++;
   }
 
+  // q8 affine linear (8-bit build) vs fp64 host math: y = sum_g s_g * sum(x q) + b_g * sum(x), and the GEMM path
+  if (MTL->supports_q8()) {
+    const int64_t N = 640, K = 2304, G = K / 64;
+    std::vector<uint8_t> codes(N * K);
+    std::vector<uint16_t> sc(N * G), bi(N * G);
+    std::uniform_int_distribution<int> ud(0, 255);
+    std::normal_distribution<float> nd(0, 1);
+    for (auto& c : codes) c = uint8_t(ud(rng));
+    for (auto& v : sc) v = f32_to_bf16(std::fabs(nd(rng)) * 0.002f);
+    for (auto& v : bi) v = f32_to_bf16(nd(rng) * 0.2f);
+    Tensor wc = MTL->alloc(DType::U32, {N, K / 4}, "q8w"), ws = MTL->alloc(DType::BF16, {N, G}, "q8s"),
+           wb = MTL->alloc(DType::BF16, {N, G}, "q8b");
+    MTL->write(wc, codes.data(), codes.size());
+    MTL->write(ws, sc.data(), sc.size() * 2);
+    MTL->write(wb, bi.data(), bi.size() * 2);
+    MTL->bind_affine(wc, ws, wb);
+    for (int64_t T : {1, 3, 8, 70}) {
+      std::vector<uint16_t> xv(T * K);
+      for (auto& v : xv) v = f32_to_bf16(nd(rng));
+      Tensor x = MTL->alloc(DType::BF16, {T, K}, "q8x"), y = MTL->alloc(DType::F32, {T, N}, "q8y");
+      MTL->write(x, xv.data(), xv.size() * 2);
+      MTL->linear(x, wc, y);
+      MTL->sync();
+      double maxrel = 0, maxref = 0;
+      for (int64_t t = 0; t < T; t++)
+        for (int64_t n = 0; n < N; n++) {
+          double ref = 0;
+          for (int64_t k = 0; k < K; k++) {
+            double s_ = bf16_to_f32(sc[n * G + k / 64]), b_ = bf16_to_f32(bi[n * G + k / 64]);
+            double w = s_ * codes[n * K + k] + b_;
+            if (T > 16) w = bf16_to_f32(f32_to_bf16(float(w)));  // GEMM path stages bf16(s*q+b), as MLX qmm
+            ref += w * bf16_to_f32(xv[t * K + k]);
+          }
+          maxref = std::max(maxref, std::fabs(ref));
+          maxrel = std::max(maxrel, std::fabs(ref - y.data<float>()[t * N + n]));
+        }
+      double rel = maxrel / maxref;
+      bool ok = rel < 1e-4;
+      if (!ok) fails++;
+      printf("%-28s %s  max|d| / max|ref| = %.2e\n", ("q8 linear T=" + std::to_string(T)).c_str(), ok ? "ok  " : "FAIL",
+             rel);
+      MTL->free(x);
+      MTL->free(y);
+    }
+    // embedding rows: bf16(s*q + b)
+    std::vector<int32_t> ids = {5, 0, 639, 77};
+    Tensor it = MTL->alloc(DType::I32, {4}, "ids"), eo = MTL->alloc(DType::BF16, {4, K}, "emb");
+    MTL->write(it, ids.data(), 16);
+    MTL->embed(it, wc, eo);
+    MTL->sync();
+    size_t bad = 0;
+    for (int r = 0; r < 4; r++)
+      for (int64_t k = 0; k < K; k++) {
+        float w = std::fma(bf16_to_f32(sc[ids[r] * G + k / 64]), float(codes[ids[r] * K + k]),
+                           bf16_to_f32(bi[ids[r] * G + k / 64]));
+        if (f32_to_bf16(w) != eo.data<uint16_t>()[r * K + k]) bad++;
+      }
+    printf("%-28s %s  mismatches %zu\n", "q8 embed rows", bad ? "FAIL" : "ok  ", bad);
+    if (bad) fails++;
+  }
+
   // MoE and router with real weights: layer 0 (NVFP4) and layer 23 (MXFP8)
   SafeTensors st;
   st.add_dir(dir);
