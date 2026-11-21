@@ -550,3 +550,21 @@ head 0.93 -> 0.48). Check script: tests/ref/check_8bit_layout.py (tensor-by-tens
   T=8 1130 / 1317, T=16 1798 / 2610. **NVFP4 is bound by decoding the codes, not by the read**: sharing only the
   read gave 1743 us at T=16 (no gain); decoding a chunk once into 32 halves and applying it per row gave 1265.
 - q8 one-pass matvec for 5..16 rows (`mr_matvec_q8`): written, unmeasured.
+- **Batch 5** (main 180d9f3, 20:29-20:42; D's expert-union MoE from 3 rows, B's q8 linear_multi opt-in): all gates
+  pass. 600 tokens, one run each, greedy token-identical to plain (tok/s):
+
+  | | plain | defaults greedy | defaults temp 0.7 |
+  |---|---|---|---|
+  | copy | 33.6 | **128.1** | 124.5 |
+  | edit | 33.4 | **114.3** | 113.3 |
+  | p0 | 36.1 | 59.8 | 54.1 |
+  | p2 | 36.6 | 41.0 | 46.5 |
+  | 8-bit copy | 38.3 | 108.2 | |
+  | 8-bit p2 | 42.2 | 50.5 | |
+
+  Server (C): agent bench median gen **88.6** lossless, 68.1 8-bit (MLX 44.1); totals 74.0 / 85.0 s (MLX 241.5);
+  new copy scenario (6 turns, print a ~500-token file back with a rename): 103.3 lossless, 93.9 8-bit; ctxbench
+  temp 0.7 gen 33.5 / 35.4 lossless, 38.2 / 36.1 8-bit (MLX 23.1 / 24.2); prefill 740 / 808; qh e2e PASS 16 s.
+  B: q8 matvec model-free 795 GB/s of codes at T=1 (dense reads of the 8-bit build: 1.7 ms against 8.1 ms bf16),
+  so the 8-bit plain step (23.7 ms) is now almost all MoE + head + small-dispatch latency; q8 linear_multi and
+  conv_mix: no gain; MoE gate/up with 2 or 1 rows per simdgroup: slower (249 / 237 vs 262 GB/s).
