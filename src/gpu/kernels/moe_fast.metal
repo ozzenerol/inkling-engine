@@ -99,6 +99,8 @@ kernel void moe_gateup(device const uint4* gw [[buffer(0)]], device const uchar*
   // grid: x = route (fastest), y = row block: routes that share an expert read the same rows close together
   uint route = tg.x, t = route / p.topk;
   for (uint i = tid; i < p.K; i += 32 * GU_SIMDS) xs[(i / 32) * 33 + i % 32] = bf2f(x[t * p.K + i]);
+  threadgroup half2 lut[256];  // LUT variant only (the declaration was missing: the library did not compile)
+  if (LUT) build_fp4_lut(lut, tid, 32 * GU_SIMDS);
   threadgroup_barrier(mem_flags::mem_threadgroup);
   uint e = uint(idx[route]);
   uint n = (tg.y * GU_SIMDS + sg) * 4 + lane / 8;
