@@ -16,3 +16,9 @@ for v in "X=1" "INK_FP4_VEC=1"; do env $v $(bin spec_check) plain ref_data/p2.id
 cmp "$BS/vec_X=1.i32" "$BS/vec_INK_FP4_VEC=1.i32" && echo "fp4 vec tokens IDENTICAL"
 echo "== B bench_q8 sanity: same bench with INK_Q8_KERNELS-independent bf16 reference"
 $(bin bench_matvec) 1 | grep GB/s; $(bin bench_q8) 1
+echo "== B fused decode ops really wired now (INK_FUSE2=1): op_diff (prep / conv_add / attention_gated cases are exact tests), then decode off vs on, both builds"
+INK_FUSE2=1 $(bin op_diff) 2>&1 | grep -E "prep |conv_add|attention_gated|verify==|ALL|FAILED|FAIL "
+for m in $HOME/llm/mlx-models/Inkling-2-Mini-MLX-4-8bit $M8; do for v in "X=1" "INK_FUSE2=1"; do
+  echo -n "[$(basename $m) $v] "; env $v INK_MODEL=$m $(bin spec_check) plain ref_data/p2.ids 200 4 "$BS/f2_$(basename $m)_$v.i32" 2>&1 | grep -oE "decode [0-9.]+ s -> [0-9.]+ tok/s"
+done; cmp "$BS/f2_$(basename $m)_X=1.i32" "$BS/f2_$(basename $m)_INK_FUSE2=1.i32" && echo "fuse2 tokens IDENTICAL"; done
+echo -n "[fuse2 dspark identity] "; INK_FUSE2=1 tools/spec_check.sh ref_data/p2.ids 200 8 2>&1 | grep -E "IDENT|DIFF"
