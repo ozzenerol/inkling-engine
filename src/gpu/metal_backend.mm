@@ -87,7 +87,7 @@ struct AttnParams {
   uint32_t T, H, KVH, cap, len, ring, window, rel_extent;
 };
 struct AttnDecParams {
-  uint32_t T, H, KVH, cap, len, ring, window, rel_extent, split_keys, nsplit;
+  uint32_t T, H, KVH, cap, len, ring, window, rel_extent, split_keys, nsplit, causal, first, use_sink;
 };
 struct RouterParams {
   uint32_t T, D, E, topk, dt_x;
@@ -451,8 +451,8 @@ class MetalBackend final : public Backend {
       uint32_t split_keys = std::max<uint32_t>(256, (cdiv(nkeys, 96) + 127) / 128 * 128);
       uint32_t nsplit = cdiv(nkeys, split_keys);
       AttnDecParams p{T, H, KVH, uint32_t(a.kv.cap), len, a.kv.ring ? 1u : 0u, window, uint32_t(a.rel_proj.dim(1)),
-                      split_keys, nsplit};
-      Tensor part = scratch("attn-part", DType::F32, {KVH * nsplit * 16, 132});
+                      split_keys, nsplit, 1u, first, 1u};
+      Tensor part = scratch("attn-part", DType::F32, {KVH * nsplit * 24, 132});
       pipe(T <= 2 ? "attn_decode_split_f1" : "attn_decode_split_f2");
       bind(0, a.q);
       bind(1, a.k_new);

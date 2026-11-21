@@ -6,11 +6,14 @@
 
 struct AttnDecParams {
   uint T, H, KVH;
-  uint cap, len, ring, window, rel_extent;
+  uint cap, len, ring, window, rel_extent;  // rel_extent 0 = no relative bias
   uint split_keys, nsplit;
+  uint causal;  // 0: every query sees all keys in range (DSpark draft block)
+  uint first;   // oldest key position (computed by the host)
+  uint use_sink;
 };
 
-constant uint AD_MAXR = 16;  // partial rows per (kvh, split)
+constant uint AD_MAXR = 24;  // partial rows per (kvh, split)
 constant uint AD_BK = 16;
 constant uint AD_SG = 2;
 
@@ -23,8 +26,7 @@ kernel void attn_decode_split(device const ushort* q [[buffer(0)]], device const
                               uint tid [[thread_index_in_threadgroup]], uint sg [[simdgroup_index_in_threadgroup]],
                               uint lane [[thread_index_in_simdgroup]]) {
   constexpr uint LDK = 128 + 8;
-  threadgroup bfloat Ks[AD_SG][AD_BK * LDK];
-  threadgroup bfloat Vs[AD_SG][AD_BK * LDK];
+  threadgroup bfloat KVs[AD_SG * 2 * AD_BK * LDK];  // per simdgroup: K tile then V tile; reused as fp32 at the end
   threadgroup bfloat Qst[8 * NF * 128];
   uint kvh = tg.x, split = tg.y;
   uint G = p.H / p.KVH;
@@ -50,12 +52,10 @@ kernel void attn_decode_split(device const ushort* q [[buffer(0)]], device const
     rok[f] = rr < R;
     uint rc = min(rr, R - 1), t = rc / G, h = kvh * G + rc % G;
     qpos[f] = p.len + t;
-    for (uint d = 0; d < 16; d++) rrv[f][d] = bf2f(r[(t * p.H + h) * 16 + d]);
+    for (uint d = 0; d < 16; d++) rrv[f][d] = p.rel_extent ? bf2f(r[(t * p.H + h) * 16 + d]) : 0.0f;
   }
   uint last = p.len + p.T - 1;
-  uint first = 0;
-  if (p.window && p.len + 1 > p.window) first = p.len + 1 - p.window;
-  uint k0 = first + split * p.split_keys;
+  uint k0 = p.first + split * p.split_keys;
   uint k1 = min(k0 + p.split_keys, last + 1);
   const float scale = 0.08838834764831845f;
   float m[NF], l[NF];
@@ -65,8 +65,8 @@ kernel void attn_decode_split(device const ushort* q [[buffer(0)]], device const
     l[f] = 0;
     for (uint j = 0; j < 16; j++) of[f][j] = simdgroup_float8x8(0);
   }
-  threadgroup bfloat* K_ = Ks[sg];
-  threadgroup bfloat* V_ = Vs[sg];
+  threadgroup bfloat* K_ = KVs + sg * 2 * AD_BK * LDK;
+  threadgroup bfloat* V_ = K_ + AD_BK * LDK;
   for (uint kb = k0 + sg * AD_BK; kb < k1; kb += AD_BK * AD_SG) {
     for (uint i = lane; i < AD_BK * 16; i += 32) {
       uint kr = i / 16, c8 = (i % 16) * 8;
@@ -98,12 +98,13 @@ kernel void attn_decode_split(device const ushort* q [[buffer(0)]], device const
         thread auto& el = sf[j].thread_elements();
         for (uint e = 0; e < 2; e++) {
           uint kpos = kb + j * 8 + fn + e;
-          bool vis = rok[f] && kpos < k1 && kpos <= qpos[f] && (p.window == 0 || qpos[f] - kpos < p.window);
+          bool vis = rok[f] && kpos < k1 &&
+                     (!p.causal || (kpos <= qpos[f] && (p.window == 0 || qpos[f] - kpos < p.window)));
           float sc = -INFINITY;
           if (vis) {
             sc = el[e] * scale;
             uint dist = qpos[f] - kpos;
-            if (dist < p.rel_extent) {
+            if (p.causal && dist < p.rel_extent) {
               float b = 0;
               for (uint d = 0; d < 16; d++) b = fma(rrv[f][d], bf2f(rel_proj[d * p.rel_extent + dist]), b);
               sc += round_bf(b);
@@ -148,7 +149,7 @@ kernel void attn_decode_split(device const ushort* q [[buffer(0)]], device const
   }
   // combine the 2 simdgroups: sg 1 writes its partial to threadgroup memory (reusing the K/V areas as float)
   threadgroup_barrier(mem_flags::mem_threadgroup);
-  threadgroup float* xo = (threadgroup float*)&Ks[0][0];  // NF*8 rows x 128 floats (<= 16 KB fits in Ks+Vs)
+  threadgroup float* xo = (threadgroup float*)KVs;  // NF*8 rows x 128 floats (12 KB for NF=3 <= 17 KB)
   threadgroup float* xm = (threadgroup float*)&Qst[0];    // m, l per row
   if (sg == 1)
     for (uint f = 0; f < NF; f++) {
@@ -191,6 +192,9 @@ kernel void attn_decode_split(device const ushort* q [[buffer(0)]], device const
 template [[host_name("attn_decode_split_f1")]] kernel void attn_decode_split<1>(
     device const ushort*, device const ushort*, device const ushort*, device const ushort*, device const ushort*,
     device const ushort*, device const ushort*, device float*, constant AttnDecParams&, uint2, uint, uint, uint);
+template [[host_name("attn_decode_split_f3")]] kernel void attn_decode_split<3>(
+    device const ushort*, device const ushort*, device const ushort*, device const ushort*, device const ushort*,
+    device const ushort*, device const ushort*, device float*, constant AttnDecParams&, uint2, uint, uint, uint);
 template [[host_name("attn_decode_split_f2")]] kernel void attn_decode_split<2>(
     device const ushort*, device const ushort*, device const ushort*, device const ushort*, device const ushort*,
     device const ushort*, device const ushort*, device float*, constant AttnDecParams&, uint2, uint, uint, uint);
@@ -201,10 +205,10 @@ kernel void attn_decode_combine(device const float* part [[buffer(0)]], device c
                                 uint2 tg [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]]) {
   uint t = tg.x, h = tg.y;
   uint G = p.H / p.KVH, kvh = h / G, rr = t * G + h % G;
-  float sv = bf2f(sink[t * p.H + h]);
+  float sv = p.use_sink ? bf2f(sink[t * p.H + h]) : -INFINITY;
   float M = sv;
   for (uint s = 0; s < p.nsplit; s++) M = max(M, part[(size_t(kvh * p.nsplit + s) * AD_MAXR + rr) * 132]);
-  float L = exp(sv - M), O = 0;
+  float L = p.use_sink ? exp(sv - M) : 0.0f, O = 0;
   for (uint s = 0; s < p.nsplit; s++) {
     device const float* src = part + (size_t(kvh * p.nsplit + s) * AD_MAXR + rr) * 132;
     if (src[0] == -INFINITY) continue;

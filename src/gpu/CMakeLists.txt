@@ -20,7 +20,7 @@ add_custom_command(
   COMMENT "Embedding Metal kernels")
 
 file(GLOB INK_GPU_OPS CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/ops*.mm)
-add_library(inkgpu STATIC context.mm metal_backend.mm ${INK_GPU_OPS} ${INK_EMBED_CPP})
+add_library(inkgpu STATIC context.mm metal_backend.mm dspark.mm ${INK_GPU_OPS} ${INK_EMBED_CPP})
 target_include_directories(inkgpu PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/..)
 target_compile_options(inkgpu PRIVATE $<$<COMPILE_LANGUAGE:OBJCXX>:-fobjc-arc>)
 target_link_libraries(inkgpu PUBLIC "-framework Metal" "-framework Foundation")
