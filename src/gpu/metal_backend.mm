@@ -119,6 +119,9 @@ struct AgParams {  // kernels/attn_gemm.metal
 struct AttnDecParams {
   uint32_t T, H, KVH, cap, len, ring, window, rel_extent, split_keys, nsplit, causal, first, use_sink, use_gate;
 };
+struct MrAttnParams {  // kernels/multirow.metal (D)
+  uint32_t T, H, KVH, cap, len, ring, window, rel_extent, split_keys, nsplit, causal, first, use_sink, use_gate, prow;
+};
 struct RouterParams {
   uint32_t T, D, E, topk, dt_x;
   float scale;
@@ -752,6 +755,39 @@ class MetalBackend final : public Backend {
       g_.dispatch({T, H, 1}, {128, 1, 1});
       return;
     }
+    if (T <= 16 && H == 3 * KVH && mr_attn_ && !getenv("INK_ATTN_SLOW")) {
+      // D: 5..16 rows (verify). Same splits and per-row arithmetic as the T <= 4 path above (rows == decode), K/V
+      // staged once per split for all rows (kernels/multirow.metal).
+      uint32_t len = uint32_t(a.kv.len), window = uint32_t(a.window);
+      uint32_t first = (window && len + 1 > window) ? len + 1 - window : 0;
+      uint32_t split_keys = window ? split_local_ : split_keys_;
+      uint32_t nsplit = cdiv(len + T, split_keys) - first / split_keys;
+      uint32_t nfg = cdiv(3 * T, 8);
+      MrAttnParams p{T, H, KVH, uint32_t(a.kv.cap), len, a.kv.ring ? 1u : 0u, window, uint32_t(a.rel_proj.dim(1)),
+                     split_keys, nsplit, 1u, first, 1u, gate ? 1u : 0u, 3 * T};
+      Tensor part = scratch("mr-attn-part", DType::F32, {KVH * nsplit * p.prow, 132});
+      std::string nm = "mr_attn_split_g" + std::to_string(nfg);
+      if (const char* ab = getenv("INK_MR_ABL")) nm = std::string("mr_attn_split_g6_abl") + ab;  // bench only
+      pipe(nm);
+      bind(0, a.q);
+      bind(1, a.k_new);
+      bind(2, a.v_new);
+      bind(3, a.r);
+      bind(4, a.rel_proj);
+      bind(5, a.kv.k.valid() ? a.kv.k : a.k_new);
+      bind(6, a.kv.v.valid() ? a.kv.v : a.v_new);
+      bind(7, part);
+      g_.set_value(8, p);
+      g_.dispatch({KVH, nsplit, 1}, {64 * nfg, 1, 1});
+      pipe("mr_attn_combine");
+      bind(0, part);
+      bind(1, a.sink);
+      bind(2, out);
+      g_.set_value(3, p);
+      bind(4, gate ? *gate : out);
+      g_.dispatch({T, H, 1}, {128, 1, 1});
+      return;
+    }
     AttnParams p{T, H, KVH, uint32_t(a.kv.cap), uint32_t(a.kv.len), a.kv.ring ? 1u : 0u, uint32_t(a.window),
                  uint32_t(a.rel_proj.dim(1)), gate ? 1u : 0u};
     if (H == 3 * KVH && T >= ag_min_t_ && !getenv("INK_ATTN_SLOW")) {
@@ -1181,6 +1217,7 @@ class MetalBackend final : public Backend {
   bool skinny_ = false;
   uint32_t split_keys_ = 512;
   uint32_t split_local_ = 64;
+  bool mr_attn_ = !(getenv("INK_MR_ATTN") && getenv("INK_MR_ATTN")[0] == '0');  // D: 5..16-row attention
   bool ag_stats_ = getenv("INK_AG_STATS") != nullptr;
   // Chain kernels (A), opt-in with INK_CHAIN=1: measured SLOWER than the separate ops (decode 28.6 vs 36.9 tok/s;
   // chain_front 198 us, chain_mid 117 us per call). One threadgroup of 1024 threads has the throughput of one
