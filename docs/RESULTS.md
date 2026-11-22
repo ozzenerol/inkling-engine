@@ -15,6 +15,14 @@ runs). MLX = measured 2026-11-21 (17:43 and 19:10), rows marked \* from BRIEF.md
 Not measured: MLX on the copy scenario (its server answered 503 while still loading; the bench now waits), MLX in
 a growing session.
 
+**Later the same day (batches 16-19, main 95b40cf), not yet in the tables below** (they are batch 13 until the
+next full batch): the weights stay wired while the server idles (a short turn after a pause: 77-85 ms to read 10
+tokens, was 380-540 ms), the draft length follows the drafter's confidence, the output head of a multi-row
+verify takes 3.9 ms instead of 14.1 (8 rows), the drafter's token step 2.3 ms instead of 5.5 (7 tokens).
+All four keep the tokens. Batch 19, inkling-8bit: target table gen 44.8 / 44.9 / 38.4 / 34.4 / 29.9 tok/s and
+read 809 / 808 / 671 / 510 / 384; agent read session 71.8 s (83.1), median gen 63.7 tok/s (52.8); copy session
+38.5 s (45.2). MLX on the copy scenario, measured in batch 16: 128.1 s, sum of TTFT 55.9 s, gen 48.6 tok/s.
+
 Batch 9 (2026-11-21, before the three defaults) for comparison, 8-bit target table: gen 39.9 / 38.1 / 30.3 / 27.2 /
 22.0 tok/s and read 729 / 794 / 658 / 503 / 381 tok/s at 1.2k / 9.6k / 39.3k / 78.6k / 127.3k.
 
