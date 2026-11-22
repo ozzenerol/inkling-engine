@@ -964,3 +964,26 @@ whole block after a round that kept everything, else for kept + 2 (min 3): each 
 One run each, tokens identical to the old policy everywhere: p2 38.7 -> 43.0 tok/s, p0 58.9 -> 63.3, p12 42.6 ->
 45.5; agent bench read session (same 3639 tokens) 50.7 -> 55.0 tok/s, total 84.7 -> 79.1 s.
 nib e2e is not a controlled speed test: the clock in its first message changes the text (506-707 tokens).
+
+## Batch 17 (main f16ebc6, 09:35-09:55, one run): confidence gate
+
+Gates pass (spec identity with the gate on, rollback 0). In the batch, 8-bit, block 8, 300 tokens, gate off -> on,
+tokens identical: p2 53.0 -> 55.7 tok/s, p0 59.1 -> 65.2, p12 45.0 -> 48.7, edit 138.9 -> 138.5 (lookup rounds).
+Depth bench gen 43.2 / 42.6 / 37.4 / 33.3 / 30.2 (batch 16: 43.8 / 41.3 / 37.7 / 32.7 / 28.6), read unchanged.
+Agent read session 77.1 s (83.1), median gen 56.8 tok/s (53.2); copy 44.3 s. qh e2e PASS 31 s, nib e2e PASS 13 s.
+
+## The output head in a verify (b/work, batch 18)
+
+INK_PROFILE with 8-row verifies (INK_SPEC_FIXED, block 8, 8-bit): mr_matvec_q8_f32_f32_t8_r2_s2, the logits of
+8 rows, took 14.1 ms a call, of a ~70 ms verify (one row: 1.24 ms). Cause: the multi-row q8 kernel reads the T
+input rows from device memory again in every simdgroup (R = 2 rows of W each); with N = vocabulary that is 7 GB
+of input reads for 0.49 GB of weights. R = 4: 5.65 ms, R = 8: 6.5. The 4-row kernel (matvec_q8_*_t4) does 4 rows
+in 1.94 ms, so the head (N >= 65536) now always takes the passes-of-4 path: 8 rows 3.9 ms, 5 rows 3.2 ms.
+A row's sum is the same on every path: tokens identical. (INK_MR_Q8_RH=2|4|8 = the multi-row kernel, to measure.)
+The dense layers stay on R = 2 (42.7 us against 71.9 at R = 4); the lossless build's bf16 head was never slow
+(8 rows 2.64 ms). One run, old -> new: p2 53.8 -> 55.3 tok/s, p0 65.1 -> 68.1, p12 47.6 -> 48.9, agent read
+session 55.3 -> 57.2 tok/s over the same 3639 tokens.
+What a verify row costs after this (8 rows, per verify): MoE 25 ms (gate/up 370 us, down 194 us per visit),
+dense q8 12.4 ms (35 us a call against 15.5 for one row: 1.0e12 fma/s, the scalar rate of this GPU; only
+simdgroup matrices go faster and they round differently), head 3.9, attention ~5.
+Rollback after a rejected draft is 192 small copies (48 visits x 4 conv states): about 0.4 ms, left alone.
