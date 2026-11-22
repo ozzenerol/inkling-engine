@@ -77,6 +77,9 @@ MV_INST(f32, float, bf16, bf16_out, 4, 4, 2)
 MV_INST(bf16, bf16_in, bf16, bf16_out, 8, 4, 2)
 MV_INST(bf16, bf16_in, f32, float, 1, 1, 4)
 MV_INST(bf16, bf16_in, f32, float, 4, 1, 4)
+// controllers (N = 64, K = 2D): one row per simdgroup; a lane's chain of fma and the simd_sum are those of r4
+MV_INST(bf16, bf16_in, bf16, bf16_out, 1, 1, 4)
+MV_INST(bf16, bf16_in, bf16, bf16_out, 4, 1, 4)
 
 // Several matrices on one input in one dispatch (decode/verify, T <= 4): up to 8 (W_i [N_i, K], y_i [T, N_i]).
 // Threadgroup g covers rows [g*8, g*8+8) of the concatenated row space; same per-row math as matvec_bf16.

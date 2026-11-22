@@ -172,6 +172,7 @@ class MetalBackend final : public Backend {
  public:
   MetalBackend() : g_(Context::get()) {
     profile_ = getenv("INK_PROFILE") != nullptr;
+    ctrl_multi_ = getenv("INK_CTRL_MULTI") != nullptr;
     g_.keep_warm();  // INK_WARM_SECS=0 disables
     gpu_time_ = getenv("INK_GPU_TIME") != nullptr;
     if (const char* sk = getenv("INK_SKIP")) skip_ = std::string(",") + sk + ",";
@@ -706,7 +707,22 @@ class MetalBackend final : public Backend {
     bind(6, pair);
     g_.set_value(7, p);
     g_.dispatch({T, 3, 1}, {256, 1, 1});
-    // h_i = bf16(pair_i @ down_i^T): one matvec_multi with per-matrix inputs (same per-row math as linear)
+    // h_i = bf16(pair_i @ down_i^T). T <= 4: three one-row-per-simdgroup matvecs, independent of each other (the
+    // GPU overlaps them). matvec_multi took 46.7 us here against 12.4 for one r4 matvec of the same K: its loops
+    // over T and its matrix select are not unrolled. Same per-row arithmetic. INK_CTRL_MULTI=1: the old dispatch.
+    if (T <= 4 && (2 * D) % 8 == 0 && !ctrl_multi_) {
+      for (uint32_t i = 0; i < 3; i++) {
+        MatvecShape shp{R, 2 * D, T, 2 * D, R};
+        pipe(T == 1 ? "matvec_bf16_bf16_bf16_t1_r1_s4" : "matvec_bf16_bf16_bf16_t4_r1_s4");
+        bind(0, downs[i]);
+        g_.set_buffer(1, bufof(pair), pair.offset + size_t(i) * T * 2 * D * 2);
+        g_.set_buffer(2, bufof(h), h.offset + size_t(i) * T * R * 2);
+        g_.set_value(3, shp);
+        g_.dispatch({cdiv(R, 4), 1, 1}, {128, 1, 1});
+      }
+      ctrl_out3(xs, ms, forgets, gains, outs, h, p, D, T);
+      return;
+    }
     MatvecMultiParams mp{};
     mp.K = 2 * D;
     mp.count = 3;
@@ -731,6 +747,11 @@ class MetalBackend final : public Backend {
       g_.set_value(17, mp);
       g_.dispatch({cdiv(mp.row_start[3], 8), 1, 1}, {64, 1, 1});
     }
+    ctrl_out3(xs, ms, forgets, gains, outs, h, p, D, T);
+  }
+  template <typename P>
+  void ctrl_out3(const Tensor* xs, const Tensor* ms, const Tensor* forgets, const Tensor* gains, Tensor* outs,
+                 const Tensor& h, const P& p, uint32_t D, uint32_t T) {
     pipe("ctrl_out3");
     for (int i = 0; i < 3; i++) {
       bind(i, xs[i]);
@@ -778,7 +799,17 @@ class MetalBackend final : public Backend {
     bind(2, pair);
     g_.set_value(3, p);
     g_.dispatch({T, 1, 1}, {256, 1, 1});
-    linear(pair, down, h);
+    if (T <= 4 && (2 * D) % 8 == 0 && !ctrl_multi_) {  // as in controller_multi: one row per simdgroup
+      MatvecShape ms{R, 2 * D, T, 2 * D, R};
+      pipe(T == 1 ? "matvec_bf16_bf16_bf16_t1_r1_s4" : "matvec_bf16_bf16_bf16_t4_r1_s4");
+      bind(0, down);
+      bind(1, pair);
+      bind(2, h);
+      g_.set_value(3, ms);
+      g_.dispatch({cdiv(R, 4), 1, 1}, {128, 1, 1});
+    } else {
+      linear(pair, down, h);
+    }
     if (T > kMR && !getenv("INK_CTRL_SCALAR")) {  // batch 3: p3 prefill 3.96 -> 3.72 s (one run)
       // prefill: forget/gain projections as GEMMs (K = 64), then an elementwise combine
       Tensor F = scratch("ctrl-F", DType::F32, {T, D}), G = scratch("ctrl-G", DType::F32, {T, D});
@@ -1560,6 +1591,7 @@ class MetalBackend final : public Backend {
   Context& g_;
   bool pending_ = false;
   bool profile_ = false;
+  bool ctrl_multi_ = false;  // INK_CTRL_MULTI=1: controllers through matvec_multi / the r4 matvec (before batch 21)
   bool gpu_time_ = false;
   // rows of one expert per MoE prefill tile (bit-identical for any choice)
   uint32_t moe_cur_m_ = 64;

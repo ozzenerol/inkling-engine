@@ -86,6 +86,8 @@ struct Context::Impl {
   bool rw = false;
   std::unordered_map<void*, uint32_t> wmask;  // pipeline -> writable buffer indices
   uint32_t cur_wmask = 0xffffffffu;
+  bool trace = false;  // INK_TRACE_DISP=1: one line per dispatch (pipeline, barrier + the buffer that forced it)
+  void* cur_pipe = nullptr;
   std::vector<std::pair<uint32_t, void*>> cur_ix;  // (index, buffer) bound for the next dispatch
   std::unordered_set<void*> touched_w;
   std::vector<void*> cur;                  // buffers bound for the next dispatch
@@ -128,6 +130,7 @@ Context::Context() : impl_(new Impl) {
     impl_->null_mode = getenv("INK_NULL") != nullptr;
     impl_->rw = !(getenv("INK_RW") && getenv("INK_RW")[0] == '0');  // default on since batch 10 (INK_RW=0 off)
     impl_->smart = getenv("INK_SERIAL") == nullptr && !impl_->concurrent;
+    impl_->trace = getenv("INK_TRACE_DISP") != nullptr;
     g_barrier_report.b = &impl_->barriers;
     g_barrier_report.d = &impl_->dispatches;
     impl_->untracked = getenv("INK_UNTRACKED") != nullptr;
@@ -354,6 +357,7 @@ void Context::set_pipeline(Pipeline p) {
   [impl_->enc setComputePipelineState:(__bridge id<MTLComputePipelineState>)p];
   auto wm = impl_->wmask.find(p);
   impl_->cur_wmask = wm == impl_->wmask.end() ? 0xffffffffu : wm->second;
+  impl_->cur_pipe = p;
 }
 
 void Context::set_buffer(uint32_t index, Buf b, size_t offset) {
@@ -389,6 +393,9 @@ void Context::dispatch(Dim3 g, Dim3 t) {
       for (auto& u : use)
         if (impl_->touched_w.count(u.first) || (u.second && impl_->touched.count(u.first))) {
           hazard = true;
+          if (impl_->trace)
+            fprintf(stderr, "  -- barrier: %s (%s)\n", [[(__bridge id<MTLBuffer>)u.first label] UTF8String],
+                    u.second ? "written here" : "read here, written before");
           break;
         }
       if (hazard) {
@@ -413,6 +420,12 @@ void Context::dispatch(Dim3 g, Dim3 t) {
         impl_->barriers++;
       }
       for (void* b : impl_->cur) impl_->touched.insert(b);
+    }
+    if (impl_->trace) {
+      const char* nm = "?";
+      for (auto& kv : impl_->pipelines)
+        if ((__bridge void*)kv.second == impl_->cur_pipe) nm = kv.first.c_str();
+      fprintf(stderr, "  %s [%u %u %u]\n", nm, g.x, g.y, g.z);
     }
     impl_->cur.clear();
     impl_->cur_ix.clear();
