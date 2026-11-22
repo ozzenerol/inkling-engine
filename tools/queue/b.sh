@@ -55,3 +55,9 @@ for f in p2 p0 p12 edit; do
     echo -n "[gate $f $v] "; env $v INK_MODEL=$M8 INK_SPEC_STATS=1 $(bin spec_check) dspark ref_data/$f.ids 300 8 "$BS/gate_$v.i32" 2>&1 | grep -E "tok/s \(block|^gate" | cut -c1-150 | tr '\n' ' '; echo
   done; cmp "$BS/gate_X=1.i32" "$BS/gate_INK_SPEC_GATE=0.i32" && echo "gate $f tokens IDENTICAL"
 done
+echo "== B output head of 5..16 rows as passes of the 4-row q8 kernel (default; INK_MR_Q8_RH=2 = one multi-row pass): 8-bit, block 8"
+for f in p0 p12; do
+  for v in "INK_MR_Q8_RH=2" "X=1"; do
+    echo -n "[head $f $v] "; env $v INK_MODEL=$M8 $(bin spec_check) dspark ref_data/$f.ids 300 8 "$BS/head_$v.i32" 2>&1 | grep -o "decode.*tok/s"
+  done; cmp "$BS/head_X=1.i32" "$BS/head_INK_MR_Q8_RH=2.i32" && echo "head $f tokens IDENTICAL"
+done
