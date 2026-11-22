@@ -921,3 +921,46 @@ session reads 80 new tokens (the 1121-token prefix comes from the pinned checkpo
 nib later on 2026-11-22: web_search (SearXNG at 192.168.1.142:8080) and web_fetch tools, on by default (the
 prefix is now about 1300 tokens, prompt version 3); live input line with a message queue, kept history and
 command suggestions. Real model: "latest stable Go release?" answered in 3 steps, 18.7 s, with the source.
+
+## Batch 16 (main 0c1e41e, 2026-11-22 08:15-08:45, `MLX=1 tools/batch.sh gates queues`, one run)
+
+Gates pass. Depth bench 8-bit: gen 43.8 / 41.3 / 37.7 / 32.7 / 28.6 tok/s, read 794 / 807 / 671 / 510 / 385 at
+1.2k / 9.6k / 39k / 79k / 127k (the game of batch 15 was idle: same as batch 13 within noise). Agent read 83.1 s,
+median TTFT 1.19 s; copy 45.0 s, 92.0 tok/s. qh e2e PASS 26 s, nib e2e PASS 12 s.
+**MLX copy baseline, measured at last**: 128.1 s, sum TTFT 55.9 s, gen 48.6 tok/s (ours 45.0 s, 5.6 s, 92.0).
+
+**The pause penalty (found in the user's nib server log).** After ~2 s without a GPU submit macOS unwires the
+resident buffers; the next submit then sits 380-440 ms in the driver (kernelStartTime..kernelEndTime of the first
+command buffer, 0.5 ms of GPU work) while 18 GB are wired again. Every message a person types paid it: a 7-token
+read took 0.40-0.65 s in the log, 0.07-0.11 s when the GPU had just worked. Not the GPU clock: a tick on a queue
+without the residency set changes nothing, `requestResidency` changes nothing. What works: the keep-warm tick's
+queue carries the residency set (`[warm_queue addResidencySet:]`). Default on for 600 s after the last work
+(`INK_WARM_SECS`, 0 off), one 1-thread dispatch per 0.5 s of idle time, none while the engine works.
+tools/idle_bench.py (in C's queue), 10-token read: hot 68-70 ms; after 2 / 5 / 20 / 60 s pauses 77-85 ms
+(before: 380-540 ms). `INK_CBTIME=1` prints scheduling and GPU time of every forward over 50 ms.
+
+**A late effort line does shorten thinking** (the open question of nib's think-cut; 3 prompts, temp 0, one run):
+reasoning characters at effort 0.7 / 0.7 with `Thinking effort level: 0.1` appended as a system message after
+the user turn / effort 0.1 from the start: 1068 / 600 / 716, 4507 / 1802 / 1018, 2846 / 1107 / 749.
+
+nib: a turn cut at max_tokens inside a tool call is not run; the model is told to write in smaller parts
+(the user's 22.5k-character document took 8168 of 8192 tokens); max_tokens 16384.
+
+## Confidence gate on the draft length (b/work f16ebc6)
+
+Where generation time goes in an agent task (nib e2e, INK_SPEC_STATS): per round 9.2 ms draft + 58 ms verify for
+3.7 accepted + 1 tokens; 25% of the drafted tokens are rejected and each row of a verify costs 5-9 ms.
+The drafter's own confidence predicts acceptance: dspark_argmax_final now also writes the margin (top softcapped
+logit minus the best other PARTIAL maximum, a partial being 32 vocabulary rows: an upper bound). 22k drafts
+(nib task + 3 free-text prompts, temp 0, INK_SPEC_FIXED, INK_SPEC_DUMP): P(accept) by margin
+<0.25 0.24, <0.5 0.24, <1 0.30, <1.5 0.33, <2 0.47, <3 0.52, <4 0.66, <6 0.78, <8 0.90, <12 0.96, above 0.99,
+and the same at draft positions 0, 1, 2, 4, 6.
+Policy (default; `INK_SPEC_GATE=0` = the old one, count follows past acceptance): draft, then keep the prefix k
+that maximizes (1 + sum of products of P) / (t_draft + verify(k + 1)), verify(T) = c0 + c1 (T - 1) fitted online
+(about 22 + 8.5 ms at 3k context); P per margin bucket is learnt online from the start values above (it differs
+by text: 0.39-0.52 in the low buckets on the agent bench). k = 0 is a plain step. The drafter is asked for the
+whole block after a round that kept everything, else for kept + 2 (min 3): each drafted token costs ~0.45 ms
+(asking for 7 always cost 3 ms a round and ate the gain on free text).
+One run each, tokens identical to the old policy everywhere: p2 38.7 -> 43.0 tok/s, p0 58.9 -> 63.3, p12 42.6 ->
+45.5; agent bench read session (same 3639 tokens) 50.7 -> 55.0 tok/s, total 84.7 -> 79.1 s.
+nib e2e is not a controlled speed test: the clock in its first message changes the text (506-707 tokens).
