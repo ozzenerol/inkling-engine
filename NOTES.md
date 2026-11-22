@@ -918,3 +918,6 @@ MLX copy baseline: still not measured. This time bench_c.sh's warm-up loop waite
 model field in the request) until killed; the loop now waits only on 503 / no answer. Run `MLX=1` on an idle GPU.
 nib on the real model after the prompt change: "hi" is answered in one step without tools (2.9 s); a second
 session reads 80 new tokens (the 1121-token prefix comes from the pinned checkpoint).
+nib later on 2026-11-22: web_search (SearXNG at 192.168.1.142:8080) and web_fetch tools, on by default (the
+prefix is now about 1300 tokens, prompt version 3); live input line with a message queue, kept history and
+command suggestions. Real model: "latest stable Go release?" answered in 3 steps, 18.7 s, with the source.
