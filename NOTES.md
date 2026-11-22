@@ -1045,3 +1045,8 @@ Gates pass (acc lines as batch 19). docs/RESULTS.md is rewritten from this batch
 28.8, lossless 38.5 ... 26.2; cold 127.5k read 495 / 498 tok/s. Agent read: 8-bit 72.7 s (median gen 63.6),
 lossless 64.6 s (75.5); from 30k: 107.4 / 108.3 s (118.5 / 114.6); copy 38.5 / 39.2 s at 109 tok/s.
 qh e2e PASS 15 s twice; nib e2e PASS 14 s and 11 s. Pause test as before (77-84 ms after 2-20 s).
+
+After batch 20, measured and left off: `INK_DSPARK_ROWS=1` (the drafter runs only anchor + asked rows instead of
+the block of 8): draft time unchanged (6.5 vs 6.4 ms), p2 56.7 -> 58.2 tok/s, p0 71.1 -> 71.4, p12 51.1 -> 49.8,
+agent read session 60.1 tok/s (60.3 without). Neutral; the drafter's layers are not bound by its row count.
+A real nib run on the final build (web search task): 4 steps, 18.2 s, wrote at 71 tok/s, read 7.3k at 737 tok/s.
