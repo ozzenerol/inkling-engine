@@ -61,12 +61,15 @@ struct Context::Impl {
   id<MTLCommandBuffer> last = nil;
   std::map<std::string, size_t> by_tag;
   std::vector<id<MTLCommandBuffer>> pending;  // committed early, not yet waited
-  // keep-warm: a one-thread kernel on its own queue every 0.5 s for warm_secs after the last wait()
+  // keep-warm: a one-thread kernel on its own queue (with the residency set) every 0.5 s of idle time
   id<MTLCommandQueue> warm_queue = nil;
   id<MTLComputePipelineState> warm_pipe = nil;
   id<MTLBuffer> warm_buf = nil;
   std::atomic<double> last_activity{0};
-  double warm_secs = 0;  // INK_WARM_SECS=300 to enable (off until tested on the GPU)
+  // After ~2 s without a submit macOS unwires the resident buffers, and the next submit waits 380-440 ms in the
+  // driver while 18 GB are wired again (measured: 10-token read 70 ms hot, 460-540 ms after a 3-60 s pause; with
+  // the tick 77-85 ms). INK_WARM_SECS sets how long after the last work the tick goes on; 0 turns it off.
+  double warm_secs = 600;
   std::thread warm_thread;
   int since_commit = 0;
   int commit_every = 128;
@@ -325,7 +328,9 @@ void Context::ensure_encoder() {
   if (impl_->enc) return;
   if (!impl_->cmd) {
     if (impl_->residency_dirty && impl_->residency) {
-      if (@available(macOS 15.0, *)) [(id<MTLResidencySet>)impl_->residency commit];
+      if (@available(macOS 15.0, *)) {
+        [(id<MTLResidencySet>)impl_->residency commit];
+      }
       impl_->residency_dirty = false;
     }
     impl_->cmd = [impl_->queue commandBufferWithUnretainedReferences];
@@ -472,6 +477,20 @@ void Context::wait() {
   }
   [impl_->last waitUntilCompleted];
   double first = impl_->last.GPUStartTime;
+  if (getenv("INK_CBTIME")) {
+    std::vector<id<MTLCommandBuffer>> all(impl_->pending.begin(), impl_->pending.end());
+    all.push_back(impl_->last);
+    double g = 0, k = 0, lo = 1e30, hi = 0;
+    for (auto& b : all) {
+      [b waitUntilCompleted];
+      g += b.GPUEndTime - b.GPUStartTime, k += b.kernelEndTime - b.kernelStartTime;
+      lo = std::min(lo, b.kernelStartTime), hi = std::max(hi, b.GPUEndTime);
+    }
+    if (hi - lo > 0.05)
+      fprintf(stderr, "[cb] %zu buffers: span %.1f ms, gpu %.1f ms, kernel(sched) %.1f ms, first: sched %.1f gpu %.1f\n",
+              all.size(), (hi - lo) * 1e3, g * 1e3, k * 1e3, (all[0].kernelEndTime - all[0].kernelStartTime) * 1e3,
+              (all[0].GPUEndTime - all[0].GPUStartTime) * 1e3);
+  }
   for (auto& b : impl_->pending) {
     [b waitUntilCompleted];
     if (b.status == MTLCommandBufferStatusError)
@@ -495,13 +514,20 @@ void Context::keep_warm() {
   impl_->last_activity = now_s();
   if (impl_->warm_secs <= 0 || impl_->warm_queue) return;
   impl_->warm_queue = [impl_->device newCommandQueue];
+  // The tick's queue carries the residency set: what it keeps awake is the wiring of the weights, not the clock.
+  if (impl_->residency && !getenv("INK_WARM_NOSET")) {
+    if (@available(macOS 15.0, *)) [impl_->warm_queue addResidencySet:(id<MTLResidencySet>)impl_->residency];
+  }
   impl_->warm_pipe = (__bridge id<MTLComputePipelineState>)pipeline("warm_tick");
   impl_->warm_buf = [impl_->device newBufferWithLength:16 options:MTLResourceStorageModeShared];
   Impl* im = impl_;
   im->warm_thread = std::thread([im] {
+    double last_tick = 0;
     while (true) {
-      std::this_thread::sleep_for(std::chrono::milliseconds(500));
-      if (now_s() - im->last_activity.load() > im->warm_secs) continue;
+      std::this_thread::sleep_for(std::chrono::milliseconds(250));
+      const double now = now_s(), idle = now - im->last_activity.load();
+      if (idle < 0.5 || idle > im->warm_secs || now - last_tick < 0.5) continue;  // not while the engine works
+      last_tick = now;
       @autoreleasepool {
         id<MTLCommandBuffer> cb = [im->warm_queue commandBuffer];
         id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];

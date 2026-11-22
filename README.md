@@ -75,4 +75,6 @@ build/inktest --backend cpu --ids ref_data/p2.ids --rollback-test --out /tmp   #
 | `INK_Q8=0` | 8-bit build: convert dense weights to bf16 at load instead of reading the codes in place |
 | `INK_AG_MIN_T=n` | use the matrix-product prefill attention from n tokens per chunk (default 64) |
 | `INK_PROFILE=1` | GPU time per kernel (each dispatch waited separately) |
+| `INK_WARM_SECS=N` | keep the weights wired for N seconds after the last work (default 600; 0 off). Without it the first submit after a 2 s pause waits about 0.4 s in the driver |
+| `INK_CBTIME=1` | print scheduling and GPU time of every forward that takes over 50 ms |
 | `INK_SPEC_STATS=1` | drafts accepted per round, draft and verify time |
