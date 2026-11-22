@@ -1,5 +1,10 @@
 # inkling-engine
 
+> **Work in progress, a test.** This whole engine was vibecoded with Claude Fable 5.2: an AI model wrote the
+> code, the kernels, the benchmarks and these notes, steered by short messages. Nobody has reviewed it line by
+> line. It runs on one machine (an M3 Max with 48 GB) and has been measured only there, mostly one run per number.
+> Expect bugs and rough edges, and do not rely on it for anything that matters.
+
 An inference engine for Inkling 2 Mini on Apple Silicon, written from scratch in C++ with Metal kernels. It serves
 an OpenAI-compatible API for agentic coding (qh) and is built to be faster than MLX-VLM with the same output.
 
