@@ -922,7 +922,7 @@ nib later on 2026-11-22: web_search (SearXNG at 192.168.1.142:8080) and web_fetc
 prefix is now about 1300 tokens, prompt version 3); live input line with a message queue, kept history and
 command suggestions. Real model: "latest stable Go release?" answered in 3 steps, 18.7 s, with the source.
 
-## Batch 16 (main 0c1e41e, 2026-11-22 08:15-08:45, `MLX=1 tools/batch.sh gates queues`, one run)
+## Batch 16 (main 0c1e41e, 2026-11-22, started 08:06, `MLX=1 tools/batch.sh gates queues`, one run)
 
 Gates pass. Depth bench 8-bit: gen 43.8 / 41.3 / 37.7 / 32.7 / 28.6 tok/s, read 794 / 807 / 671 / 510 / 385 at
 1.2k / 9.6k / 39k / 79k / 127k (the game of batch 15 was idle: same as batch 13 within noise). Agent read 83.1 s,
@@ -965,7 +965,7 @@ One run each, tokens identical to the old policy everywhere: p2 38.7 -> 43.0 tok
 45.5; agent bench read session (same 3639 tokens) 50.7 -> 55.0 tok/s, total 84.7 -> 79.1 s.
 nib e2e is not a controlled speed test: the clock in its first message changes the text (506-707 tokens).
 
-## Batch 17 (main f16ebc6, 09:35-09:55, one run): confidence gate
+## Batch 17 (main f16ebc6, started 08:42, one run): confidence gate
 
 Gates pass (spec identity with the gate on, rollback 0). In the batch, 8-bit, block 8, 300 tokens, gate off -> on,
 tokens identical: p2 53.0 -> 55.7 tok/s, p0 59.1 -> 65.2, p12 45.0 -> 48.7, edit 138.9 -> 138.5 (lookup rounds).
@@ -987,3 +987,52 @@ What a verify row costs after this (8 rows, per verify): MoE 25 ms (gate/up 370 
 dense q8 12.4 ms (35 us a call against 15.5 for one row: 1.0e12 fma/s, the scalar rate of this GPU; only
 simdgroup matrices go faster and they round differently), head 3.9, attention ~5.
 Rollback after a rejected draft is 192 small copies (48 visits x 4 conv states): about 0.4 ms, left alone.
+
+## Batch 18 (main 0835906, started 09:12, one run): head as passes of the 4-row kernel
+
+Gates pass. In the batch, old (INK_MR_Q8_RH=2) -> new, tokens identical: p0 64.9 -> 67.6 tok/s, p12 47.5 -> 48.6.
+Depth gen 43.7 / 41.9 / 39.1 / 34.0 / 28.5. Agent read 76.7 s, median gen 58.1; copy 40.0 s (45.0 in batch 16:
+its 16-row lookup verifies had the slow head too). qh e2e PASS 21 s, nib e2e PASS 14 s (722 tokens at 76 tok/s).
+
+## The drafter's token step (b/work, batch 19)
+
+INK_DSPARK_TIME=1 (new: wall time of the parts of a draft, a sync after each). 7 tokens, 8-bit: layers 3.1 ms,
+head 3.0 (the target's q8 head for the 7 mask rows; 1.94 for <= 4), token steps 5.5 = 0.79 a token.
+Per dispatch (INK_DSPARK_TIME=2, each sync adds ~0.2 ms): markov 0.72, fold 0.51, argmax 0.22.
+dspark_markov_step was one threadgroup in which every simdgroup did 96 rows of 16 fma one after another: the
+small-kernel rule again (latency = serial loop length). Now dspark_markov_mv (96 threadgroups, one row per
+simdgroup, the same sums in the same order) + dspark_markov_gate (one group, elementwise): 7 tokens 5.5 -> 2.3 ms,
+a whole draft 12.5 -> 9.3 ms, drafts identical in all 110 rounds of p12 (INK_DSPARK_MARKOV1=1 = the old kernel).
+The greedy fold no longer applies the softcap to all 200k logits (monotonic: the argmax is the same; the margin
+caps winner and runner-up); that alone changed nothing measurable.
+One run, old -> new, tokens identical: p2 55.8 -> 58.7 tok/s, p0 67.3 -> 71.7, p12 48.5 -> 49.1, agent read
+session 56.7 -> 60.3 tok/s. The gate now asks for at least 4 drafts (3 / 4 / always 7: 60.3 / 60.3 / 58.6).
+
+## Batch 19 (main 95b40cf, started 09:44, one run): drafter step
+
+Gates pass (acc lines identical to batch 18). In the batch: markov old -> new p0 65.7 -> 69.5 tok/s (token steps
+4.13 -> 1.75 ms a draft), p12 48.5 -> 50.3; head old -> new p0 67.0 -> 71.4, p12 49.5 -> 50.8; all identical.
+Depth bench 8-bit: gen 44.8 / 44.9 / 38.4 / 34.4 / 29.9 tok/s, read 809 / 808 / 671 / 510 / 384.
+Agent read session 71.8 s, sum TTFT 13.2 s, median gen 63.7 tok/s (batch 16: 83.1 s, 53.2); copy 38.5 s (45.0).
+qh e2e PASS 20 s; nib e2e PASS 10 s (530 tokens at 82 tok/s).
+
+Tried after it, no gain, not merged: 6-row instances of the multi-row matvecs for verifies of 5 and 6 rows (the
+t8 kernels compute 8 rows whatever T is): p0 71.3 vs 71.6 tok/s, p12 50.3 vs 50.4.
+On b/work, not merged yet (stats only): `verify rows:` histogram in INK_SPEC_STATS. With the gate most verifies
+are short: p0 2:12 3:24 4:12 5:17 6:4 7:4 8:4, p12 2:41 3:29 4:15 5:7 6:5 7:1 8:2. So what is left per round is
+the fixed part: the 22 ms of a one-row forward and 6-7 ms of draft (layers 3.1, head 1.9, steps 1.3).
+At 32k a verify row adds 1.7 ms of attention (global 1.07, local 0.63) to MoE ~3 and dense ~1.1.
+
+## State and next steps (end of the morning of 2026-11-22, main 95b40cf + NOTES)
+
+Today on top of batch 13/15: keep-warm (0.45 s off every turn after a pause), confidence gate, verify head,
+drafter step. Agent bench read session 83.1 -> 71.8 s, generation there 50.7 -> ~62 tok/s; free text at short
+context 43-45 tok/s sampled (depth bench), 50-72 greedy with drafts.
+Open, in order of expected gain:
+1. Drafter fixed cost (6-7 ms of a ~40 ms round): its layers are 8 rows x 3 layers at the scalar fma rate; the
+   head read is 0.49 GB per pass. A vocabulary shortlist for the draft head would save ~2.5 ms but risks
+   acceptance and needs token statistics; not tried.
+2. Reading: unchanged today (compute bound; 179 ms + 1.055 ms/token per chunk; 384 tok/s at 127k).
+3. `tools/batch.sh queues full` on an idle machine to refresh docs/RESULTS.md's cold sweep and the lossless
+   tables with today's changes (the RESULTS agent tables below are from batch 19, the sweep from batch 13).
+4. Lossy 8-bit KV: still waits for the user's go-ahead.
