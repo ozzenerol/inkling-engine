@@ -1036,3 +1036,12 @@ Open, in order of expected gain:
 3. `tools/batch.sh queues full` on an idle machine to refresh docs/RESULTS.md's cold sweep and the lossless
    tables with today's changes (the RESULTS agent tables below are from batch 19, the sweep from batch 13).
 4. Lossy 8-bit KV: still waits for the user's go-ahead.
+
+## Batch 20 (main 68d0a8a, 10:08-10:56, `tools/batch.sh gates queues full`, one run): the new RESULTS.md
+
+Gates pass (acc lines as batch 19). docs/RESULTS.md is rewritten from this batch. Depth bench gen, 8-bit:
+45.8 / 44.7 / 38.9 / 33.5 / 29.9; lossless: 40.4 / 40.8 / 35.7 / 32.1 / 26.9 (batch 13: 35.2 / 36.0 / 32.5 / 28.7
+/ 25.5), so the lossless build meets the 40 tok/s start target for the first time. Cold sweep gen 8-bit 44.4 ...
+28.8, lossless 38.5 ... 26.2; cold 127.5k read 495 / 498 tok/s. Agent read: 8-bit 72.7 s (median gen 63.6),
+lossless 64.6 s (75.5); from 30k: 107.4 / 108.3 s (118.5 / 114.6); copy 38.5 / 39.2 s at 109 tok/s.
+qh e2e PASS 15 s twice; nib e2e PASS 14 s and 11 s. Pause test as before (77-84 ms after 2-20 s).
