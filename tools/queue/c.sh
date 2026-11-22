@@ -39,6 +39,7 @@ pid=$!
 for _ in $(seq 1 120); do curl -s -m 2 http://127.0.0.1:8091/v1/models >/dev/null && break; sleep 1; done
 "$here/tools/qh_e2e.sh" queue "${FULL:+2}"
 "$here/tools/nib_e2e.sh" queue "${FULL:+2}"
+python3 "$here/tools/idle_bench.py" http://127.0.0.1:8091 0 0 2 5 0 20  # short turns after a pause (keep-warm)
 kill $pid 2>/dev/null; wait $pid 2>/dev/null
 grep -E "diverged|no checkpoint|restore of|WARNING|rror" "$OUT"/inkling*serve*.log | cut -c1-160 | sed 's/^/cache: /'
 if [ -n "${MLX:-}" ]; then
