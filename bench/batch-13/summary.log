@@ -1,0 +1,10 @@
+batch 13 at 0fb5072 00:30
+== queue a
+   exit 0 (       0 lines in bench/batch-13/a.log)
+== queue b
+   exit 0 (     122 lines in bench/batch-13/b.log)
+== queue d
+   exit 0 (       0 lines in bench/batch-13/d.log)
+== queue c
+   exit 0 (     235 lines in bench/batch-13/c.log)
+batch 13 done 01:12

@@ -1,0 +1,47 @@
+batch 6 at 73d0183 20:44
+== gate kernel_check
+== gate op_diff
+ALL OK: 0 failing
+== gate op_diff_q8
+ALL OK: 0 failing
+== gate acc
+p0 [inktest] 63 decode steps 1.71 s (36.80 tok/s)
+p0 vs MLX-bf16: steps 64  greedy match 64/64  first mismatch -  KL mean 1.722e-03 max 3.258e-02  max|dlogit| 3.015
+p0 vs fp32:     steps 64  greedy match 64/64  first mismatch -  KL mean 1.669e-03 max 1.644e-02  max|dlogit| 3.718
+p1 [inktest] 63 decode steps 1.71 s (36.91 tok/s)
+p1 vs MLX-bf16: steps 64  greedy match 63/64  first mismatch 38  KL mean 7.357e-03 max 3.047e-01  max|dlogit| 5.753
+  mismatch step 38: ref 200001 (gap to 2nd 0.6044), ours 199999 (ours prefers by 1.5484), KL 3.05e-01
+p1 vs fp32:     steps 64  greedy match 63/64  first mismatch 38  KL mean 1.723e-03 max 4.085e-02  max|dlogit| 5.227
+p2 [inktest] 63 decode steps 1.67 s (37.83 tok/s)
+p2 vs MLX-bf16: steps 64  greedy match 63/64  first mismatch 6  KL mean 1.408e-03 max 1.769e-02  max|dlogit| 2.905
+  mismatch step 6: ref 149878 (gap to 2nd 0.0127), ours 161043 (ours prefers by 0.1010), KL 1.75e-03
+p2 vs fp32:     steps 64  greedy match 63/64  first mismatch 6  KL mean 8.349e-04 max 8.532e-03  max|dlogit| 2.693
+== gate acc8
+p0 [inktest] 63 decode steps 1.47 s (42.74 tok/s)
+p0 vs MLX-bf16: steps 64  greedy match 63/64  first mismatch 9  KL mean 2.472e-03 max 3.890e-02  max|dlogit| 5.441
+  mismatch step 9: ref 149890 (gap to 2nd 0.1146), ours 166543 (ours prefers by 0.0193), KL 2.29e-03
+p0 vs fp32:     steps 64  greedy match 63/64  first mismatch 9  KL mean 1.396e-03 max 8.770e-03  max|dlogit| 5.717
+p1 [inktest] 63 decode steps 1.47 s (42.85 tok/s)
+p1 vs MLX-bf16: steps 64  greedy match 63/64  first mismatch 38  KL mean 1.301e-02 max 3.559e-01  max|dlogit| 6.010
+  mismatch step 38: ref 200001 (gap to 2nd 0.6044), ours 199999 (ours prefers by 0.8988), KL 2.17e-01
+p1 vs fp32:     steps 64  greedy match 63/64  first mismatch 38  KL mean 5.950e-03 max 1.786e-01  max|dlogit| 6.693
+p2 [inktest] 63 decode steps 1.42 s (44.46 tok/s)
+p2 vs MLX-bf16: steps 64  greedy match 63/64  first mismatch 6  KL mean 2.355e-03 max 2.899e-02  max|dlogit| 5.280
+  mismatch step 6: ref 149878 (gap to 2nd 0.0127), ours 161043 (ours prefers by 0.0813), KL 1.36e-03
+p2 vs fp32:     steps 64  greedy match 63/64  first mismatch 6  KL mean 2.194e-03 max 2.294e-02  max|dlogit| 3.452
+== gate spec
+plain : prompt 32 tok, prefill 1.03 s (31 tok/s); 99 tokens, decode 2.68 s -> 36.6 tok/s (block 4)
+lookup: 0 rounds, accepted 0 of 0 drafts, 0.0 tok/s in lookup rounds
+dspark adaptive: 53 plain steps, plain 26.3 ms, draft 6.3 ms, verify T=2..5 32.7 36.8 41.9 0.0 ms, acceptance by position 0.51 0.61 0.72, tok/s by draft count 38.0 37.3 41.8 51.9 0.0 0.0 0.0 0.0, verify T=8 0.0 T=16 0.0 ms
+dspark: prompt 32 tok, prefill 0.42 s (77 tok/s); 99 tokens, decode 2.49 s -> 39.3 tok/s (block 4)
+token streams IDENTICAL
+== gate rollback
+rollback test (metal): max |dlogit| 0, identical 100.00%, argmax differences 0/3, len 17
+== queue a
+   exit 0 (     101 lines in bench/batch-6/a.log)
+== queue b
+   exit 0 (      44 lines in bench/batch-6/b.log)
+== queue d
+   exit 0 (     111 lines in bench/batch-6/d.log)
+== queue c
+batch 6 done (stopped by A during C's full sweep at the lossless 78k row; partial results kept)
