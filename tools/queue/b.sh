@@ -49,3 +49,9 @@ for v in "INK_MIX2=0" "X=1"; do
 done; cmp "$BS/mix_X=1.i32" "$BS/mix_INK_MIX2=0.i32" && echo "mix2 tokens IDENTICAL"
 echo -n "[mix2 dspark identity] "; tools/spec_check.sh ref_data/p2.ids 200 8 2>&1 | grep -E "IDENT|DIFF"
 INK_PROFILE=1 INK_NO_DSPARK=1 build/inktest --backend metal --model $M8 --ids ref_data/p2.ids --steps 64 --out $BS/pf 2>&1 | grep -E "mix|rms_norm_rows"
+echo "== B confidence gate on the draft length (default; INK_SPEC_GATE=0 = draft count follows acceptance): 8-bit, block 8, off vs on with token cmp"
+for f in p2 p0 p12 edit; do
+  for v in "INK_SPEC_GATE=0" "X=1"; do
+    echo -n "[gate $f $v] "; env $v INK_MODEL=$M8 INK_SPEC_STATS=1 $(bin spec_check) dspark ref_data/$f.ids 300 8 "$BS/gate_$v.i32" 2>&1 | grep -E "tok/s \(block|^gate" | cut -c1-150 | tr '\n' ' '; echo
+  done; cmp "$BS/gate_X=1.i32" "$BS/gate_INK_SPEC_GATE=0.i32" && echo "gate $f tokens IDENTICAL"
+done

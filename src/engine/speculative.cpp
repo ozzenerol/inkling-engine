@@ -44,6 +44,12 @@ struct Spec {
   double lk_rate = 0;       // tokens per ms delivered by lookup rounds (EMA)
   long lk_n = 0, lk_rounds = 0, lk_drafted = 0, lk_accepted = 0;
   int lk_skip = 0, lk_k = 7;
+  // Confidence gate: P(draft accepted | the drafter's margin bucket), learnt as the text goes (start values from
+  // 22k drafts of agent and free text at temperature 0), and a linear cost model of a verify of T rows.
+  double pm[11] = {0.24, 0.24, 0.30, 0.33, 0.47, 0.52, 0.66, 0.78, 0.90, 0.96, 0.99};
+  double vc0 = 0, vc1 = 0;  // ms: verify(T) = vc0 + vc1 * (T - 1); 0 = not measured yet
+  long gate_cut = 0, gate_zero = 0;
+  int gate_k = 7;  // drafts asked of the drafter next round (each costs ~0.45 ms whether kept or not)
   std::mt19937_64 rng{0x9E3779B97F4A7C15ull};  // speculative sampling uniforms
   uint64_t seeded = ~0ull;
   std::vector<float> pt;
@@ -123,6 +129,38 @@ bool speculative_generate(Engine& e, Model& m, const SamplingParams& p, int max_
     s.seeded = p.seed;
   }
   const bool adaptive = !getenv("INK_SPEC_FIXED");
+  // The drafter says how sure it is of each token (top logit minus runner-up) and that predicts acceptance well:
+  // 25% below a margin of 1, 50% at 2-3, 78% at 4-6, 96-99% above 8, at every draft position. So a round drafts
+  // the whole block and keeps the prefix with the best expected tokens per ms. The output does not depend on it.
+  const bool gate = adaptive && !(getenv("INK_SPEC_GATE") && getenv("INK_SPEC_GATE")[0] == '0');
+  auto bucket = [](float mg) {
+    static const float edges[10] = {0.25f, 0.5f, 1, 1.5f, 2, 3, 4, 6, 8, 12};
+    int i = 0;
+    while (i < 10 && mg >= edges[i]) i++;
+    return i;
+  };
+  auto verify_cost = [&](int T) {
+    const double c0 = s.vc0 > 0 ? s.vc0 : (s.t_plain > 0 ? s.t_plain : 24.0), c1 = s.vc1 > 0 ? s.vc1 : 7.0;
+    return c0 + c1 * (T - 1);
+  };
+  auto verify_seen = [&](int T, double ms) {  // normalized LMS step on (vc0, vc1)
+    if (s.vc0 <= 0) s.vc0 = s.t_plain > 0 ? s.t_plain : 24.0, s.vc1 = 7.0;
+    const double x = T - 1, err = ms - (s.vc0 + s.vc1 * x), mu = 0.3 / (1.0 + x * x);
+    s.vc0 = std::max(1.0, s.vc0 + mu * err);
+    s.vc1 = std::max(0.5, s.vc1 + mu * err * x);
+  };
+  auto gate_cut = [&](const std::vector<float>& mg, int k) {
+    const double td = s.t_draft > 0 ? s.t_draft : 9.0;
+    double reach = 1.0, tokens = 1.0, best = tokens / (td + verify_cost(1));
+    int cut = 0;
+    for (int j = 0; j < k; j++) {
+      reach *= s.pm[bucket(mg[size_t(j)])];
+      tokens += reach;
+      const double r = tokens / (td + verify_cost(j + 2));
+      if (r > best) best = r, cut = j + 1;
+    }
+    return cut;
+  };
   auto ema = [](double& v, double x, double alpha) { v = v == 0 ? x : v + alpha * (x - v); };
   auto ms_since = [](std::chrono::steady_clock::time_point t) {
     return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t).count();
@@ -148,7 +186,7 @@ bool speculative_generate(Engine& e, Model& m, const SamplingParams& p, int max_
       s.draft_n = 3;  // a few fresh rounds decide again after the rest
       return 0;
     }
-    return std::max(1, std::min(kmax, s.k_cur));
+    return gate ? std::min(kmax, s.gate_k) : std::max(1, std::min(kmax, s.k_cur));
   };
   auto arm_update = [&](int k, int tokens, double ms) {
     ema(s.arm_rate[k], tokens / ms, 0.15);
@@ -275,6 +313,36 @@ bool speculative_generate(Engine& e, Model& m, const SamplingParams& p, int max_
     } else {
       drafts = d.draft(b, k);
     }
+    std::vector<float> mg;  // margins of the drafts kept (gate statistics)
+    if (gate && !use_lookup && !sampled && d.margins().size() >= size_t(k)) {
+      mg = d.margins();
+      const int cut = gate_cut(mg, k);
+      if (cut < k) s.gate_cut++;
+      // Ask for the whole block again after a round that kept all it asked for, else for two more than were kept.
+      s.gate_k = cut == k ? 7 : std::max(3, cut + 2);
+      if (cut == 0) {
+        // Not even the first draft is worth a second row: a plain step, charged to the drafting mode.
+        s.gate_zero++;
+        ema(s.t_draft, ms_since(c0), 0.2);
+        s.draft_ms += ms_since(c0);
+        auto t0 = std::chrono::steady_clock::now();
+        m.forward(&b, 1, false);
+        int32_t t = sample_last();
+        verify_seen(1, ms_since(t0));
+        s.verify_ms += ms_since(t0);
+        s.rounds++;
+        ema(s.draft_rate, 1.0 / ms_since(c0), 0.15);
+        s.draft_n++;
+        ema(s.pm[bucket(mg[0])], t == drafts[0] ? 1.0 : 0.0, 0.03);
+        bool more = on_token(t);
+        emitted++;
+        if (is_stop(t) || !more || emitted >= max_tokens) break;
+        b = t;
+        continue;
+      }
+      k = cut;
+      drafts.resize(size_t(k));
+    }
     auto c1 = std::chrono::steady_clock::now();
     verify.assign(1, b);
     verify.insert(verify.end(), drafts.begin(), drafts.end());
@@ -287,6 +355,7 @@ bool speculative_generate(Engine& e, Model& m, const SamplingParams& p, int max_
     s.verify_ms += std::chrono::duration<double, std::milli>(c2 - c1).count();
     if (!use_lookup) ema(s.t_draft, std::chrono::duration<double, std::milli>(c1 - c0).count(), 0.2);
     ema(s.t_verify[k + 1], std::chrono::duration<double, std::milli>(c2 - c1).count(), 0.2);
+    verify_seen(k + 1, std::chrono::duration<double, std::milli>(c2 - c1).count());
     const auto& lg = m.logits();
     // Sample-and-compare (as mlx_vlm's DSpark walk): sample the target at each row in order; accept the draft
     // while it equals the sample. Every emitted token is an exact target sample (greedy: the argmax).
@@ -343,6 +412,14 @@ bool speculative_generate(Engine& e, Model& m, const SamplingParams& p, int max_
       for (int x : y) fprintf(stderr, " %d", x);
       fprintf(stderr, " | a=%d\n", a);
     }
+    if (!use_lookup && !sampled) {
+      static FILE* dump = getenv("INK_SPEC_DUMP") ? fopen(getenv("INK_SPEC_DUMP"), "a") : nullptr;
+      const auto& mg = d.margins();
+      if (dump && mg.size() >= size_t(k)) {
+        for (int j = 0; j < k; j++) fprintf(dump, "%d %d %.4f %d\n", k, j, mg[size_t(j)], j < a ? 1 : j == a ? 0 : -1);
+        fflush(dump);
+      }
+    }
     if (use_lookup) {
       s.lk_rounds++;
       s.lk_drafted += k;
@@ -355,6 +432,7 @@ bool speculative_generate(Engine& e, Model& m, const SamplingParams& p, int max_
       s.drafted += k;
       s.accepted += a;
       for (int j = 0; j < k && j <= a; j++) ema(s.acc[j], j < a ? 1.0 : 0.0, 0.08);  // positions reached this round
+      for (int j = 0; j < k && j <= a && size_t(j) < mg.size(); j++) ema(s.pm[bucket(mg[size_t(j)])], j < a ? 1.0 : 0.0, 0.03);
       arm_update(k, a + 1, std::chrono::duration<double, std::milli>(c2 - c0).count());
     }
     // emit d_0..d_{a-1}, then y_a; stop as soon as a stop token / limit / on_token=false shows up
@@ -383,6 +461,10 @@ bool speculative_generate(Engine& e, Model& m, const SamplingParams& p, int max_
     fprintf(stderr, "dspark: %ld rounds, accepted %ld of %ld drafts (%.2f per round), draft %.2f ms, verify %.2f ms per round\n",
             s.rounds, s.accepted, s.drafted, s.rounds ? double(s.accepted) / s.rounds : 0.0,
             s.rounds ? s.draft_ms / s.rounds : 0.0, s.rounds ? s.verify_ms / s.rounds : 0.0);
+  if (getenv("INK_SPEC_STATS"))
+    fprintf(stderr, "gate: %ld rounds cut, %ld to a plain step; verify(T) = %.1f + %.1f (T-1) ms; P(accept) by margin "
+                    "%.2f %.2f %.2f %.2f %.2f %.2f %.2f %.2f %.2f %.2f %.2f\n", s.gate_cut, s.gate_zero, s.vc0, s.vc1,
+            s.pm[0], s.pm[1], s.pm[2], s.pm[3], s.pm[4], s.pm[5], s.pm[6], s.pm[7], s.pm[8], s.pm[9], s.pm[10]);
   if (getenv("INK_SPEC_STATS"))
     fprintf(stderr, "lookup: %ld rounds, accepted %ld of %ld drafts, %.1f tok/s in lookup rounds\n", s.lk_rounds,
             s.lk_accepted, s.lk_drafted, 1e3 * s.lk_rate);

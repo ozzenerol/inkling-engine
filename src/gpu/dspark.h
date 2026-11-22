@@ -46,6 +46,9 @@ class DSpark {
                                     std::vector<float>* q_tok);
   // Full q_j row (vocab_unpadded floats) of the last draft_sample, computed on the host from the stored logits.
   const float* q_row(int j);
+  // After draft(): per drafted token, the drafter's top logit minus its runner-up (softcapped logits; an upper
+  // bound, see dspark_argmax_final). Large = the drafter is sure.
+  const std::vector<float>& margins() const { return margin_; }
   int64_t vocab() const;
   int max_count() const { return block_ - 1; }
 
@@ -55,6 +58,7 @@ class DSpark {
                            std::vector<float>* q_tok);
   std::unique_ptr<Impl> impl_;
   std::vector<float> qrow_;
+  std::vector<float> margin_;
   Tensor cap_;
   int64_t ctx_len_ = 0;
   int block_ = 8;

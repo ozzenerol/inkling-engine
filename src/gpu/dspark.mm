@@ -90,7 +90,7 @@ struct DSpark::Impl {
   float alpha[4][4];
   const Tensor &embed, &embed_norm, &head;
   // workspace
-  Tensor mixed, kx, vx, tokens, e0, e1, x, xin, q, kb, vb, at, o, summed, res, post, gt, ut, a, h, base, frnn, cat,
+  Tensor mixed, kx, vx, tokens, margins, e0, e1, x, xin, q, kb, vb, at, o, summed, res, post, gt, ut, a, h, base, frnn, cat,
       ctxm, state, zero_state, latent, part, last_feat, apart, zbuf, stats, qbuf, ga_s, ga_bmax, ga_m, ga_part;
   // D: direct global attention (multirow_ga.metal) for the drafter's global layer: on unless INK_GA=0 or
   // INK_GA_DRAFT=0
@@ -328,6 +328,7 @@ DSpark::DSpark(Backend& be, const std::string& dir, const Tensor& embed, const T
   m.kx = be.alloc(DType::BF16, {rows, m.KVH * m.HD}, "dspark.kx");
   m.vx = be.alloc(DType::BF16, {rows, m.KVH * m.HD}, "dspark.vx");
   m.tokens = be.alloc(DType::I32, {B}, "dspark.tokens");
+  m.margins = be.alloc(DType::F32, {B}, "dspark.margins");
   m.e0 = be.alloc(DType::BF16, {1, m.D}, "dspark.e0");
   m.e1 = be.alloc(DType::BF16, {1, m.D}, "dspark.e1");
   m.x = be.alloc(DType::BF16, {B, m.D}, "dspark.x");
@@ -583,6 +584,7 @@ std::vector<int32_t> DSpark::run(int32_t anchor, int count, float temperature, c
       m.bind(0, m.part);
       m.bind(1, m.tokens);
       m.g.set_value(2, ap);
+      m.bind(3, m.margins);
       m.g.dispatch({1, 1, 1}, {1024, 1, 1});
     }
   }
@@ -590,6 +592,10 @@ std::vector<int32_t> DSpark::run(int32_t anchor, int count, float temperature, c
   std::vector<int32_t> out(size_t(count + 1));
   memcpy(out.data(), m.tokens.data<int32_t>(), out.size() * 4);
   out.erase(out.begin());
+  if (!sampled) {
+    margin_.resize(size_t(count));
+    for (int i = 0; i < count; i++) margin_[size_t(i)] = m.margins.data<float>()[i + 1];
+  }
   if (sampled && q_tok) {
     q_tok->resize(size_t(count));
     for (int i = 0; i < count; i++) (*q_tok)[i] = m.stats.data<float>()[i * 4 + 2];

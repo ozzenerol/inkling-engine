@@ -150,39 +150,54 @@ kernel void dspark_fold_argmax(device const ushort* latent [[buffer(0)]], device
     part[tg] = float2(b, as_type<float>(idx));
   }
 }
-// Final argmax over the partials (one threadgroup of 1024); writes tokens[out_index].
+// Final argmax over the partials (one threadgroup of 1024); writes tokens[out_index] and
+// margin[out_index] = best - second best PARTIAL maximum (a partial is 32 vocabulary rows, so a runner-up in
+// the winner's own partial is not seen: the margin is an upper bound; it only steers the draft length).
 struct ArgmaxParams {
   uint n, out_index;
 };
 kernel void dspark_argmax_final(device const float2* part [[buffer(0)]], device int* tokens [[buffer(1)]],
-                                constant ArgmaxParams& p [[buffer(2)]], uint tid [[thread_position_in_threadgroup]]) {
+                                constant ArgmaxParams& p [[buffer(2)]], device float* margin [[buffer(3)]],
+                                uint tid [[thread_position_in_threadgroup]]) {
   threadgroup float bv[1024];
+  threadgroup float sv[1024];
   threadgroup uint bi[1024];
-  float b = -INFINITY;
+  float b = -INFINITY, b2 = -INFINITY;
   uint idx = 0xffffffffu;
   for (uint i = tid; i < p.n; i += 1024) {
     float v = part[i].x;
     uint j = as_type<uint>(part[i].y);
     if (v > b || (v == b && j < idx)) {
+      b2 = b;
       b = v;
       idx = j;
+    } else {
+      b2 = max(b2, v);
     }
   }
   bv[tid] = b;
+  sv[tid] = b2;
   bi[tid] = idx;
   threadgroup_barrier(mem_flags::mem_threadgroup);
   for (uint s = 512; s > 0; s >>= 1) {
     if (tid < s) {
       float v = bv[tid + s];
       uint j = bi[tid + s];
+      float lo = max(sv[tid], sv[tid + s]);
       if (v > bv[tid] || (v == bv[tid] && j < bi[tid])) {
+        sv[tid] = max(lo, bv[tid]);
         bv[tid] = v;
         bi[tid] = j;
+      } else {
+        sv[tid] = max(lo, v);
       }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
   }
-  if (tid == 0) tokens[p.out_index] = int(bi[0]);
+  if (tid == 0) {
+    tokens[p.out_index] = int(bi[0]);
+    margin[p.out_index] = bv[0] - sv[0];
+  }
 }
 
 // Write row 0 = src (bf16 [D]) and rows 1..n-1 = mask (bf16 [D]) into x [n, D].

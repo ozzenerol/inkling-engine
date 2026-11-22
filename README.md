@@ -78,3 +78,5 @@ build/inktest --backend cpu --ids ref_data/p2.ids --rollback-test --out /tmp   #
 | `INK_WARM_SECS=N` | keep the weights wired for N seconds after the last work (default 600; 0 off). Without it the first submit after a 2 s pause waits about 0.4 s in the driver |
 | `INK_CBTIME=1` | print scheduling and GPU time of every forward that takes over 50 ms |
 | `INK_SPEC_STATS=1` | drafts accepted per round, draft and verify time |
+| `INK_SPEC_GATE=0` | draft count follows past acceptance instead of the drafter's confidence (the default cuts each draft where its expected tokens per ms peak) |
+| `INK_SPEC_DUMP=file` | append `asked position margin accepted` for every drafted token (to recalibrate the gate) |
