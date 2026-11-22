@@ -319,7 +319,9 @@ bool speculative_generate(Engine& e, Model& m, const SamplingParams& p, int max_
       const int cut = gate_cut(mg, k);
       if (cut < k) s.gate_cut++;
       // Ask for the whole block again after a round that kept all it asked for, else for two more than were kept.
-      s.gate_k = cut == k ? 7 : std::max(3, cut + 2);
+      // (At least 4: up to 4 rows are one pass over the head. Asking for 3, 4 or always 7 measured 60.3 / 60.3 /
+      // 58.6 tok/s on the agent bench.)
+      s.gate_k = cut == k ? 7 : std::max(4, cut + 2);
       if (cut == 0) {
         // Not even the first draft is worth a second row: a plain step, charged to the drafting mode.
         s.gate_zero++;

@@ -97,6 +97,43 @@ kernel void dspark_markov_step(device ushort* state [[buffer(0)]], device ushort
   }
 }
 
+// The same step as two dispatches. In one threadgroup the 768 rows run 96 after another per simdgroup (about
+// 0.5 ms a step: latency is the serial loop length); here every simdgroup has one row. Same sums, same order.
+// Grid: (cdiv(3 * R, 8), 1, 1), 256 threads. raw: f32 [3 * R].
+kernel void dspark_markov_mv(device const ushort* state [[buffer(0)]], device float* raw [[buffer(1)]],
+                             device const float* ctx [[buffer(2)]], device const ushort* ws [[buffer(3)]],
+                             device const ushort* w1 [[buffer(4)]], device const int* tokens [[buffer(5)]],
+                             constant MarkovParams& p [[buffer(6)]], device const ushort* bias [[buffer(7)]],
+                             uint tg [[threadgroup_position_in_grid]], uint lane [[thread_index_in_simdgroup]],
+                             uint sg [[simdgroup_index_in_threadgroup]]) {
+  const uint R = p.rank, row = tg * 8 + sg;
+  if (row >= 3 * R) return;
+  const int prev = tokens[p.prev_index];
+  float a = 0;
+  for (uint k = lane; k < 2 * R; k += 32) {
+    const float x = k < R ? bf2f(state[k]) : bf2f(w1[size_t(prev) * R + (k - R)]);
+    a = fma(x, bf2f(ws[row * 2 * R + k]), a);
+  }
+  a = simd_sum(a);
+  if (lane == 0) raw[row] = round_bf(a + (ctx[row] + bf2f(bias[row])));
+}
+// One threadgroup of 256 threads (R = 256).
+kernel void dspark_markov_gate(device ushort* state [[buffer(0)]], device ushort* latent [[buffer(1)]],
+                               device const float* raw [[buffer(2)]], constant MarkovParams& p [[buffer(3)]],
+                               uint tid [[thread_position_in_threadgroup]]) {
+  const uint R = p.rank;
+  for (uint i = tid; i < R; i += 256) {
+    float gate = round_bf(1.0f / (1.0f + exp(-raw[i])));
+    float cand = round_bf(precise::tanh(raw[R + i]));
+    float s = bf2f(state[i]);
+    float gs = round_bf(gate * s);
+    float om = round_bf(1.0f - gate);
+    float oc = round_bf(om * cand);
+    state[i] = f2bf(gs + oc);
+    latent[i] = f2bf(precise::tanh(raw[2 * R + i]));
+  }
+}
+
 // Draft logits for one step and a partial argmax: for vocab rows v (< V), l = bf16(fold_b[v] + latent . fold_w[v])
 // (fp32 dot), z = bf16(base[v] + l), z = bf16(cap * tanh(z / cap)); per-threadgroup best (value, index).
 // One simdgroup per 4 rows; 8 simdgroups per threadgroup -> 32 rows per threadgroup.
@@ -127,8 +164,12 @@ kernel void dspark_fold_argmax(device const ushort* latent [[buffer(0)]], device
     a = simd_sum(a);
     float l = round_bf(a + bf2f(fb[v]));
     float z = round_bf(bf2f(base[v]) + l);
-    z = round_bf(p.cap * precise::tanh(z / p.cap));
-    if (p.write_z && lane == 0) zout[v] = z;
+    // The softcap is monotonic: the greedy path takes the argmax of z itself and caps only the winner and the
+    // runner-up (dspark_argmax_final). Sampling needs the capped row.
+    if (p.write_z) {
+      z = round_bf(p.cap * precise::tanh(z / p.cap));
+      if (lane == 0) zout[v] = z;
+    }
     if (z > best) {
       best = z;
       besti = v;
@@ -155,6 +196,7 @@ kernel void dspark_fold_argmax(device const ushort* latent [[buffer(0)]], device
 // the winner's own partial is not seen: the margin is an upper bound; it only steers the draft length).
 struct ArgmaxParams {
   uint n, out_index;
+  float cap;
 };
 kernel void dspark_argmax_final(device const float2* part [[buffer(0)]], device int* tokens [[buffer(1)]],
                                 constant ArgmaxParams& p [[buffer(2)]], device float* margin [[buffer(3)]],
@@ -196,7 +238,7 @@ kernel void dspark_argmax_final(device const float2* part [[buffer(0)]], device 
   }
   if (tid == 0) {
     tokens[p.out_index] = int(bi[0]);
-    margin[p.out_index] = bv[0] - sv[0];
+    margin[p.out_index] = p.cap * (precise::tanh(bv[0] / p.cap) - precise::tanh(sv[0] / p.cap));
   }
 }
 

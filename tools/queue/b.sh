@@ -61,3 +61,9 @@ for f in p0 p12; do
     echo -n "[head $f $v] "; env $v INK_MODEL=$M8 $(bin spec_check) dspark ref_data/$f.ids 300 8 "$BS/head_$v.i32" 2>&1 | grep -o "decode.*tok/s"
   done; cmp "$BS/head_X=1.i32" "$BS/head_INK_MR_Q8_RH=2.i32" && echo "head $f tokens IDENTICAL"
 done
+echo "== B drafter Markov step in two wide dispatches (default; INK_DSPARK_MARKOV1=1 = one threadgroup): 8-bit, block 8"
+for f in p0 p12; do
+  for v in "INK_DSPARK_MARKOV1=1" "X=1"; do
+    echo -n "[markov $f $v] "; env $v INK_MODEL=$M8 INK_DSPARK_TIME=1 $(bin spec_check) dspark ref_data/$f.ids 300 8 "$BS/mk_$v.i32" 2>&1 | grep -E "dspark time|tok/s \(block" | tail -2 | grep -o "markov+fold+argmax [0-9.]*\|decode.*tok/s" | tr '\n' ' '; echo
+  done; cmp "$BS/mk_X=1.i32" "$BS/mk_INK_DSPARK_MARKOV1=1.i32" && echo "markov $f tokens IDENTICAL"
+done

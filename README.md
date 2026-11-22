@@ -80,3 +80,4 @@ build/inktest --backend cpu --ids ref_data/p2.ids --rollback-test --out /tmp   #
 | `INK_SPEC_STATS=1` | drafts accepted per round, draft and verify time |
 | `INK_SPEC_GATE=0` | draft count follows past acceptance instead of the drafter's confidence (the default cuts each draft where its expected tokens per ms peak) |
 | `INK_SPEC_DUMP=file` | append `asked position margin accepted` for every drafted token (to recalibrate the gate) |
+| `INK_DSPARK_TIME=1` | wall time of the parts of a draft (layers, head, token steps); `2` also per dispatch |

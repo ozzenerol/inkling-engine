@@ -1,5 +1,6 @@
 // DSpark drafter on Metal. Owner: B. See dspark.h. Generic ops go through the Backend (MetalBackend), the
 // drafter-specific kernels (dspark.metal, split attention) are dispatched on the same command buffer.
+#include <chrono>
 #include "gpu/dspark.h"
 
 #include <algorithm>
@@ -56,6 +57,7 @@ struct SampleParams {
 };
 struct ArgmaxParams {
   uint32_t n, out_index;
+  float cap;
 };
 struct GaParams {  // kernels/multirow_ga.metal (D)
   uint32_t T, H, KVH, cap, len, rel_extent, sr, sk, nblk, nsplit;
@@ -90,7 +92,7 @@ struct DSpark::Impl {
   float alpha[4][4];
   const Tensor &embed, &embed_norm, &head;
   // workspace
-  Tensor mixed, kx, vx, tokens, margins, e0, e1, x, xin, q, kb, vb, at, o, summed, res, post, gt, ut, a, h, base, frnn, cat,
+  Tensor mixed, kx, vx, tokens, margins, raw, e0, e1, x, xin, q, kb, vb, at, o, summed, res, post, gt, ut, a, h, base, frnn, cat,
       ctxm, state, zero_state, latent, part, last_feat, apart, zbuf, stats, qbuf, ga_s, ga_bmax, ga_m, ga_part;
   // D: direct global attention (multirow_ga.metal) for the drafter's global layer: on unless INK_GA=0 or
   // INK_GA_DRAFT=0
@@ -329,6 +331,7 @@ DSpark::DSpark(Backend& be, const std::string& dir, const Tensor& embed, const T
   m.vx = be.alloc(DType::BF16, {rows, m.KVH * m.HD}, "dspark.vx");
   m.tokens = be.alloc(DType::I32, {B}, "dspark.tokens");
   m.margins = be.alloc(DType::F32, {B}, "dspark.margins");
+  m.raw = be.alloc(DType::F32, {3 * m.R}, "dspark.raw");
   m.e0 = be.alloc(DType::BF16, {1, m.D}, "dspark.e0");
   m.e1 = be.alloc(DType::BF16, {1, m.D}, "dspark.e1");
   m.x = be.alloc(DType::BF16, {B, m.D}, "dspark.x");
@@ -480,6 +483,21 @@ std::vector<int32_t> DSpark::run(int32_t anchor, int count, float temperature, c
     m.g.set_bytes(3, nd, sizeof(nd));
     m.g.dispatch({cdiv(m.D, 256), uint32_t(B), 1}, {256, 1, 1});
   }
+  // INK_DSPARK_TIME=1: wall time of the parts of a draft (a sync after each; printed every 50 drafts).
+  static const bool timing = getenv("INK_DSPARK_TIME") != nullptr;
+  static const bool tsteps = timing && atoi(getenv("INK_DSPARK_TIME")) > 1;  // 2: also a sync after every dispatch of a step
+  static double tsec[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+  static long tn = 0;
+  auto tnow = [] { return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now().time_since_epoch()).count(); };
+  double tl = 0;
+  auto lap = [&](int i) {
+    if (!timing) return;
+    m.be.sync();
+    const double t = tnow();
+    tsec[i] += t - tl;
+    tl = t;
+  };
+  if (timing) m.be.sync(), tl = tnow();
   const int64_t pos0 = ctx_len_;
   for (size_t i = 0; i < m.L.size(); i++) {
     auto& l = m.L[i];
@@ -515,6 +533,7 @@ std::vector<int32_t> DSpark::run(int32_t anchor, int count, float temperature, c
     m.be.linear(w_a, l.down, w_x);
     m.be.cast(w_summed, w_res);
   }
+  lap(0);
   m.be.add(w_x, w_res, w_summed);
   m.be.rms_norm(w_summed, &m.norm, m.eps, m.D, w_h);
   // rows 1..count
@@ -523,6 +542,7 @@ std::vector<int32_t> DSpark::run(int32_t anchor, int count, float temperature, c
   hc.offset += size_t(m.D) * 2;
   Tensor base = view(m.base, {count, m.V});
   m.be.linear(hc, m.head, base);
+  lap(1);
   Tensor lf = m.last_feat;
   lf.set_shape({1, 4, m.D});
   m.mix(lf, 1, 3, m.mk_dflare, m.frnn);
@@ -540,21 +560,43 @@ std::vector<int32_t> DSpark::run(int32_t anchor, int count, float temperature, c
   Tensor cat = view(m.cat, {count, 2 * m.D}), ctxm = view(m.ctxm, {count, 3 * m.R});
   m.be.linear(cat, m.wc, ctxm);
   m.be.copy(m.zero_state, m.state);
+  lap(2);
   uint32_t nparts = cdiv(m.Vu, 32);
   for (int i = 0; i < count; i++) {
     MarkovParams mp{uint32_t(m.R), uint32_t(i)};
-    m.pipe("dspark_markov_step");
-    m.bind(0, m.state);
-    m.bind(1, m.latent);
     Tensor cr = m.ctxm;
     cr.offset += size_t(i) * 3 * m.R * 4;
-    m.bind(2, cr);
-    m.bind(3, m.ws);
-    m.bind(4, m.w1);
-    m.bind(5, m.tokens);
-    m.g.set_value(6, mp);
-    m.bind(7, m.rnn_b);
-    m.g.dispatch({1, 1, 1}, {256, 1, 1});
+    static const bool one_group = getenv("INK_DSPARK_MARKOV1") != nullptr;  // the old single-threadgroup step
+    if (one_group) {
+      m.pipe("dspark_markov_step");
+      m.bind(0, m.state);
+      m.bind(1, m.latent);
+      m.bind(2, cr);
+      m.bind(3, m.ws);
+      m.bind(4, m.w1);
+      m.bind(5, m.tokens);
+      m.g.set_value(6, mp);
+      m.bind(7, m.rnn_b);
+      m.g.dispatch({1, 1, 1}, {256, 1, 1});
+    } else {
+      m.pipe("dspark_markov_mv");
+      m.bind(0, m.state);
+      m.bind(1, m.raw);
+      m.bind(2, cr);
+      m.bind(3, m.ws);
+      m.bind(4, m.w1);
+      m.bind(5, m.tokens);
+      m.g.set_value(6, mp);
+      m.bind(7, m.rnn_b);
+      m.g.dispatch({cdiv(uint32_t(3 * m.R), 8), 1, 1}, {256, 1, 1});
+      m.pipe("dspark_markov_gate");
+      m.bind(0, m.state);
+      m.bind(1, m.latent);
+      m.bind(2, m.raw);
+      m.g.set_value(3, mp);
+      m.g.dispatch({1, 1, 1}, {256, 1, 1});
+    }
+    if (tsteps) lap(4);
     FoldParams fp{uint32_t(m.Vu), uint32_t(m.R), m.cap, sampled ? 1u : 0u};
     m.pipe("dspark_fold_argmax");
     m.bind(0, m.latent);
@@ -569,6 +611,7 @@ std::vector<int32_t> DSpark::run(int32_t anchor, int count, float temperature, c
     zr.offset += size_t(i) * m.Vu * 4;
     m.bind(6, zr);
     m.g.dispatch({nparts, 1, 1}, {256, 1, 1});
+    if (tsteps) lap(5);
     if (sampled) {
       SampleParams sp{uint32_t(m.Vu), nparts, uint32_t(i + 1), uint32_t(i), 1.0f / temperature, uniforms[i]};
       m.pipe("dspark_sample_final");
@@ -579,7 +622,7 @@ std::vector<int32_t> DSpark::run(int32_t anchor, int count, float temperature, c
       m.g.set_value(4, sp);
       m.g.dispatch({1, 1, 1}, {1024, 1, 1});
     } else {
-      ArgmaxParams ap{nparts, uint32_t(i + 1)};
+      ArgmaxParams ap{nparts, uint32_t(i + 1), m.cap};
       m.pipe("dspark_argmax_final");
       m.bind(0, m.part);
       m.bind(1, m.tokens);
@@ -587,8 +630,15 @@ std::vector<int32_t> DSpark::run(int32_t anchor, int count, float temperature, c
       m.bind(3, m.margins);
       m.g.dispatch({1, 1, 1}, {1024, 1, 1});
     }
+    if (tsteps) lap(6);
   }
   m.be.sync();
+  lap(3);
+  if (timing && tsteps && (tn + 1) % 50 == 0)
+    fprintf(stderr, "dspark steps per draft: markov %.2f ms, fold %.2f, argmax %.2f\n", tsec[4] / (tn + 1), tsec[5] / (tn + 1), tsec[6] / (tn + 1));
+  if (timing && ++tn % 50 == 0)
+    fprintf(stderr, "dspark time per draft: layers %.2f ms, head %.2f, mix/ctx %.2f, markov+fold+argmax %.2f (count %d now)\n",
+            tsec[0] / tn, tsec[1] / tn, tsec[2] / tn, tsec[3] / tn, count);
   std::vector<int32_t> out(size_t(count + 1));
   memcpy(out.data(), m.tokens.data<int32_t>(), out.size() * 4);
   out.erase(out.begin());
