@@ -379,11 +379,14 @@ class MetalBackend final : public Backend {
   }
   void linear_q8(const Tensor& x, const Tensor& w, Tensor& out, uint32_t T, uint32_t N, uint32_t K) {
     auto& sb = affine_of(w);
-    if (T > 4 && T <= kMR && mr_ && K % 64 == 0) {
+    if (T > 4 && T <= kMR && mr_ && K % 64 == 0 && !(N >= 65536 && mr_q8_rh_ == 0)) {
       // D: one pass over the codes per 16 rows; every row equals the 1-row q8 matvec bit for bit
       for (uint32_t t0 = 0; t0 < T; t0 += 16) {
         const uint32_t tt = std::min<uint32_t>(16, T - t0);
-        const uint32_t R = mr_q8_r_ ? mr_q8_r_ : (tt <= 8 ? 2u : 4u);  // INK_MR_Q8_R: bench only
+        // (The output head, N = vocabulary, does not come here: every simdgroup reads the T input rows again,
+        // so 8 rows of logits took 14.1 ms at R = 2, 5.65 at R = 4, and 3.9 as two passes of the 4-row kernel
+        // below. INK_MR_Q8_RH=2|4|8 brings it back for measurements. A row's sum is the same on every path.)
+        const uint32_t R = N >= 65536 ? mr_q8_rh_ : mr_q8_r_ ? mr_q8_r_ : (tt <= 8 ? 2u : 4u);
         Q8Params qp{N, K, tt, K, N};
         pipe(std::string("mr_matvec_q8_") + dtn(x.dtype) + "_" + dtn(out.dtype) + (tt <= 8 ? "_t8_r" : "_t16_r") +
              std::to_string(R) + "_s2");
@@ -1581,6 +1584,7 @@ class MetalBackend final : public Backend {
   // sharing below 8 rows) it costs ~22 us more per call at T = 2 and breaks even at 4; real rows share 21% of the
   // routes at T = 2 and 33-41% at T = 3-4 (INK_MOE_STATS), so 3 until T = 2 is measured with the model.
   uint32_t mr_q8_r_ = getenv("INK_MR_Q8_R") ? uint32_t(atoi(getenv("INK_MR_Q8_R"))) : 0;
+  uint32_t mr_q8_rh_ = getenv("INK_MR_Q8_RH") ? uint32_t(atoi(getenv("INK_MR_Q8_RH"))) : 0;  // head: 2, 4 or 8
   bool mr_moe_ = !(getenv("INK_MR_MOE") && getenv("INK_MR_MOE")[0] == '0');
   uint32_t mr_moe_min_ = getenv("INK_MR_MOE_MIN") ? uint32_t(atoi(getenv("INK_MR_MOE_MIN"))) : 3;
   // D: two-pass global attention without staging. On by default since batch 10 (INK_GA=0 off). INK_GA_THR=x: weights below
