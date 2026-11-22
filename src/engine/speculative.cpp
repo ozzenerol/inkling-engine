@@ -49,6 +49,7 @@ struct Spec {
   double pm[11] = {0.24, 0.24, 0.30, 0.33, 0.47, 0.52, 0.66, 0.78, 0.90, 0.96, 0.99};
   double vc0 = 0, vc1 = 0;  // ms: verify(T) = vc0 + vc1 * (T - 1); 0 = not measured yet
   long gate_cut = 0, gate_zero = 0;
+  long vhist[33] = {};  // verify forwards by row count
   int gate_k = 7;  // drafts asked of the drafter next round (each costs ~0.45 ms whether kept or not)
   std::mt19937_64 rng{0x9E3779B97F4A7C15ull};  // speculative sampling uniforms
   uint64_t seeded = ~0ull;
@@ -358,6 +359,7 @@ bool speculative_generate(Engine& e, Model& m, const SamplingParams& p, int max_
     if (!use_lookup) ema(s.t_draft, std::chrono::duration<double, std::milli>(c1 - c0).count(), 0.2);
     ema(s.t_verify[k + 1], std::chrono::duration<double, std::milli>(c2 - c1).count(), 0.2);
     verify_seen(k + 1, std::chrono::duration<double, std::milli>(c2 - c1).count());
+    s.vhist[std::min(32, k + 1)]++;
     const auto& lg = m.logits();
     // Sample-and-compare (as mlx_vlm's DSpark walk): sample the target at each row in order; accept the draft
     // while it equals the sample. Every emitted token is an exact target sample (greedy: the argmax).
@@ -467,6 +469,12 @@ bool speculative_generate(Engine& e, Model& m, const SamplingParams& p, int max_
     fprintf(stderr, "gate: %ld rounds cut, %ld to a plain step; verify(T) = %.1f + %.1f (T-1) ms; P(accept) by margin "
                     "%.2f %.2f %.2f %.2f %.2f %.2f %.2f %.2f %.2f %.2f %.2f\n", s.gate_cut, s.gate_zero, s.vc0, s.vc1,
             s.pm[0], s.pm[1], s.pm[2], s.pm[3], s.pm[4], s.pm[5], s.pm[6], s.pm[7], s.pm[8], s.pm[9], s.pm[10]);
+  if (getenv("INK_SPEC_STATS")) {
+    fprintf(stderr, "verify rows:");
+    for (int t = 2; t <= 32; t++)
+      if (s.vhist[t]) fprintf(stderr, " %d:%ld", t, s.vhist[t]);
+    fprintf(stderr, "\n");
+  }
   if (getenv("INK_SPEC_STATS"))
     fprintf(stderr, "lookup: %ld rounds, accepted %ld of %ld drafts, %.1f tok/s in lookup rounds\n", s.lk_rounds,
             s.lk_accepted, s.lk_drafted, 1e3 * s.lk_rate);
